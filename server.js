@@ -63,7 +63,7 @@ function detectFlags(cb) {
 }
 
 // Construye los argumentos con las optimizaciones de velocidad soportadas.
-function buildArgs(message, useContinue, withModel) {
+function buildArgs(message, sessionId, withModel) {
   const a = ['-p', message, '--allow-all-tools'];
   const s = SUPPORTED || {};
   if (withModel && s.model && state.model && state.model !== 'auto') { a.push('--model', state.model); }
@@ -73,7 +73,8 @@ function buildArgs(message, useContinue, withModel) {
   if (s.noRemote) a.push('--no-remote');
   if (s.disableBuiltinMcps) a.push('--disable-builtin-mcps');
   if (s.noAskUser) a.push('--no-ask-user');
-  if (useContinue) a.push('--continue');
+  // Continuar la conversación real del CLI si tenemos su session id.
+  if (sessionId) a.push('--resume=' + sessionId);
   return a;
 }
 
@@ -167,10 +168,11 @@ function handleChat(req, res, body) {
     message = message ? (message + '\n\n' + refs) : ('Describe estas imágenes: ' + refs);
   }
   if (!message) { res.writeHead(400); return res.end('empty'); }
-  detectFlags(() => handleChatInner(req, res, message));
+  const sessionId = (body.sessionId || '').trim();
+  detectFlags(() => handleChatInner(req, res, message, sessionId));
 }
 
-function handleChatInner(req, res, message) {
+function handleChatInner(req, res, message, sessionId) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -178,25 +180,22 @@ function handleChatInner(req, res, message) {
   });
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
-  function launchRaw(withModel, useContinue) {
-    const a = buildArgs(message, useContinue, withModel);
+  function launchRaw(withModel, sid) {
+    const a = buildArgs(message, sid, withModel);
     const loader = resolveLoader();
     if (loader) {
-      // Ejecutar node npm-loader.js directamente: preserva saltos de línea.
       return spawn(process.execPath, [loader].concat(a), { cwd: state.cwd, env: process.env });
     }
-    // Fallback: wrapper por cmd.exe (modo test o si no se halló el loader).
     if (process.platform === 'win32') {
       return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: state.cwd, env: process.env });
     }
     return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env });
   }
 
-  // Ejecuta un intento; si el modelo no está disponible, reintenta con Auto.
-  function attempt(withModel, useContinue, isRetry) {
+  function attempt(withModel, sid, isRetry) {
     let child;
     try {
-      child = launchRaw(withModel, useContinue);
+      child = launchRaw(withModel, sid);
     } catch (e) {
       send('error', 'No se pudo iniciar copilot: ' + e.message);
       return res.end();
@@ -211,27 +210,27 @@ function handleChatInner(req, res, message) {
     child.on('error', (e) => { send('error', 'Error al ejecutar copilot: ' + e.message); res.end(); });
     child.on('close', (code) => {
       const modelUnavailable = withModel && /model .*(is )?not available|not available.*--model|--model flag is not available/i.test(raw);
-      // Si el modelo elegido no está disponible en el plan → reintentar con Auto.
       if (modelUnavailable && !isRetry) {
         state.autoOnly = true;
-        return attempt(false, useContinue, true);
+        return attempt(false, sid, true);
       }
-      // Reintento por sesión previa inexistente (--continue falló sin salida).
-      if (code !== 0 && useContinue && !gotOutput && !isRetry) {
-        state.started = false;
-        return attempt(withModel, false, true);
+      // Si --resume falló (sesión inexistente), reintenta sin sesión.
+      if (code !== 0 && sid && !gotOutput && !isRetry) {
+        return attempt(withModel, '', true);
       }
       filter.flush();
-      state.started = true;
+      // Capturar el session id del CLI para continuar esta conversación luego.
+      const m = /--resume=([a-f0-9-]{8,})/i.exec(raw);
+      if (m) send('session', { id: m[1] });
       send('done', { code });
       res.end();
     });
 
+    // Permitir detener la respuesta desde el cliente (cerrar el stream mata el proceso).
     req.on('close', () => { try { child.kill(); } catch (e) {} });
   }
 
-  // Si ya sabemos que el plan solo permite Auto, no mandes --model.
-  attempt(!state.autoOnly, state.started, false);
+  attempt(!state.autoOnly, sessionId, false);
 }
 
 // ===== Historial de conversaciones (persistente en disco) =====

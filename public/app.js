@@ -7,11 +7,34 @@ const cwdEl = document.getElementById('cwd');
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
-// Render minimalista de markdown (bloques de código, `code`, saltos)
+// Render de markdown (bloques de código, inline, negritas, listas, títulos, enlaces)
 function renderMd(text){
-  let html = esc(text);
-  html = html.replace(/```([\s\S]*?)```/g, (m,c)=>`<pre><code>${c.replace(/^\n/,'')}</code></pre>`);
-  html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  // Extraer bloques de código primero (para no tocar su contenido)
+  const blocks = [];
+  let html = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (m,lang,code)=>{
+    blocks.push('<pre><code>'+esc(code.replace(/\n$/,''))+'</code></pre>');
+    return '\u0000B'+(blocks.length-1)+'\u0000';
+  });
+  html = esc(html);
+  // inline code
+  const inline = [];
+  html = html.replace(/`([^`\n]+)`/g, (m,c)=>{ inline.push('<code>'+c+'</code>'); return '\u0000I'+(inline.length-1)+'\u0000'; });
+  // enlaces [texto](url)
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  // negritas y cursivas
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  // títulos
+  html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
+  html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^# (.+)$/gm, '<h3>$1</h3>');
+  // listas
+  html = html.replace(/^(\s*)[-*] (.+)$/gm, '$1<li>$2</li>');
+  html = html.replace(/^(\s*)\d+\. (.+)$/gm, '$1<li>$2</li>');
+  html = html.replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, '<ul>$1</ul>');
+  // restaurar código
+  html = html.replace(/\u0000I(\d+)\u0000/g, (m,i)=>inline[+i]);
+  html = html.replace(/\u0000B(\d+)\u0000/g, (m,i)=>blocks[+i]);
   return html;
 }
 
@@ -28,6 +51,7 @@ function addMsg(role, html){
 let convId = 'c' + Date.now();
 let convTitle = 'Nueva conversación';
 let convMsgs = []; // {role, html}
+let convSession = null; // session id real del CLI para esta conversación
 const WELCOME = '¡Hola! Soy <strong>HanstlerS</strong>. Elige tu carpeta de proyecto arriba y dime en qué trabajamos. Puedo leer y editar archivos, ejecutar comandos y usar tu agente <code>hanstler-dev</code>.';
 
 function recordMsg(role, html){ convMsgs.push({role, html}); persistConv(); }
@@ -38,7 +62,7 @@ function persistConv(){
     if(firstUser){ const t=firstUser.html.replace(/<[^>]+>/g,'').trim(); convTitle = t.slice(0,40) || 'Conversación'; }
   }
   fetch('/api/conv/save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ id: convId, title: convTitle, messages: convMsgs })})
+    body: JSON.stringify({ id: convId, title: convTitle, messages: convMsgs, session: convSession })})
     .then(()=>loadConvList()).catch(()=>{});
 }
 
@@ -64,18 +88,16 @@ async function openConv(id){
   try{
     const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
     if(!c || c.error) return;
-    convId=c.id; convTitle=c.title||'Conversación'; convMsgs=c.messages||[];
+    convId=c.id; convTitle=c.title||'Conversación'; convMsgs=c.messages||[]; convSession=c.session||null;
     chat.innerHTML='';
     convMsgs.forEach(m=> addMsg(m.role, m.html));
-    await fetch('/api/newsession',{method:'POST'}); // sesión CLI nueva al cambiar
     loadConvList();
   }catch(e){}
 }
 
 function newConv(){
-  convId='c'+Date.now(); convTitle='Nueva conversación'; convMsgs=[];
+  convId='c'+Date.now(); convTitle='Nueva conversación'; convMsgs=[]; convSession=null;
   chat.innerHTML=''; addMsg('bot', WELCOME);
-  fetch('/api/newsession',{method:'POST'}).catch(()=>{});
   loadConvList();
 }
 
@@ -182,13 +204,18 @@ async function drainQueue(){
   processing=false;
 }
 
+let currentAbort = null;
+
 async function runOne(msg, images){
   const bubble = addMsg('bot', '<span class="typing"><span></span><span></span><span></span></span>');
   let acc='';
+  currentAbort = new AbortController();
+  setStopMode(true);
   try{
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ message: msg, images: images||[] })
+      signal: currentAbort.signal,
+      body: JSON.stringify({ message: msg, images: images||[], sessionId: convSession || '' })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
@@ -206,19 +233,36 @@ async function runOne(msg, images){
         const type = ev[1];
         let data; try{ data = JSON.parse(dm[1]); }catch(_){ data = dm[1]; }
         if(type==='chunk'){ acc += data; bubble.innerHTML = renderMd(acc); chat.scrollTop=chat.scrollHeight; }
+        else if(type==='session'){ if(data && data.id){ convSession = data.id; } }
         else if(type==='error'){ acc += '\n⚠️ '+data; bubble.innerHTML = renderMd(acc); }
       }
     }
     if(!acc.trim()){ bubble.innerHTML = '<em style="color:#8a8aa0">(sin respuesta)</em>'; recordMsg('bot', bubble.innerHTML); }
     else { recordMsg('bot', bubble.innerHTML); speak(acc); }
   }catch(err){
-    bubble.innerHTML = '⚠️ Error de conexión: '+esc(err.message);
-    recordMsg('bot', bubble.innerHTML);
+    if(err.name==='AbortError'){
+      bubble.innerHTML = renderMd(acc) + '<div style="color:#8a8aa0;font-size:12px;margin-top:6px;">⏹ Detenido</div>';
+      if(acc.trim()) recordMsg('bot', bubble.innerHTML);
+    } else {
+      bubble.innerHTML = '⚠️ Error de conexión: '+esc(err.message);
+      recordMsg('bot', bubble.innerHTML);
+    }
+  }finally{
+    currentAbort = null;
+    setStopMode(false);
   }
+}
+
+function setStopMode(on){
+  sendBtn.textContent = on ? '⏹' : '➤';
+  sendBtn.title = on ? 'Detener' : 'Enviar';
+  sendBtn.classList.toggle('stopping', on);
 }
 
 composer.addEventListener('submit', (e)=>{
   e.preventDefault();
+  // Si hay una respuesta en curso, el botón funciona como "detener".
+  if(currentAbort){ try{ currentAbort.abort(); }catch(_){}; return; }
   const msg = input.value.trim();
   const imgs = pendingImages.slice();
   if(!msg && !imgs.length) return;

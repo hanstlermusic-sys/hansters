@@ -105,6 +105,13 @@ body{
   background:linear-gradient(135deg,var(--neon),var(--neon2));box-shadow:0 0 14px rgba(176,38,255,.4);
 }
 #send:disabled{opacity:.4;cursor:default;box-shadow:none;}
+#send.stopping{background:linear-gradient(135deg,#ff2668,#ff5a3c);}
+.bubble h3{font-size:1.05em;margin:8px 0 4px;}
+.bubble h4{font-size:1em;margin:6px 0 3px;color:var(--neon2);}
+.bubble ul{margin:6px 0 6px 4px;padding-left:18px;}
+.bubble li{margin:2px 0;}
+.bubble a{color:var(--neon2);}
+.bubble strong{color:#fff;}
 
 .mic, .speak{
   width:48px;flex:0 0 48px;border:1px solid var(--border);border-radius:12px;background:#0c0c16;
