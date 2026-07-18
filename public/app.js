@@ -24,6 +24,67 @@ function addMsg(role, html){
   return wrap.querySelector('.bubble');
 }
 
+// ===== Historial de conversaciones =====
+let convId = 'c' + Date.now();
+let convTitle = 'Nueva conversación';
+let convMsgs = []; // {role, html}
+const WELCOME = '¡Hola! Soy <strong>HanstlerS</strong>. Elige tu carpeta de proyecto arriba y dime en qué trabajamos. Puedo leer y editar archivos, ejecutar comandos y usar tu agente <code>hanstler-dev</code>.';
+
+function recordMsg(role, html){ convMsgs.push({role, html}); persistConv(); }
+function persistConv(){
+  if(!convMsgs.length) return;
+  if(convTitle==='Nueva conversación'){
+    const firstUser = convMsgs.find(m=>m.role==='user');
+    if(firstUser){ const t=firstUser.html.replace(/<[^>]+>/g,'').trim(); convTitle = t.slice(0,40) || 'Conversación'; }
+  }
+  fetch('/api/conv/save', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ id: convId, title: convTitle, messages: convMsgs })})
+    .then(()=>loadConvList()).catch(()=>{});
+}
+
+async function loadConvList(){
+  try{
+    const r = await fetch('/api/conv/list'); const j = await r.json();
+    const box = document.getElementById('conv-list'); box.innerHTML='';
+    (j.items||[]).forEach(it=>{
+      const el = document.createElement('div');
+      el.className = 'conv-item' + (it.id===convId?' active':'');
+      el.innerHTML = `<span class="t">${esc(it.title)}</span><span class="del" title="Borrar">🗑</span>`;
+      el.querySelector('.t').onclick = ()=> openConv(it.id);
+      el.querySelector('.del').onclick = async (e)=>{ e.stopPropagation();
+        await fetch('/api/conv/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id})});
+        if(it.id===convId) newConv(); else loadConvList();
+      };
+      box.appendChild(el);
+    });
+  }catch(e){}
+}
+
+async function openConv(id){
+  try{
+    const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
+    if(!c || c.error) return;
+    convId=c.id; convTitle=c.title||'Conversación'; convMsgs=c.messages||[];
+    chat.innerHTML='';
+    convMsgs.forEach(m=> addMsg(m.role, m.html));
+    await fetch('/api/newsession',{method:'POST'}); // sesión CLI nueva al cambiar
+    loadConvList();
+  }catch(e){}
+}
+
+function newConv(){
+  convId='c'+Date.now(); convTitle='Nueva conversación'; convMsgs=[];
+  chat.innerHTML=''; addMsg('bot', WELCOME);
+  fetch('/api/newsession',{method:'POST'}).catch(()=>{});
+  loadConvList();
+}
+
+document.getElementById('btn-newconv').addEventListener('click', newConv);
+document.getElementById('btn-toggle').addEventListener('click', ()=>{
+  document.getElementById('sidebar').classList.toggle('hidden');
+});
+loadConvList();
+
 function setCwd(p){ if(p){ cwdEl.textContent = p; cwdEl.title = p; } }
 
 fetch('/api/state').then(r=>r.json()).then(s=>setCwd(s.cwd)).catch(()=>{});
@@ -34,14 +95,8 @@ document.getElementById('btn-folder').addEventListener('click', async ()=>{
     const r = await fetch('/api/pickfolder');
     const j = await r.json();
     setCwd(j.cwd);
-    if(j.path) addMsg('bot', 'Carpeta cambiada a <code>'+esc(j.path)+'</code>. Nueva conversación iniciada.');
+    if(j.path){ const h='Carpeta cambiada a <code>'+esc(j.path)+'</code>.'; addMsg('bot', h); recordMsg('bot', h); }
   }catch(e){ setCwd('~'); }
-});
-
-document.getElementById('btn-new').addEventListener('click', async ()=>{
-  await fetch('/api/newsession', {method:'POST'});
-  chat.innerHTML='';
-  addMsg('bot', 'Nueva conversación. ¿En qué trabajamos?');
 });
 
 // Selector de modelo
@@ -94,7 +149,9 @@ let pendingImages=[]; // imágenes adjuntas al mensaje que se está redactando
 
 function enqueue(msg, images){
   const imgHtml = (images&&images.length) ? images.map(im=>`<img src="${im}" style="max-width:160px;max-height:120px;border-radius:8px;margin:4px 4px 0 0;border:1px solid #33335a;">`).join('') : '';
-  addMsg('user', renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):''));
+  const userHtml = renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):'');
+  addMsg('user', userHtml);
+  recordMsg('user', userHtml);
   queue.push({msg, images: images||[]});
   updatePending();
   if(!processing) drainQueue();
@@ -152,10 +209,11 @@ async function runOne(msg, images){
         else if(type==='error'){ acc += '\n⚠️ '+data; bubble.innerHTML = renderMd(acc); }
       }
     }
-    if(!acc.trim()) bubble.innerHTML = '<em style="color:#8a8aa0">(sin respuesta)</em>';
-    else speak(acc);
+    if(!acc.trim()){ bubble.innerHTML = '<em style="color:#8a8aa0">(sin respuesta)</em>'; recordMsg('bot', bubble.innerHTML); }
+    else { recordMsg('bot', bubble.innerHTML); speak(acc); }
   }catch(err){
     bubble.innerHTML = '⚠️ Error de conexión: '+esc(err.message);
+    recordMsg('bot', bubble.innerHTML);
   }
 }
 

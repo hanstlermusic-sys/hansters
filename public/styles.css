@@ -7,8 +7,34 @@ html,body{height:100%;}
 body{
   background:radial-gradient(1200px 600px at 80% -10%, #1a1030 0%, var(--bg) 55%);
   color:var(--text); font-family:'Segoe UI',system-ui,sans-serif;
-  display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  height:100vh; overflow:hidden;
 }
+#layout{ display:flex; height:100vh; }
+#sidebar{
+  width:240px; flex:0 0 240px; background:#0c0c16; border-right:1px solid var(--border);
+  display:flex; flex-direction:column; overflow:hidden; transition:margin-left .2s;
+}
+#sidebar.hidden{ margin-left:-240px; }
+#btn-newconv{
+  margin:12px; padding:10px; border-radius:10px; border:1px solid var(--border);
+  background:linear-gradient(135deg,var(--neon),var(--neon2)); color:#fff; font-size:13px;
+  cursor:pointer; font-weight:600;
+}
+#conv-list{ flex:1; overflow-y:auto; padding:0 8px 12px; }
+#conv-list::-webkit-scrollbar{ width:8px; }
+#conv-list::-webkit-scrollbar-thumb{ background:#22223a; border-radius:6px; }
+.conv-item{
+  display:flex; align-items:center; gap:6px; padding:9px 10px; margin:3px 0; border-radius:8px;
+  cursor:pointer; font-size:13px; color:var(--muted); border:1px solid transparent;
+}
+.conv-item:hover{ background:#14141f; color:var(--text); }
+.conv-item.active{ background:#181828; color:var(--text); border-color:var(--border); }
+.conv-item .t{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.conv-item .del{ opacity:0; color:#ff5a7a; cursor:pointer; font-size:14px; }
+.conv-item:hover .del{ opacity:.8; }
+#mainpane{ flex:1; display:flex; flex-direction:column; min-width:0; height:100vh; }
+#btn-toggle{ background:#1a1a2a; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:7px 10px; font-size:14px; cursor:pointer; }
+#btn-toggle:hover{ border-color:var(--neon); }
 #topbar{
   display:flex; align-items:center; gap:14px; padding:10px 16px;
   background:linear-gradient(90deg,#14141f,#0e0e18); border-bottom:1px solid var(--border);

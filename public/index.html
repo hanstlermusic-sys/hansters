@@ -7,7 +7,14 @@
 <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <div id="layout">
+  <aside id="sidebar">
+    <button id="btn-newconv" title="Nueva conversación">＋ Nueva conversación</button>
+    <div id="conv-list"></div>
+  </aside>
+  <div id="mainpane">
   <header id="topbar">
+    <button id="btn-toggle" title="Mostrar/ocultar historial">☰</button>
     <div class="brand">
       <span class="logo">H</span>
       <div class="brand-text">
@@ -19,7 +26,6 @@
     <div class="actions">
       <select id="model-sel" title="Modelo (velocidad vs. calidad)"></select>
       <button id="btn-folder" title="Elegir carpeta de proyecto">📁 Carpeta</button>
-      <button id="btn-new" title="Nueva conversación">✦ Nuevo</button>
     </div>
   </header>
 
@@ -36,6 +42,8 @@
     <button id="btn-speak" type="button" class="speak" title="Leer las respuestas en voz alta">🔈</button>
     <button id="send" type="submit" title="Enviar">➤</button>
   </form>
+  </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>

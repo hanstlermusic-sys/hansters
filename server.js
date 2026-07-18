@@ -234,6 +234,37 @@ function handleChatInner(req, res, message) {
   attempt(!state.autoOnly, state.started, false);
 }
 
+// ===== Historial de conversaciones (persistente en disco) =====
+const CONV_DIR = path.join(os.homedir(), '.hanstlers', 'conversations');
+function ensureConvDir() { try { fs.mkdirSync(CONV_DIR, { recursive: true }); } catch (e) {} }
+function convFile(id) { return path.join(CONV_DIR, id.replace(/[^a-z0-9_-]/gi, '') + '.json'); }
+function listConversations() {
+  ensureConvDir();
+  let files = [];
+  try { files = fs.readdirSync(CONV_DIR).filter((f) => f.endsWith('.json')); } catch (e) {}
+  const items = [];
+  for (const f of files) {
+    try {
+      const c = JSON.parse(fs.readFileSync(path.join(CONV_DIR, f), 'utf8'));
+      items.push({ id: c.id, title: c.title || 'Conversación', updatedAt: c.updatedAt || 0 });
+    } catch (e) {}
+  }
+  items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return items;
+}
+function saveConversation(conv) {
+  ensureConvDir();
+  if (!conv || !conv.id) return;
+  conv.updatedAt = Date.now();
+  try { fs.writeFileSync(convFile(conv.id), JSON.stringify(conv)); } catch (e) {}
+}
+function getConversation(id) {
+  try { return JSON.parse(fs.readFileSync(convFile(id), 'utf8')); } catch (e) { return null; }
+}
+function deleteConversation(id) {
+  try { fs.unlinkSync(convFile(id)); return true; } catch (e) { return false; }
+}
+
 function pickFolder(res) {
   const ps = [
     'Add-Type -AssemblyName System.Windows.Forms;',
@@ -285,6 +316,28 @@ const server = http.createServer(async (req, res) => {
     if (b && b.model) { state.model = b.model; state.started = false; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, model: state.model }));
+  }
+  if (req.method === 'GET' && req.url === '/api/conv/list') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ items: listConversations() }));
+  }
+  if (req.method === 'GET' && req.url.startsWith('/api/conv/get')) {
+    const id = new URL(req.url, 'http://x').searchParams.get('id') || '';
+    const c = getConversation(id);
+    res.writeHead(c ? 200 : 404, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(c || { error: 'not found' }));
+  }
+  if (req.method === 'POST' && req.url === '/api/conv/save') {
+    const b = await readBody(req);
+    saveConversation(b);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  if (req.method === 'POST' && req.url === '/api/conv/delete') {
+    const b = await readBody(req);
+    const ok = deleteConversation((b && b.id) || '');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok }));
   }
   if (req.method === 'POST' && req.url === '/api/newsession') {
     state.started = false;
