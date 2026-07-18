@@ -213,11 +213,19 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({
       current: state.model,
       models: [
-        { id: 'claude-haiku-4.5', name: 'Haiku (más rápido)' },
+        { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5 (más rápido)' },
         { id: 'gpt-5-mini', name: 'GPT-5 mini (rápido)' },
-        { id: 'gemini-3.5-flash', name: 'Gemini Flash (rápido)' },
-        { id: 'claude-sonnet-4.5', name: 'Sonnet (equilibrado)' },
-        { id: 'auto', name: 'Automático' }
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (rápido)' },
+        { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5 (equilibrado)' },
+        { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6 (equilibrado)' },
+        { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex (código)' },
+        { id: 'gpt-5.4', name: 'GPT-5.4 (potente)' },
+        { id: 'gpt-5.5', name: 'GPT-5.5 (potente)' },
+        { id: 'gemini-3-pro', name: 'Gemini 3 Pro (potente)' },
+        { id: 'claude-opus-4.5', name: 'Claude Opus 4.5 (máxima calidad)' },
+        { id: 'claude-opus-4.8', name: 'Claude Opus 4.8 (máxima calidad)' },
+        { id: 'auto', name: 'Automático' },
+        { id: '__custom__', name: 'Otro… (escribir ID)' }
       ]
     }));
   }

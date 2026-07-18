@@ -49,15 +49,35 @@ const modelSel = document.getElementById('model-sel');
 if (modelSel) {
   fetch('/api/models').then(r=>r.json()).then(d=>{
     modelSel.innerHTML='';
+    let found=false;
     d.models.forEach(m=>{
       const o=document.createElement('option');
       o.value=m.id; o.textContent=m.name;
-      if(m.id===d.current) o.selected=true;
+      if(m.id===d.current){ o.selected=true; found=true; }
       modelSel.appendChild(o);
     });
+    // Si el modelo actual es uno personalizado no listado, añadirlo
+    if(!found && d.current){
+      const o=document.createElement('option');
+      o.value=d.current; o.textContent=d.current+' (personalizado)';
+      o.selected=true;
+      modelSel.insertBefore(o, modelSel.lastChild);
+    }
   }).catch(()=>{});
+
+  let lastModel = null;
+  modelSel.addEventListener('focus', ()=>{ lastModel = modelSel.value; });
   modelSel.addEventListener('change', ()=>{
-    fetch('/api/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: modelSel.value})})
+    let id = modelSel.value;
+    if(id==='__custom__'){
+      const typed = (prompt('Escribe el ID del modelo (ej: claude-opus-4.8):','claude-opus-4.8')||'').trim();
+      if(!typed){ if(lastModel) modelSel.value=lastModel; return; }
+      // Añadir/seleccionar la opción personalizada
+      let opt=[...modelSel.options].find(o=>o.value===typed);
+      if(!opt){ opt=document.createElement('option'); opt.value=typed; opt.textContent=typed+' (personalizado)'; modelSel.insertBefore(opt, modelSel.lastChild); }
+      opt.selected=true; id=typed;
+    }
+    fetch('/api/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: id})})
       .then(()=> addMsg('bot', 'Modelo cambiado a <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.'));
   });
 }
