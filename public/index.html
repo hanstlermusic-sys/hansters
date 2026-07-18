@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HanstlerS</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo">H</span>
+      <div class="brand-text">
+        <strong>HanstlerS</strong>
+        <small>tu asistente personal</small>
+      </div>
+    </div>
+    <div class="cwd" id="cwd" title="Carpeta de trabajo">~</div>
+    <div class="actions">
+      <button id="btn-folder" title="Elegir carpeta de proyecto">📁 Carpeta</button>
+      <button id="btn-new" title="Nueva conversación">✦ Nuevo</button>
+    </div>
+  </header>
+
+  <main id="chat">
+    <div class="msg bot">
+      <div class="avatar">H</div>
+      <div class="bubble">¡Hola! Soy <strong>HanstlerS</strong>. Elige tu carpeta de proyecto arriba y dime en qué trabajamos. Puedo leer y editar archivos, ejecutar comandos y usar tu agente <code>hanstler-dev</code>.</div>
+    </div>
+  </main>
+
+  <form id="composer">
+    <button id="btn-mic" type="button" class="mic" title="Hablar (dictar por voz)">🎤</button>
+    <textarea id="input" rows="1" placeholder="Escribe o pulsa 🎤 para hablar…  (Enter para enviar, Shift+Enter para salto de línea)"></textarea>
+    <button id="btn-speak" type="button" class="speak" title="Leer las respuestas en voz alta">🔈</button>
+    <button id="send" type="submit" title="Enviar">➤</button>
+  </form>
+
+  <script src="/app.js"></script>
+</body>
+</html>
