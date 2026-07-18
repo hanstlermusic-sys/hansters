@@ -193,7 +193,7 @@ if (modelSel) {
   });
 }
 
-function autoGrow(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,180)+'px'; }
+function autoGrow(){ input.style.height='auto'; input.style.height=Math.min(Math.max(input.scrollHeight,88),280)+'px'; }
 input.addEventListener('input', autoGrow);
 input.addEventListener('keydown', (e)=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); composer.requestSubmit(); }

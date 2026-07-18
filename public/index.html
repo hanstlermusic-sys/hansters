@@ -24,7 +24,6 @@
     </div>
     <div class="cwd" id="cwd" title="Carpeta de trabajo">~</div>
     <div class="actions">
-      <select id="model-sel" title="Modelo (velocidad vs. calidad)"></select>
       <button id="btn-folder" title="Elegir carpeta de proyecto">📁 Carpeta</button>
     </div>
   </header>
@@ -37,10 +36,17 @@
   </main>
 
   <form id="composer">
-    <button id="btn-mic" type="button" class="mic" title="Hablar (dictar por voz)">🎤</button>
-    <textarea id="input" rows="1" placeholder="Escribe o pulsa 🎤 para hablar…  (Enter para enviar, Shift+Enter para salto de línea)"></textarea>
-    <button id="btn-speak" type="button" class="speak" title="Leer las respuestas en voz alta">🔈</button>
-    <button id="send" type="submit" title="Enviar">➤</button>
+    <textarea id="input" rows="3" placeholder="Escribe o pulsa 🎤 para hablar…  (Enter para enviar, Shift+Enter para salto de línea)"></textarea>
+    <div id="composer-bar">
+      <div class="left-tools">
+        <select id="model-sel" title="Modelo (velocidad vs. calidad)"></select>
+      </div>
+      <div class="right-tools">
+        <button id="btn-mic" type="button" class="mic" title="Hablar (dictar por voz)">🎤</button>
+        <button id="btn-speak" type="button" class="speak" title="Leer las respuestas en voz alta">🔈</button>
+        <button id="send" type="submit" title="Enviar">➤</button>
+      </div>
+    </div>
   </form>
   </div>
   </div>
