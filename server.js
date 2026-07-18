@@ -27,6 +27,41 @@ function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
 }
 
+// Líneas de "ruido" que el CLI imprime y que el usuario no necesita ver.
+const NOISE = [
+  /^\s*Changes\s+[+\-]?\d+/i,
+  /^\s*AI Credits\b/i,
+  /^\s*Tokens\b/i,
+  /^\s*Resume\b/i,
+  /copilot --resume=/i,
+  /^\s*\d+(\.\d+)?k?\s+(cached|written)/i,
+  /^\s*↑|^\s*↓/,
+  /reasoning\)\s*$/i,
+  /Total duration/i,
+  /Total usage est/i
+];
+function isNoise(line) {
+  return NOISE.some((re) => re.test(line));
+}
+// Crea un filtro con buffer por líneas: recibe texto crudo, devuelve texto limpio.
+function makeLineFilter(onClean) {
+  let buf = '';
+  return {
+    push(text) {
+      buf += text;
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (!isNoise(line)) onClean(line + '\n');
+      }
+    },
+    flush() {
+      if (buf.length) { if (!isNoise(buf)) onClean(buf); buf = ''; }
+    }
+  };
+}
+
 function serveStatic(req, res) {
   let file = req.url === '/' ? '/index.html' : req.url.split('?')[0];
   const full = path.join(PUBLIC, path.normalize(file).replace(/^([.][.][\/\\])+/, ''));
@@ -80,18 +115,22 @@ function handleChat(req, res, body) {
   }
 
   let gotOutput = false;
-  child.stdout.on('data', (d) => { gotOutput = true; send('chunk', stripAnsi(d.toString())); });
-  child.stderr.on('data', (d) => { send('chunk', stripAnsi(d.toString())); });
+  const filter = makeLineFilter((clean) => { gotOutput = true; send('chunk', clean); });
+
+  child.stdout.on('data', (d) => { filter.push(stripAnsi(d.toString())); });
+  child.stderr.on('data', (d) => { filter.push(stripAnsi(d.toString())); });
   child.on('error', (e) => { send('error', 'Error al ejecutar copilot: ' + e.message); res.end(); });
   child.on('close', (code) => {
     if (code !== 0 && state.started && !gotOutput) {
       state.started = false;
       const retry = launch(false);
-      retry.stdout.on('data', (d) => send('chunk', stripAnsi(d.toString())));
-      retry.stderr.on('data', (d) => send('chunk', stripAnsi(d.toString())));
-      retry.on('close', () => { state.started = true; send('done', { code: 0 }); res.end(); });
+      const rf = makeLineFilter((clean) => send('chunk', clean));
+      retry.stdout.on('data', (d) => rf.push(stripAnsi(d.toString())));
+      retry.stderr.on('data', (d) => rf.push(stripAnsi(d.toString())));
+      retry.on('close', () => { rf.flush(); state.started = true; send('done', { code: 0 }); res.end(); });
       return;
     }
+    filter.flush();
     state.started = true;
     send('done', { code });
     res.end();
