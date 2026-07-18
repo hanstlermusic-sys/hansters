@@ -62,8 +62,32 @@ function detectFlags(cb) {
   setTimeout(finish, 8000);
 }
 
+// Respaldo: obtener el id de la sesión más reciente del CLI desde disco.
+function newestSessionId() {
+  const bases = [
+    path.join(os.homedir(), '.copilot', 'history'),
+    path.join(os.homedir(), '.copilot', 'session-state'),
+    path.join(os.homedir(), '.copilot', 'sessions')
+  ];
+  let best = null, bestMs = 0;
+  for (const base of bases) {
+    let entries = [];
+    try { entries = fs.readdirSync(base); } catch (e) { continue; }
+    for (const name of entries) {
+      const id = name.replace(/\.(json|db|sqlite|log)$/i, '');
+      if (!/^[a-f0-9-]{8,}$/i.test(id)) continue;
+      try {
+        const st = fs.statSync(path.join(base, name));
+        if (st.mtimeMs > bestMs) { bestMs = st.mtimeMs; best = id; }
+      } catch (e) {}
+    }
+  }
+  return best;
+}
+
 // Construye los argumentos con las optimizaciones de velocidad soportadas.
-function buildArgs(message, sessionId, withModel) {
+function buildArgs(message, opts, withModel) {
+  opts = opts || {};
   const a = ['-p', message, '--allow-all-tools'];
   const s = SUPPORTED || {};
   if (withModel && s.model && state.model && state.model !== 'auto') { a.push('--model', state.model); }
@@ -73,8 +97,9 @@ function buildArgs(message, sessionId, withModel) {
   if (s.noRemote) a.push('--no-remote');
   if (s.disableBuiltinMcps) a.push('--disable-builtin-mcps');
   if (s.noAskUser) a.push('--no-ask-user');
-  // Continuar la conversación real del CLI si tenemos su session id.
-  if (sessionId) a.push('--resume=' + sessionId);
+  // Mantener el hilo: reanudar por id exacto o continuar la sesión más reciente.
+  if (opts.sessionId) a.push('--resume=' + opts.sessionId);
+  else if (opts.useContinue && s.continue !== false) a.push('--continue');
   return a;
 }
 
@@ -169,19 +194,30 @@ function handleChat(req, res, body) {
   }
   if (!message) { res.writeHead(400); return res.end('empty'); }
   const sessionId = (body.sessionId || '').trim();
-  detectFlags(() => handleChatInner(req, res, message, sessionId));
+  const convId = (body.convId || '').trim();
+  detectFlags(() => handleChatInner(req, res, message, sessionId, convId));
 }
 
-function handleChatInner(req, res, message, sessionId) {
+function handleChatInner(req, res, message, sessionId, convId) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive'
   });
-  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  let ended = false;
+  const send = (event, data) => { if (ended) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {} };
+  res.on('close', () => { ended = true; });
 
-  function launchRaw(withModel, sid) {
-    const a = buildArgs(message, sid, withModel);
+  // Decidir cómo mantener el hilo:
+  //  - si conocemos el session id exacto → --resume
+  //  - si es la misma conversación activa que el último turno → --continue
+  //  - si no → sesión nueva (y marcamos esta conversación como activa)
+  const sameConv = convId && convId === state.activeConvId;
+  const useContinue = !sessionId && sameConv;
+  if (convId) state.activeConvId = convId;
+
+  function launchRaw(withModel, opts) {
+    const a = buildArgs(message, opts, withModel);
     const loader = resolveLoader();
     if (loader) {
       return spawn(process.execPath, [loader].concat(a), { cwd: state.cwd, env: process.env });
@@ -192,10 +228,10 @@ function handleChatInner(req, res, message, sessionId) {
     return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env });
   }
 
-  function attempt(withModel, sid, isRetry) {
+  function attempt(withModel, opts, isRetry) {
     let child;
     try {
-      child = launchRaw(withModel, sid);
+      child = launchRaw(withModel, opts);
     } catch (e) {
       send('error', 'No se pudo iniciar copilot: ' + e.message);
       return res.end();
@@ -203,25 +239,34 @@ function handleChatInner(req, res, message, sessionId) {
 
     let raw = '';
     let gotOutput = false;
+    let sessionEmitted = false;
+    const emitSession = (text) => {
+      if (sessionEmitted) return;
+      const m = /--resume=([a-f0-9-]{8,})/i.exec(text) || /session[ _-]?id["':\s]+([a-f0-9-]{8,})/i.exec(text);
+      if (m) { sessionEmitted = true; send('session', { id: m[1] }); }
+    };
     const filter = makeLineFilter((clean) => { gotOutput = true; send('chunk', clean); });
 
-    child.stdout.on('data', (d) => { const t = stripAnsi(d.toString()); raw += t; filter.push(t); });
-    child.stderr.on('data', (d) => { const t = stripAnsi(d.toString()); raw += t; filter.push(t); });
+    child.stdout.on('data', (d) => { const t = stripAnsi(d.toString()); raw += t; emitSession(raw); filter.push(t); });
+    child.stderr.on('data', (d) => { const t = stripAnsi(d.toString()); raw += t; emitSession(raw); filter.push(t); });
     child.on('error', (e) => { send('error', 'Error al ejecutar copilot: ' + e.message); res.end(); });
     child.on('close', (code) => {
       const modelUnavailable = withModel && /model .*(is )?not available|not available.*--model|--model flag is not available/i.test(raw);
       if (modelUnavailable && !isRetry) {
         state.autoOnly = true;
-        return attempt(false, sid, true);
+        return attempt(false, opts, true);
       }
-      // Si --resume falló (sesión inexistente), reintenta sin sesión.
-      if (code !== 0 && sid && !gotOutput && !isRetry) {
-        return attempt(withModel, '', true);
+      // Si --resume/--continue falló (sesión inexistente), reintenta sin reanudar.
+      if (code !== 0 && (opts.sessionId || opts.useContinue) && !gotOutput && !isRetry) {
+        return attempt(withModel, {}, true);
       }
       filter.flush();
-      // Capturar el session id del CLI para continuar esta conversación luego.
-      const m = /--resume=([a-f0-9-]{8,})/i.exec(raw);
-      if (m) send('session', { id: m[1] });
+      emitSession(raw);
+      // Respaldo: si no se detectó en la salida, buscar la sesión más reciente en disco.
+      if (!sessionEmitted) {
+        const id = newestSessionId();
+        if (id) send('session', { id });
+      }
       send('done', { code });
       res.end();
     });
@@ -230,7 +275,7 @@ function handleChatInner(req, res, message, sessionId) {
     req.on('close', () => { try { child.kill(); } catch (e) {} });
   }
 
-  attempt(!state.autoOnly, sessionId, false);
+  attempt(!state.autoOnly, { sessionId: sessionId, useContinue: useContinue }, false);
 }
 
 // ===== Historial de conversaciones (persistente en disco) =====

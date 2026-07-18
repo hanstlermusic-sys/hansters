@@ -222,7 +222,7 @@ async function runOne(msg, images){
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       signal: currentAbort.signal,
-      body: JSON.stringify({ message: msg, images: images||[], sessionId: convSession || '' })
+      body: JSON.stringify({ message: msg, images: images||[], sessionId: convSession || '', convId: convId })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
