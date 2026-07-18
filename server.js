@@ -597,7 +597,8 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'GET' && req.url === '/api/shutdown') {
     res.writeHead(200); res.end('bye');
-    setTimeout(() => process.exit(0), 200);
+    // En modo Electron no matamos el proceso (Electron gestiona el ciclo de vida).
+    if (!process.env.HANSTLERS_ELECTRON) setTimeout(() => process.exit(0), 200);
     return;
   }
   serveStatic(req, res);
