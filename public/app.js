@@ -55,7 +55,7 @@ const convData = {}; // id -> {title, messages:[], session, queue:[], busy, abor
 let activeId = 'c' + Date.now();
 
 function getConv(id){
-  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, queue:[], busy:false, aborts:new Set() };
+  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, model:null, queue:[], busy:false, aborts:new Set() };
   return convData[id];
 }
 
@@ -66,7 +66,7 @@ function persistConv(id){
     if(fu){ const t=fu.html.replace(/<[^>]+>/g,'').trim(); c.title = t.slice(0,40) || 'Conversación'; }
   }
   fetch('/api/conv/save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session })})
+    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session, model:c.model })})
     .then(()=>loadConvList()).catch(()=>{});
 }
 
@@ -117,13 +117,25 @@ async function openConv(id){
     if(!convData[id]){
       const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
       if(!c || c.error) return;
-      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, queue:[], busy:false, aborts:new Set() };
+      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, model:c.model||null, queue:[], busy:false, aborts:new Set() };
     }
     activeId = id;
     renderActive();
+    reflectModel();
     refreshStopMode();
     loadConvList();
   }catch(e){}
+}
+
+// Refleja en el selector el modelo guardado de la conversación activa.
+function reflectModel(){
+  const sel = document.getElementById('model-sel');
+  if(!sel || !sel.options.length) return;
+  const c = convData[activeId];
+  const m = (c && c.model) ? c.model : 'auto';
+  let opt = [...sel.options].find(o=>o.value===m);
+  if(!opt){ opt=document.createElement('option'); opt.value=m; opt.textContent=m+' (personalizado)'; sel.insertBefore(opt, sel.lastChild); }
+  sel.value = m;
 }
 
 function newConv(){
@@ -160,20 +172,12 @@ const modelSel = document.getElementById('model-sel');
 if (modelSel) {
   fetch('/api/models').then(r=>r.json()).then(d=>{
     modelSel.innerHTML='';
-    let found=false;
     d.models.forEach(m=>{
       const o=document.createElement('option');
       o.value=m.id; o.textContent=m.name;
-      if(m.id===d.current){ o.selected=true; found=true; }
       modelSel.appendChild(o);
     });
-    // Si el modelo actual es uno personalizado no listado, añadirlo
-    if(!found && d.current){
-      const o=document.createElement('option');
-      o.value=d.current; o.textContent=d.current+' (personalizado)';
-      o.selected=true;
-      modelSel.insertBefore(o, modelSel.lastChild);
-    }
+    reflectModel(); // mostrar el modelo de la conversación activa
   }).catch(()=>{});
 
   let lastModel = null;
@@ -181,15 +185,17 @@ if (modelSel) {
   modelSel.addEventListener('change', ()=>{
     let id = modelSel.value;
     if(id==='__custom__'){
-      const typed = (prompt('Escribe el ID del modelo (ej: claude-opus-4.8):','claude-opus-4.8')||'').trim();
+      const typed = (prompt('Escribe el ID del modelo (ej: claude-sonnet-5):','claude-sonnet-5')||'').trim();
       if(!typed){ if(lastModel) modelSel.value=lastModel; return; }
-      // Añadir/seleccionar la opción personalizada
       let opt=[...modelSel.options].find(o=>o.value===typed);
       if(!opt){ opt=document.createElement('option'); opt.value=typed; opt.textContent=typed+' (personalizado)'; modelSel.insertBefore(opt, modelSel.lastChild); }
       opt.selected=true; id=typed;
     }
-    fetch('/api/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: id})})
-      .then(()=>{ const h='Modelo cambiado a <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.'; const c=getConv(activeId); c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId); });
+    // Guardar el modelo EN LA CONVERSACIÓN activa (no global).
+    const c = getConv(activeId);
+    c.model = id;
+    const h='Modelo de esta conversación: <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.';
+    c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId);
   });
 }
 
@@ -238,7 +244,7 @@ async function runOne(id, msg, images){
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       signal: abort.signal,
-      body: JSON.stringify({ message: msg, images: images||[], sessionId: c.session || '', convId: id })
+      body: JSON.stringify({ message: msg, images: images||[], sessionId: c.session || '', convId: id, model: c.model || '' })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();

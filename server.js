@@ -90,7 +90,9 @@ function buildArgs(message, opts, withModel) {
   opts = opts || {};
   const a = ['-p', message, '--allow-all-tools'];
   const s = SUPPORTED || {};
-  if (withModel && s.model && state.model && state.model !== 'auto') { a.push('--model', state.model); }
+  // El modelo puede venir por conversación (opts.model); si no, usa el global.
+  const model = opts.model || state.model;
+  if (withModel && s.model && model && model !== 'auto') { a.push('--model', model); }
   if (s.silent) a.push('--silent');
   if (s.noBanner) a.push('--no-banner');
   if (s.noAutoUpdate) a.push('--no-auto-update');
@@ -194,10 +196,11 @@ function handleChat(req, res, body) {
   if (!message) { res.writeHead(400); return res.end('empty'); }
   const sessionId = (body.sessionId || '').trim();
   const convId = (body.convId || '').trim();
-  detectFlags(() => handleChatInner(req, res, message, sessionId, convId));
+  const model = (body.model || '').trim();
+  detectFlags(() => handleChatInner(req, res, message, sessionId, convId, model));
 }
 
-function handleChatInner(req, res, message, sessionId, convId) {
+function handleChatInner(req, res, message, sessionId, convId, model) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -208,11 +211,9 @@ function handleChatInner(req, res, message, sessionId, convId) {
   res.on('close', () => { ended = true; });
 
   // Cada conversación mantiene su PROPIA sesión (independiente de las demás).
-  // Preferimos el sessionId que envía el cliente; si no, el que el servidor
-  // recordó para esta conversación en un turno anterior.
   state.convSessions = state.convSessions || {};
   let effSession = sessionId || (convId ? state.convSessions[convId] : '') || '';
-  const useContinue = false; // ya no dependemos de un hilo global
+  const effModel = model || state.model;
 
   function launchRaw(withModel, opts) {
     const a = buildArgs(message, opts, withModel);
@@ -257,9 +258,9 @@ function handleChatInner(req, res, message, sessionId, convId) {
         state.autoOnly = true;
         return attempt(false, opts, true);
       }
-      // Si --resume falló (sesión inexistente), reintenta sin reanudar.
+      // Si --resume falló (sesión inexistente), reintenta sin reanudar (conservando el modelo).
       if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
-        return attempt(withModel, {}, true);
+        return attempt(withModel, { model: opts.model }, true);
       }
       filter.flush();
       emitSession(raw);
@@ -276,7 +277,7 @@ function handleChatInner(req, res, message, sessionId, convId) {
     req.on('close', () => { try { child.kill(); } catch (e) {} });
   }
 
-  attempt(!state.autoOnly, { sessionId: effSession }, false);
+  attempt(!state.autoOnly, { sessionId: effSession, model: effModel }, false);
 }
 
 // ===== Historial de conversaciones (persistente en disco) =====
