@@ -111,8 +111,18 @@ if (SR) {
   recog.continuous = false;
   let baseText = '';
 
-  recog.onstart = () => { listening = true; micBtn.classList.add('listening'); };
-  recog.onerror = () => stopListen();
+  recog.onstart = () => { listening = true; micBtn.classList.add('listening'); setStatusMic('Escuchando… habla ahora'); };
+  recog.onerror = (e) => {
+    const m = {
+      'not-allowed': 'Permiso de micrófono denegado. Haz clic en el candado 🔒 de la barra y permite el micrófono.',
+      'service-not-allowed': 'El reconocimiento de voz está bloqueado. Permite el micrófono para este sitio.',
+      'no-speech': 'No te escuché. Intenta de nuevo.',
+      'audio-capture': 'No se detectó micrófono. Conecta uno y reintenta.',
+      'network': 'El dictado necesita conexión a internet.'
+    };
+    setStatusMic('🎤 ' + (m[e.error] || ('Error de voz: ' + e.error)));
+    stopListen();
+  };
   recog.onend = () => stopListen();
   recog.onresult = (e) => {
     let txt = '';
@@ -121,8 +131,18 @@ if (SR) {
     autoGrow();
   };
 
-  micBtn.addEventListener('click', () => {
+  micBtn.addEventListener('click', async () => {
     if (listening) { recog.stop(); return; }
+    // Pedir permiso de micrófono explícitamente (mejora el prompt en modo app).
+    try {
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+        s.getTracks().forEach(t => t.stop());
+      }
+    } catch (err) {
+      setStatusMic('🎤 Permiso de micrófono denegado. Actívalo en el candado 🔒 de la barra.');
+      return;
+    }
     baseText = input.value.trim();
     try { recog.start(); } catch (_) {}
   });
@@ -133,6 +153,20 @@ if (SR) {
 }
 
 function stopListen(){ listening = false; micBtn.classList.remove('listening'); }
+
+function setStatusMic(text){
+  let bar = document.getElementById('mic-status');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'mic-status';
+    bar.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:82px;background:#1a1a2a;border:1px solid #33335a;color:#e8e8f0;padding:8px 14px;border-radius:10px;font-size:13px;z-index:50;max-width:80%;box-shadow:0 4px 20px rgba(0,0,0,.5);';
+    document.body.appendChild(bar);
+  }
+  bar.textContent = text;
+  bar.style.display = 'block';
+  clearTimeout(bar._t);
+  bar._t = setTimeout(() => { bar.style.display = 'none'; }, 6000);
+}
 
 let speakOn = false;
 speakBtn.addEventListener('click', () => {

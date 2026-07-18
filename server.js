@@ -59,12 +59,21 @@ function handleChat(req, res, body) {
   });
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
-  const args = ['-p', message, '--allow-all-tools'];
-  if (state.started) args.push('--continue');
+  const baseArgs = ['-p', message, '--allow-all-tools'];
+
+  function launch(useContinue) {
+    const a = useContinue ? baseArgs.concat('--continue') : baseArgs.slice();
+    // En Windows: invocar via cmd.exe con shell:false para que Node entrecomille
+    // correctamente cada argumento (evita "Invalid command format" con espacios).
+    if (process.platform === 'win32') {
+      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: state.cwd, env: process.env });
+    }
+    return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env });
+  }
 
   let child;
   try {
-    child = spawn(COPILOT_CMD, args, { cwd: state.cwd, shell: true, env: process.env });
+    child = launch(state.started);
   } catch (e) {
     send('error', 'No se pudo iniciar copilot: ' + e.message);
     return res.end();
@@ -77,7 +86,7 @@ function handleChat(req, res, body) {
   child.on('close', (code) => {
     if (code !== 0 && state.started && !gotOutput) {
       state.started = false;
-      const retry = spawn(COPILOT_CMD, ['-p', message, '--allow-all-tools'], { cwd: state.cwd, shell: true, env: process.env });
+      const retry = launch(false);
       retry.stdout.on('data', (d) => send('chunk', stripAnsi(d.toString())));
       retry.stderr.on('data', (d) => send('chunk', stripAnsi(d.toString())));
       retry.on('close', () => { state.started = true; send('done', { code: 0 }); res.end(); });
