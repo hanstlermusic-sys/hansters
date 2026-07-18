@@ -90,10 +90,12 @@ input.addEventListener('keydown', (e)=>{
 
 let processing=false;
 const queue=[];
+let pendingImages=[]; // imágenes adjuntas al mensaje que se está redactando
 
-function enqueue(msg){
-  addMsg('user', renderMd(msg));
-  queue.push(msg);
+function enqueue(msg, images){
+  const imgHtml = (images&&images.length) ? images.map(im=>`<img src="${im}" style="max-width:160px;max-height:120px;border-radius:8px;margin:4px 4px 0 0;border:1px solid #33335a;">`).join('') : '';
+  addMsg('user', renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):''));
+  queue.push({msg, images: images||[]});
   updatePending();
   if(!processing) drainQueue();
 }
@@ -116,20 +118,20 @@ function updatePending(){
 async function drainQueue(){
   processing=true;
   while(queue.length){
-    const msg=queue.shift();
+    const item=queue.shift();
     updatePending();
-    await runOne(msg);
+    await runOne(item.msg, item.images);
   }
   processing=false;
 }
 
-async function runOne(msg){
+async function runOne(msg, images){
   const bubble = addMsg('bot', '<span class="typing"><span></span><span></span><span></span></span>');
   let acc='';
   try{
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ message: msg })
+      body: JSON.stringify({ message: msg, images: images||[] })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
@@ -160,10 +162,55 @@ async function runOne(msg){
 composer.addEventListener('submit', (e)=>{
   e.preventDefault();
   const msg = input.value.trim();
-  if(!msg) return;
+  const imgs = pendingImages.slice();
+  if(!msg && !imgs.length) return;
   input.value=''; autoGrow();
-  enqueue(msg);
+  clearPreview();
+  enqueue(msg || '¿Qué ves en esta imagen?', imgs);
   input.focus();
+});
+
+/* ===== Adjuntar imágenes: pegar (Ctrl+V) y arrastrar ===== */
+function addImage(dataUrl){
+  pendingImages.push(dataUrl);
+  renderPreview();
+}
+function clearPreview(){ pendingImages=[]; renderPreview(); }
+function renderPreview(){
+  let bar=document.getElementById('img-preview');
+  if(!bar){
+    bar=document.createElement('div');
+    bar.id='img-preview';
+    bar.style.cssText='display:flex;gap:8px;flex-wrap:wrap;padding:0 18px;max-width:936px;margin:0 auto;width:100%;';
+    composer.parentNode.insertBefore(bar, composer);
+  }
+  bar.innerHTML='';
+  pendingImages.forEach((im,idx)=>{
+    const w=document.createElement('div');
+    w.style.cssText='position:relative;';
+    w.innerHTML=`<img src="${im}" style="height:56px;border-radius:8px;border:1px solid #33335a;"><span style="position:absolute;top:-6px;right:-6px;background:#ff2668;color:#fff;border-radius:50%;width:18px;height:18px;display:grid;place-items:center;font-size:12px;cursor:pointer;">×</span>`;
+    w.querySelector('span').onclick=()=>{ pendingImages.splice(idx,1); renderPreview(); };
+    bar.appendChild(w);
+  });
+  bar.style.display = pendingImages.length ? 'flex' : 'none';
+}
+function fileToDataUrl(file){
+  return new Promise((resolve)=>{ const r=new FileReader(); r.onload=()=>resolve(r.result); r.readAsDataURL(file); });
+}
+
+document.addEventListener('paste', async (e)=>{
+  const items = (e.clipboardData||{}).items || [];
+  for(const it of items){
+    if(it.type && it.type.startsWith('image/')){
+      const f=it.getAsFile();
+      if(f){ addImage(await fileToDataUrl(f)); e.preventDefault(); }
+    }
+  }
+});
+['dragover','drop'].forEach(ev=>document.addEventListener(ev,(e)=>{ e.preventDefault(); }));
+document.addEventListener('drop', async (e)=>{
+  const files = (e.dataTransfer||{}).files || [];
+  for(const f of files){ if(f.type.startsWith('image/')) addImage(await fileToDataUrl(f)); }
 });
 
 input.focus();

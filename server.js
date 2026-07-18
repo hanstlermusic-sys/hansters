@@ -10,10 +10,26 @@ const PORT = process.env.HANSTLERS_PORT ? Number(process.env.HANSTLERS_PORT) : 8
 const COPILOT_CMD = process.env.HANSTLERS_CMD || 'copilot';
 const PUBLIC = path.join(__dirname, 'public');
 
+// Resuelve el script real de Copilot (npm-loader.js) para poder ejecutarlo con
+// node directamente y preservar saltos de línea (cmd.exe los rompe).
+let LOADER = undefined; // undefined = sin resolver; null = no encontrado
+function resolveLoader() {
+  if (LOADER !== undefined) return LOADER;
+  if (process.env.HANSTLERS_LOADER) { LOADER = process.env.HANSTLERS_LOADER; return LOADER; }
+  if (process.env.HANSTLERS_CMD) { LOADER = null; return LOADER; } // modo test: usar wrapper
+  const candidates = [];
+  if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@github', 'copilot', 'npm-loader.js'));
+  if (process.env.ProgramFiles) candidates.push(path.join(process.env.ProgramFiles, 'nodejs', 'node_modules', '@github', 'copilot', 'npm-loader.js'));
+  if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@github', 'copilot', 'index.js'));
+  for (const c of candidates) { try { if (fs.existsSync(c)) { LOADER = c; return LOADER; } } catch (e) {} }
+  LOADER = null;
+  return LOADER;
+}
+
 let state = {
   cwd: process.env.HANSTLERS_CWD || process.env.USERPROFILE || os.homedir(),
   started: false,
-  model: process.env.HANSTLERS_MODEL || 'claude-haiku-4.5'
+  model: process.env.HANSTLERS_MODEL || 'auto'
 };
 
 // Detecta qué flags soporta la version instalada del CLI (una sola vez).
@@ -47,10 +63,10 @@ function detectFlags(cb) {
 }
 
 // Construye los argumentos con las optimizaciones de velocidad soportadas.
-function buildArgs(message, useContinue) {
+function buildArgs(message, useContinue, withModel) {
   const a = ['-p', message, '--allow-all-tools'];
   const s = SUPPORTED || {};
-  if (s.model && state.model && state.model !== 'auto') { a.push('--model', state.model); }
+  if (withModel && s.model && state.model && state.model !== 'auto') { a.push('--model', state.model); }
   if (s.silent) a.push('--silent');
   if (s.noBanner) a.push('--no-banner');
   if (s.noAutoUpdate) a.push('--no-auto-update');
@@ -130,7 +146,26 @@ function readBody(req) {
 }
 
 function handleChat(req, res, body) {
-  const message = (body.message || '').trim();
+  let message = (body.message || '').trim();
+  const images = Array.isArray(body.images) ? body.images : [];
+  // Guardar imágenes pegadas/arrastradas y referenciarlas con @ruta para el CLI.
+  const savedPaths = [];
+  try {
+    const dir = path.join(os.tmpdir(), 'hanstlers-img');
+    fs.mkdirSync(dir, { recursive: true });
+    images.forEach((img, i) => {
+      const m = /^data:image\/(png|jpeg|jpg|gif|webp);base64,(.+)$/i.exec(img || '');
+      if (!m) return;
+      const ext = m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase();
+      const file = path.join(dir, `img_${Date.now()}_${i}.${ext}`);
+      fs.writeFileSync(file, Buffer.from(m[2], 'base64'));
+      savedPaths.push(file);
+    });
+  } catch (e) {}
+  if (savedPaths.length) {
+    const refs = savedPaths.map((p) => '@' + p).join(' ');
+    message = message ? (message + '\n\n' + refs) : ('Describe estas imágenes: ' + refs);
+  }
   if (!message) { res.writeHead(400); return res.end('empty'); }
   detectFlags(() => handleChatInner(req, res, message));
 }
@@ -143,47 +178,60 @@ function handleChatInner(req, res, message) {
   });
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
-  function launch(useContinue) {
-    const a = buildArgs(message, useContinue);
-    // En Windows: invocar via cmd.exe con shell:false para que Node entrecomille
-    // correctamente cada argumento (evita "Invalid command format" con espacios).
+  function launchRaw(withModel, useContinue) {
+    const a = buildArgs(message, useContinue, withModel);
+    const loader = resolveLoader();
+    if (loader) {
+      // Ejecutar node npm-loader.js directamente: preserva saltos de línea.
+      return spawn(process.execPath, [loader].concat(a), { cwd: state.cwd, env: process.env });
+    }
+    // Fallback: wrapper por cmd.exe (modo test o si no se halló el loader).
     if (process.platform === 'win32') {
       return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: state.cwd, env: process.env });
     }
     return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env });
   }
 
-  let child;
-  try {
-    child = launch(state.started);
-  } catch (e) {
-    send('error', 'No se pudo iniciar copilot: ' + e.message);
-    return res.end();
+  // Ejecuta un intento; si el modelo no está disponible, reintenta con Auto.
+  function attempt(withModel, useContinue, isRetry) {
+    let child;
+    try {
+      child = launchRaw(withModel, useContinue);
+    } catch (e) {
+      send('error', 'No se pudo iniciar copilot: ' + e.message);
+      return res.end();
+    }
+
+    let raw = '';
+    let gotOutput = false;
+    const filter = makeLineFilter((clean) => { gotOutput = true; send('chunk', clean); });
+
+    child.stdout.on('data', (d) => { const t = stripAnsi(d.toString()); raw += t; filter.push(t); });
+    child.stderr.on('data', (d) => { const t = stripAnsi(d.toString()); raw += t; filter.push(t); });
+    child.on('error', (e) => { send('error', 'Error al ejecutar copilot: ' + e.message); res.end(); });
+    child.on('close', (code) => {
+      const modelUnavailable = withModel && /model .*(is )?not available|not available.*--model|--model flag is not available/i.test(raw);
+      // Si el modelo elegido no está disponible en el plan → reintentar con Auto.
+      if (modelUnavailable && !isRetry) {
+        state.autoOnly = true;
+        return attempt(false, useContinue, true);
+      }
+      // Reintento por sesión previa inexistente (--continue falló sin salida).
+      if (code !== 0 && useContinue && !gotOutput && !isRetry) {
+        state.started = false;
+        return attempt(withModel, false, true);
+      }
+      filter.flush();
+      state.started = true;
+      send('done', { code });
+      res.end();
+    });
+
+    req.on('close', () => { try { child.kill(); } catch (e) {} });
   }
 
-  let gotOutput = false;
-  const filter = makeLineFilter((clean) => { gotOutput = true; send('chunk', clean); });
-
-  child.stdout.on('data', (d) => { filter.push(stripAnsi(d.toString())); });
-  child.stderr.on('data', (d) => { filter.push(stripAnsi(d.toString())); });
-  child.on('error', (e) => { send('error', 'Error al ejecutar copilot: ' + e.message); res.end(); });
-  child.on('close', (code) => {
-    if (code !== 0 && state.started && !gotOutput) {
-      state.started = false;
-      const retry = launch(false);
-      const rf = makeLineFilter((clean) => send('chunk', clean));
-      retry.stdout.on('data', (d) => rf.push(stripAnsi(d.toString())));
-      retry.stderr.on('data', (d) => rf.push(stripAnsi(d.toString())));
-      retry.on('close', () => { rf.flush(); state.started = true; send('done', { code: 0 }); res.end(); });
-      return;
-    }
-    filter.flush();
-    state.started = true;
-    send('done', { code });
-    res.end();
-  });
-
-  req.on('close', () => { try { child.kill(); } catch (e) {} });
+  // Si ya sabemos que el plan solo permite Auto, no mandes --model.
+  attempt(!state.autoOnly, state.started, false);
 }
 
 function pickFolder(res) {
