@@ -264,6 +264,7 @@ async function runOne(id, msg, images){
         if(type==='chunk'){ acc += data; setHtml(renderMd(acc)); }
         else if(type==='session'){ if(data && data.id){ c.session = data.id; } }
         else if(type==='memory'){ if(data && data.text) showMemoryChip(data.text); }
+        else if(type==='usage'){ if(data) updateUsage(data); }
         else if(type==='error'){ acc += '\n⚠️ '+data; setHtml(renderMd(acc)); }
       }
     }
@@ -305,6 +306,18 @@ function showMemoryChip(text){
   chip.style.display = 'block';
   clearTimeout(chip._t);
   chip._t = setTimeout(()=>{ chip.style.display='none'; }, 4000);
+}
+
+// Medidor de consumo pequeño (acumula créditos de la sesión).
+let sessionCredits = 0;
+function updateUsage(u){
+  if(typeof u.credits === 'number' && !isNaN(u.credits)) sessionCredits += u.credits;
+  const el = document.getElementById('usage-meter');
+  if(!el) return;
+  let s = '';
+  if(sessionCredits > 0) s += '◈ ' + sessionCredits.toFixed(2);
+  if(u.tokens) s += (s?'  ':'') + '⇅ ' + u.tokens;
+  el.textContent = s || '·';
 }
 
 composer.addEventListener('submit', (e)=>{

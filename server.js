@@ -342,6 +342,13 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote) {
         const id = newestSessionId();
         if (id) { rememberSession(id); send('session', { id }); }
       }
+      // Medidor: extraer créditos AI y tokens de la salida del CLI (si los imprime).
+      const usage = {};
+      const cr = /AI Credits\s+([\d.]+)/i.exec(raw);
+      if (cr) usage.credits = parseFloat(cr[1]);
+      const tk = /Tokens[\s\S]{0,40}?([\d.]+k?)\b/i.exec(raw);
+      if (tk) usage.tokens = tk[1];
+      if (usage.credits !== undefined || usage.tokens) send('usage', usage);
       send('done', { code });
       res.end();
     });
