@@ -243,13 +243,18 @@ function handleChat(req, res, body) {
     }
   }
 
-  // Inyectar la memoria como contexto del prompt (para poder recordar en cualquier conversación).
-  const mem = memoryContextBlock();
-  const finalMessage = mem ? (mem + 'Mensaje del usuario:\n' + message) : message;
-
   const sessionId = (body.sessionId || '').trim();
   const convId = (body.convId || '').trim();
   const model = (body.model || '').trim();
+
+  // AHORRO DE TOKENS: inyectar la memoria SOLO cuando aporta valor:
+  //  - primer mensaje de la conversación (aún no hay sesión que la contenga), o
+  //  - el usuario pregunta/alude a la memoria ("recuerdas", "acuerdas", "sabes que"...).
+  const asksMemory = /\b(recuerdas?|te acuerdas|acuerdas|sab[eí]as?|dijimos|hab[ií]amos|mencion[eé]|coment[eé])\b/i.test(body.message || '');
+  const firstTurn = !sessionId;
+  const mem = (firstTurn || asksMemory) ? memoryContextBlock() : '';
+  const finalMessage = mem ? (mem + 'Mensaje del usuario:\n' + message) : message;
+
   detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote));
 }
 
