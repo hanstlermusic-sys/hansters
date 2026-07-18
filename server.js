@@ -162,6 +162,44 @@ function serveStatic(req, res) {
   });
 }
 
+// ===== Memoria global (persiste entre TODAS las conversaciones) =====
+const MEM_FILE = path.join(os.homedir(), '.hanstlers', 'memory.json');
+function loadMemory() {
+  try { return JSON.parse(fs.readFileSync(MEM_FILE, 'utf8')); } catch (e) { return []; }
+}
+function saveMemory(list) {
+  try { fs.mkdirSync(path.dirname(MEM_FILE), { recursive: true }); fs.writeFileSync(MEM_FILE, JSON.stringify(list)); } catch (e) {}
+}
+function addMemory(text) {
+  text = (text || '').trim();
+  if (!text) return null;
+  const list = loadMemory();
+  const item = { id: 'm' + Date.now() + Math.floor(Math.random() * 1000), text, at: Date.now() };
+  list.push(item);
+  saveMemory(list);
+  return item;
+}
+// Detecta datos a recordar, de forma automática:
+//  - órdenes explícitas: "recuerda que ...", "anota que ..."
+//  - hechos declarativos duraderos sobre el usuario/proyectos
+function detectMemory(message) {
+  const notes = [];
+  const explicit = /(?:^|\b)(?:recuerda|recu[eé]rdame|acu[eé]rdate|acu[eé]rdame|anota|guarda|ten en cuenta)(?:\s+que)?\s*[:,]?\s+([\s\S]{3,})/i.exec(message);
+  if (explicit) notes.push(explicit[1].trim().replace(/^["“]|["”]$/g, ''));
+  // Hechos declarativos (frases cortas), solo si el usuario no está preguntando.
+  if (!/[?¿]/.test(message) && message.length < 200) {
+    const decl = /(?:^|\b)((?:mi|mis|me llamo|soy|trabajo en|uso|prefiero|mi nombre es)\b[\s\S]{3,120})/i.exec(message);
+    if (decl && !explicit) notes.push(decl[1].trim());
+  }
+  return notes;
+}
+function memoryContextBlock() {
+  const list = loadMemory();
+  if (!list.length) return '';
+  const facts = list.map((x) => '- ' + x.text).join('\n');
+  return 'Datos que debes recordar sobre el usuario y sus proyectos (memoria persistente):\n' + facts + '\n\n';
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let b = '';
@@ -194,13 +232,28 @@ function handleChat(req, res, body) {
     message = message ? (message + '\n\n' + refs) : ('Describe estas imágenes: ' + refs);
   }
   if (!message) { res.writeHead(400); return res.end('empty'); }
+
+  // Auto-capturar memoria: órdenes explícitas + hechos declarativos.
+  let memNote = '';
+  const facts = detectMemory((body.message || '').trim());
+  if (facts.length) {
+    const existing = loadMemory().map((x) => x.text.toLowerCase());
+    for (const f of facts) {
+      if (!existing.includes(f.toLowerCase())) { addMemory(f); memNote = f; }
+    }
+  }
+
+  // Inyectar la memoria como contexto del prompt (para poder recordar en cualquier conversación).
+  const mem = memoryContextBlock();
+  const finalMessage = mem ? (mem + 'Mensaje del usuario:\n' + message) : message;
+
   const sessionId = (body.sessionId || '').trim();
   const convId = (body.convId || '').trim();
   const model = (body.model || '').trim();
-  detectFlags(() => handleChatInner(req, res, message, sessionId, convId, model));
+  detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote));
 }
 
-function handleChatInner(req, res, message, sessionId, convId, model) {
+function handleChatInner(req, res, message, sessionId, convId, model, memNote) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -209,6 +262,9 @@ function handleChatInner(req, res, message, sessionId, convId, model) {
   let ended = false;
   const send = (event, data) => { if (ended) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {} };
   res.on('close', () => { ended = true; });
+
+  // Avisar al cliente que se guardó un dato en memoria (para mostrar chip discreto).
+  if (memNote) send('memory', { text: memNote });
 
   // Cada conversación mantiene su PROPIA sesión (independiente de las demás).
   state.convSessions = state.convSessions || {};

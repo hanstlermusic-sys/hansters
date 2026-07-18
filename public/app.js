@@ -263,6 +263,7 @@ async function runOne(id, msg, images){
         let data; try{ data = JSON.parse(dm[1]); }catch(_){ data = dm[1]; }
         if(type==='chunk'){ acc += data; setHtml(renderMd(acc)); }
         else if(type==='session'){ if(data && data.id){ c.session = data.id; } }
+        else if(type==='memory'){ if(data && data.text) showMemoryChip(data.text); }
         else if(type==='error'){ acc += '\n⚠️ '+data; setHtml(renderMd(acc)); }
       }
     }
@@ -289,6 +290,21 @@ function refreshStopMode(){
   sendBtn.textContent = on ? '⏹' : '➤';
   sendBtn.title = on ? 'Detener' : 'Enviar';
   sendBtn.classList.toggle('stopping', on);
+}
+
+// Aviso discreto de "memoria guardada" (se auto-oculta).
+function showMemoryChip(text){
+  let chip = document.getElementById('mem-chip');
+  if(!chip){
+    chip = document.createElement('div');
+    chip.id = 'mem-chip';
+    chip.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:#1a1030;border:1px solid #b026ff;color:#e8e8f0;padding:8px 14px;border-radius:20px;font-size:12.5px;z-index:60;box-shadow:0 4px 20px rgba(176,38,255,.4);max-width:70%;';
+    document.body.appendChild(chip);
+  }
+  chip.textContent = '🧠 Recordaré: ' + text;
+  chip.style.display = 'block';
+  clearTimeout(chip._t);
+  chip._t = setTimeout(()=>{ chip.style.display='none'; }, 4000);
 }
 
 composer.addEventListener('submit', (e)=>{
