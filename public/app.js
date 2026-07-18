@@ -73,8 +73,15 @@ async function loadConvList(){
     (j.items||[]).forEach(it=>{
       const el = document.createElement('div');
       el.className = 'conv-item' + (it.id===convId?' active':'');
-      el.innerHTML = `<span class="t">${esc(it.title)}</span><span class="del" title="Borrar">🗑</span>`;
+      el.innerHTML = `<span class="t" title="${esc(it.title)}">${esc(it.title)}</span><span class="ren" title="Renombrar">✏️</span><span class="del" title="Borrar">🗑</span>`;
       el.querySelector('.t').onclick = ()=> openConv(it.id);
+      el.querySelector('.ren').onclick = async (e)=>{ e.stopPropagation();
+        const nn = (prompt('Nuevo nombre de la conversación:', it.title)||'').trim();
+        if(!nn) return;
+        await fetch('/api/conv/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id,title:nn})});
+        if(it.id===convId) convTitle=nn;
+        loadConvList();
+      };
       el.querySelector('.del').onclick = async (e)=>{ e.stopPropagation();
         await fetch('/api/conv/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id})});
         if(it.id===convId) newConv(); else loadConvList();

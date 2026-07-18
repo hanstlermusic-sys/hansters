@@ -332,6 +332,13 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true }));
   }
+  if (req.method === 'POST' && req.url === '/api/conv/rename') {
+    const b = await readBody(req);
+    const c = getConversation((b && b.id) || '');
+    if (c && b.title) { c.title = String(b.title).slice(0, 80); c.renamed = true; saveConversation(c); }
+    res.writeHead(c ? 200 : 404, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: !!c }));
+  }
   if (req.method === 'POST' && req.url === '/api/conv/delete') {
     const b = await readBody(req);
     const ok = deleteConversation((b && b.id) || '');
