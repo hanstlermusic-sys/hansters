@@ -126,6 +126,25 @@ const server = http.createServer(async (req, res) => {
   serveStatic(req, res);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`HanstlerS escuchando en http://127.0.0.1:${PORT}`);
+let bindTries = 0;
+function startListen() {
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`HanstlerS escuchando en http://127.0.0.1:${PORT}`);
+  });
+}
+
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE' && bindTries < 5) {
+    bindTries++;
+    const req = http.get({ host: '127.0.0.1', port: PORT, path: '/api/shutdown', timeout: 1500 }, () => {});
+    req.on('error', () => {});
+    setTimeout(() => {
+      try { server.close(); } catch (e) {}
+      startListen();
+    }, 900);
+  } else if (err && err.code !== 'EADDRINUSE') {
+    console.error('Error del servidor:', err && err.message);
+  }
 });
+
+startListen();
