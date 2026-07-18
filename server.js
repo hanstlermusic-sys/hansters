@@ -6,6 +6,12 @@ const path = require('path');
 const os = require('os');
 const { spawn, execFile } = require('child_process');
 
+// AHORRO DE TOKENS: salidas de herramientas grandes van a archivo (el modelo ve
+// solo una vista previa), reduciendo el contexto por turno. Ajustable por env.
+if (!process.env.COPILOT_LARGE_OUTPUT_THRESHOLD_BYTES) {
+  process.env.COPILOT_LARGE_OUTPUT_THRESHOLD_BYTES = '4096';
+}
+
 const PORT = process.env.HANSTLERS_PORT ? Number(process.env.HANSTLERS_PORT) : 8717;
 const COPILOT_CMD = process.env.HANSTLERS_CMD || 'copilot';
 const PUBLIC = path.join(__dirname, 'public');
@@ -49,7 +55,9 @@ function detectFlags(cb) {
       noRemote: has('--no-remote'),
       disableBuiltinMcps: has('--disable-builtin-mcps'),
       model: has('--model'),
-      noAskUser: has('--no-ask-user')
+      noAskUser: has('--no-ask-user'),
+      effort: has('--effort') || has('--reasoning-effort'),
+      maxAiCredits: has('--max-ai-credits')
     };
     cb(SUPPORTED);
   };
@@ -99,6 +107,10 @@ function buildArgs(message, opts, withModel) {
   if (s.noRemote) a.push('--no-remote');
   if (s.disableBuiltinMcps) a.push('--disable-builtin-mcps');
   if (s.noAskUser) a.push('--no-ask-user');
+  // AHORRO: menor esfuerzo de razonamiento (menos tokens de "pensamiento").
+  if (s.effort) a.push('--effort=' + (process.env.HANSTLERS_EFFORT || 'low'));
+  // AHORRO/seguridad: tope de créditos por respuesta (evita gastos desbocados).
+  if (s.maxAiCredits && process.env.HANSTLERS_MAX_CREDITS) a.push('--max-ai-credits=' + process.env.HANSTLERS_MAX_CREDITS);
   // Mantener el hilo: reanudar por id exacto de sesión de esta conversación.
   if (opts.sessionId) a.push('--resume=' + opts.sessionId);
   return a;
