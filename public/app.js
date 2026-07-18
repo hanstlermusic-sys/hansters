@@ -44,6 +44,24 @@ document.getElementById('btn-new').addEventListener('click', async ()=>{
   addMsg('bot', 'Nueva conversación. ¿En qué trabajamos?');
 });
 
+// Selector de modelo
+const modelSel = document.getElementById('model-sel');
+if (modelSel) {
+  fetch('/api/models').then(r=>r.json()).then(d=>{
+    modelSel.innerHTML='';
+    d.models.forEach(m=>{
+      const o=document.createElement('option');
+      o.value=m.id; o.textContent=m.name;
+      if(m.id===d.current) o.selected=true;
+      modelSel.appendChild(o);
+    });
+  }).catch(()=>{});
+  modelSel.addEventListener('change', ()=>{
+    fetch('/api/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: modelSel.value})})
+      .then(()=> addMsg('bot', 'Modelo cambiado a <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.'));
+  });
+}
+
 function autoGrow(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,180)+'px'; }
 input.addEventListener('input', autoGrow);
 input.addEventListener('keydown', (e)=>{

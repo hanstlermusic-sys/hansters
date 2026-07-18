@@ -12,8 +12,54 @@ const PUBLIC = path.join(__dirname, 'public');
 
 let state = {
   cwd: process.env.HANSTLERS_CWD || process.env.USERPROFILE || os.homedir(),
-  started: false
+  started: false,
+  model: process.env.HANSTLERS_MODEL || 'claude-haiku-4.5'
 };
+
+// Detecta qué flags soporta la version instalada del CLI (una sola vez).
+let SUPPORTED = null;
+function detectFlags(cb) {
+  if (SUPPORTED) return cb(SUPPORTED);
+  const runner = process.platform === 'win32'
+    ? spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD, '--help'], { env: process.env })
+    : spawn(COPILOT_CMD, ['--help'], { env: process.env });
+  let out = '';
+  const done = () => {
+    const has = (f) => out.includes(f);
+    SUPPORTED = {
+      silent: has('--silent') || /\s-s[,\s]/.test(out),
+      noBanner: has('--no-banner'),
+      noAutoUpdate: has('--no-auto-update'),
+      noRemote: has('--no-remote'),
+      disableBuiltinMcps: has('--disable-builtin-mcps'),
+      model: has('--model'),
+      noAskUser: has('--no-ask-user')
+    };
+    cb(SUPPORTED);
+  };
+  let finished = false;
+  const finish = () => { if (!finished) { finished = true; done(); } };
+  runner.stdout.on('data', (d) => (out += d.toString()));
+  runner.stderr.on('data', (d) => (out += d.toString()));
+  runner.on('close', finish);
+  runner.on('error', finish);
+  setTimeout(finish, 8000);
+}
+
+// Construye los argumentos con las optimizaciones de velocidad soportadas.
+function buildArgs(message, useContinue) {
+  const a = ['-p', message, '--allow-all-tools'];
+  const s = SUPPORTED || {};
+  if (s.model && state.model && state.model !== 'auto') { a.push('--model', state.model); }
+  if (s.silent) a.push('--silent');
+  if (s.noBanner) a.push('--no-banner');
+  if (s.noAutoUpdate) a.push('--no-auto-update');
+  if (s.noRemote) a.push('--no-remote');
+  if (s.disableBuiltinMcps) a.push('--disable-builtin-mcps');
+  if (s.noAskUser) a.push('--no-ask-user');
+  if (useContinue) a.push('--continue');
+  return a;
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -86,7 +132,10 @@ function readBody(req) {
 function handleChat(req, res, body) {
   const message = (body.message || '').trim();
   if (!message) { res.writeHead(400); return res.end('empty'); }
+  detectFlags(() => handleChatInner(req, res, message));
+}
 
+function handleChatInner(req, res, message) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -94,10 +143,8 @@ function handleChat(req, res, body) {
   });
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
-  const baseArgs = ['-p', message, '--allow-all-tools'];
-
   function launch(useContinue) {
-    const a = useContinue ? baseArgs.concat('--continue') : baseArgs.slice();
+    const a = buildArgs(message, useContinue);
     // En Windows: invocar via cmd.exe con shell:false para que Node entrecomille
     // correctamente cada argumento (evita "Invalid command format" con espacios).
     if (process.platform === 'win32') {
@@ -159,7 +206,26 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/api/pickfolder') return pickFolder(res);
   if (req.method === 'GET' && req.url === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ cwd: state.cwd }));
+    return res.end(JSON.stringify({ cwd: state.cwd, model: state.model }));
+  }
+  if (req.method === 'GET' && req.url === '/api/models') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      current: state.model,
+      models: [
+        { id: 'claude-haiku-4.5', name: 'Haiku (más rápido)' },
+        { id: 'gpt-5-mini', name: 'GPT-5 mini (rápido)' },
+        { id: 'gemini-3.5-flash', name: 'Gemini Flash (rápido)' },
+        { id: 'claude-sonnet-4.5', name: 'Sonnet (equilibrado)' },
+        { id: 'auto', name: 'Automático' }
+      ]
+    }));
+  }
+  if (req.method === 'POST' && req.url === '/api/model') {
+    const b = await readBody(req);
+    if (b && b.model) { state.model = b.model; state.started = false; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, model: state.model }));
   }
   if (req.method === 'POST' && req.url === '/api/newsession') {
     state.started = false;
