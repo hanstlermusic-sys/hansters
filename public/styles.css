@@ -99,6 +99,22 @@ body{
 .typing span:nth-child(2){animation-delay:.2s}.typing span:nth-child(3){animation-delay:.4s}
 @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
 
+.working{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:14px;}
+.wheel{
+  width:15px;height:15px;border-radius:50%;
+  border:2.5px solid rgba(176,38,255,.25);border-top-color:var(--neon);
+  display:inline-block;animation:spin .7s linear infinite;
+}
+#working-bar{
+  position:fixed;top:0;left:50%;transform:translateX(-50%);
+  display:flex;align-items:center;gap:9px;
+  background:linear-gradient(90deg,#1a1030,#0e0e18);
+  border:1px solid var(--neon);border-top:none;
+  color:#e8e8f0;font-size:12.5px;padding:6px 16px;border-radius:0 0 12px 12px;
+  z-index:70;box-shadow:0 4px 18px rgba(176,38,255,.4);
+}
+#working-bar .wheel{width:13px;height:13px;}
+
 #composer{
   display:flex;flex-direction:column;gap:8px;padding:14px 18px 16px;border-top:1px solid var(--border);background:#0e0e18;
   max-width:936px;width:100%;margin:0 auto;

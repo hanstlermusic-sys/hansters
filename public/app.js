@@ -176,6 +176,7 @@ if (modelSel) {
       const o=document.createElement('option');
       o.value=m.id; o.textContent=m.name;
       modelSel.appendChild(o);
+      if(m.id==='azure') hasAzure = true;
     });
     reflectModel(); // mostrar el modelo de la conversación activa
   }).catch(()=>{});
@@ -215,8 +216,42 @@ function enqueue(msg, images){
   c.messages.push({role:'user', html:userHtml});
   if(id===activeId) addMsg('user', userHtml, c.messages.length-1);
   persistConv(id);
+  maybeSuggestAzure(c, msg);
   c.queue.push({msg, images: images||[]});
   if(!c.busy) drainConv(id);
+}
+
+// ===== Sugerencia inteligente: usar Azure cuando solo se chatea =====
+let hasAzure = false;
+let azureSuggestDismissed = false;
+function looksLikeExecution(msg){
+  return /\b(crea|cre[aá]|edita|modifica|arregla|corrige|ejecuta|corre|instala|despliega|refactor|agrega|a[ñn]ade|borra|elimina|archivo|carpeta|comando|script|c[oó]digo|bug|error|compila|build|test|prueba|git|deploy)\b/i.test(msg||'')
+    || /@[\w./\\-]+/.test(msg||'');
+}
+function maybeSuggestAzure(c, msg){
+  if(azureSuggestDismissed || !hasAzure) return;
+  const model = c.model || 'auto';
+  if(model === 'azure' || model === 'azure-gpt-5-mini') return;
+  const userMsgs = c.messages.filter(m=>m.role==='user');
+  if(userMsgs.length < 2) return;
+  const recent = userMsgs.slice(-3).map(m=>m.html.replace(/<[^>]+>/g,''));
+  if(recent.some(looksLikeExecution) || looksLikeExecution(msg)) return;
+  showAzureSuggestion();
+}
+function showAzureSuggestion(){
+  if(document.getElementById('azure-suggest')) return;
+  const bar = document.createElement('div');
+  bar.id = 'azure-suggest';
+  bar.style.cssText='position:fixed;top:58px;left:50%;transform:translateX(-50%);background:#0e1a2a;border:1px solid #26e0ff;color:#e8e8f0;padding:10px 14px;border-radius:12px;font-size:12.5px;z-index:60;box-shadow:0 4px 20px rgba(38,224,255,.35);max-width:80%;display:flex;gap:10px;align-items:center;';
+  bar.innerHTML='💡 Parece que solo chateas. <b style="color:#26e0ff">Azure gpt-5-mini</b> es casi gratis para esto. <button id="az-switch" style="background:linear-gradient(135deg,#26e0ff,#b026ff);border:none;color:#fff;border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px;">Cambiar</button> <span id="az-dismiss" style="cursor:pointer;color:#8a8aa0;">✕</span>';
+  document.body.appendChild(bar);
+  document.getElementById('az-switch').onclick=()=>{
+    const sel=document.getElementById('model-sel');
+    if(sel){ sel.value='azure'; sel.dispatchEvent(new Event('change')); }
+    bar.remove();
+  };
+  document.getElementById('az-dismiss').onclick=()=>{ azureSuggestDismissed=true; bar.remove(); };
+  setTimeout(()=>{ if(bar.parentNode) bar.remove(); }, 12000);
 }
 
 async function drainConv(id){
@@ -233,8 +268,9 @@ async function runOne(id, msg, images){
   const c = getConv(id);
   // Crear el mensaje de respuesta en el modelo de datos y (si visible) en el DOM.
   const botIdx = c.messages.length;
-  c.messages.push({role:'bot', html:'<span class="typing"><span></span><span></span><span></span></span>'});
+  c.messages.push({role:'bot', html:'<span class="working"><span class="wheel"></span> Trabajando…</span>'});
   if(id===activeId) addMsg('bot', c.messages[botIdx].html, botIdx);
+  showWorking(true);
   let acc='';
   const abort = new AbortController();
   c.aborts.add(abort);
@@ -290,7 +326,24 @@ async function runOne(id, msg, images){
   }finally{
     c.aborts.delete(abort);
     refreshStopMode();
+    // Ocultar la rueda global si ninguna conversación sigue trabajando.
+    const anyBusy = Object.keys(convData).some(k=>convData[k].aborts && convData[k].aborts.size>0);
+    if(!anyBusy) showWorking(false);
   }
+}
+
+// Rueda de carga global (barra superior) mientras HanstlerS trabaja.
+function showWorking(on){
+  let bar = document.getElementById('working-bar');
+  if(on){
+    if(!bar){
+      bar = document.createElement('div');
+      bar.id = 'working-bar';
+      bar.innerHTML = '<span class="wheel"></span> HanstlerS está trabajando…';
+      document.body.appendChild(bar);
+    }
+    bar.style.display = 'flex';
+  } else if(bar){ bar.style.display = 'none'; }
 }
 
 // El botón de enviar se vuelve "detener" si la conversación ACTIVA está trabajando.
