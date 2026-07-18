@@ -38,32 +38,50 @@ function renderMd(text){
   return html;
 }
 
-function addMsg(role, html){
+function addMsg(role, html, idx){
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + role;
+  if(idx!==undefined) wrap.dataset.idx = idx;
   wrap.innerHTML = `<div class="avatar">${role==='bot'?'H':'Tú'}</div><div class="bubble">${html}</div>`;
   chat.appendChild(wrap);
   chat.scrollTop = chat.scrollHeight;
   return wrap.querySelector('.bubble');
 }
 
-// ===== Historial de conversaciones =====
-let convId = 'c' + Date.now();
-let convTitle = 'Nueva conversación';
-let convMsgs = []; // {role, html}
-let convSession = null; // session id real del CLI para esta conversación
 const WELCOME = '¡Hola! Soy <strong>HanstlerS</strong>. Elige tu carpeta de proyecto arriba y dime en qué trabajamos. Puedo leer y editar archivos, ejecutar comandos y usar tu agente <code>hanstler-dev</code>.';
 
-function recordMsg(role, html){ convMsgs.push({role, html}); persistConv(); }
-function persistConv(){
-  if(!convMsgs.length) return;
-  if(convTitle==='Nueva conversación'){
-    const firstUser = convMsgs.find(m=>m.role==='user');
-    if(firstUser){ const t=firstUser.html.replace(/<[^>]+>/g,'').trim(); convTitle = t.slice(0,40) || 'Conversación'; }
+// ===== Estado por conversación (independiente / paralelo) =====
+const convData = {}; // id -> {title, messages:[], session, queue:[], busy, aborts:Set}
+let activeId = 'c' + Date.now();
+
+function getConv(id){
+  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, queue:[], busy:false, aborts:new Set() };
+  return convData[id];
+}
+
+function persistConv(id){
+  const c = convData[id]; if(!c || !c.messages.length) return;
+  if(c.title==='Nueva conversación'){
+    const fu = c.messages.find(m=>m.role==='user');
+    if(fu){ const t=fu.html.replace(/<[^>]+>/g,'').trim(); c.title = t.slice(0,40) || 'Conversación'; }
   }
   fetch('/api/conv/save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ id: convId, title: convTitle, messages: convMsgs, session: convSession })})
+    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session })})
     .then(()=>loadConvList()).catch(()=>{});
+}
+
+// Actualiza el DOM de un mensaje concreto solo si su conversación está activa.
+function updateBubble(id, idx, html){
+  if(id!==activeId) return;
+  const el = chat.querySelector('.msg[data-idx="'+idx+'"] .bubble');
+  if(el){ el.innerHTML = html; chat.scrollTop = chat.scrollHeight; }
+}
+
+function renderActive(){
+  chat.innerHTML='';
+  const c = getConv(activeId);
+  if(!c.messages.length){ addMsg('bot', WELCOME); return; }
+  c.messages.forEach((m,i)=> addMsg(m.role, m.html, i));
 }
 
 async function loadConvList(){
@@ -71,20 +89,22 @@ async function loadConvList(){
     const r = await fetch('/api/conv/list'); const j = await r.json();
     const box = document.getElementById('conv-list'); box.innerHTML='';
     (j.items||[]).forEach(it=>{
+      const busy = convData[it.id] && convData[it.id].busy;
       const el = document.createElement('div');
-      el.className = 'conv-item' + (it.id===convId?' active':'');
-      el.innerHTML = `<span class="t" title="${esc(it.title)}">${esc(it.title)}</span><span class="ren" title="Renombrar">✏️</span><span class="del" title="Borrar">🗑</span>`;
+      el.className = 'conv-item' + (it.id===activeId?' active':'');
+      el.innerHTML = `<span class="t" title="${esc(it.title)}">${busy?'<span class="spin">●</span> ':''}${esc(it.title)}</span><span class="ren" title="Renombrar">✏️</span><span class="del" title="Borrar">🗑</span>`;
       el.querySelector('.t').onclick = ()=> openConv(it.id);
       el.querySelector('.ren').onclick = async (e)=>{ e.stopPropagation();
         const nn = (prompt('Nuevo nombre de la conversación:', it.title)||'').trim();
         if(!nn) return;
         await fetch('/api/conv/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id,title:nn})});
-        if(it.id===convId) convTitle=nn;
+        if(convData[it.id]) convData[it.id].title=nn;
         loadConvList();
       };
       el.querySelector('.del').onclick = async (e)=>{ e.stopPropagation();
         await fetch('/api/conv/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id})});
-        if(it.id===convId) newConv(); else loadConvList();
+        delete convData[it.id];
+        if(it.id===activeId) newConv(); else loadConvList();
       };
       box.appendChild(el);
     });
@@ -93,18 +113,24 @@ async function loadConvList(){
 
 async function openConv(id){
   try{
-    const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
-    if(!c || c.error) return;
-    convId=c.id; convTitle=c.title||'Conversación'; convMsgs=c.messages||[]; convSession=c.session||null;
-    chat.innerHTML='';
-    convMsgs.forEach(m=> addMsg(m.role, m.html));
+    // Si ya la tenemos en memoria (posiblemente trabajando), úsala; si no, cárgala.
+    if(!convData[id]){
+      const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
+      if(!c || c.error) return;
+      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, queue:[], busy:false, aborts:new Set() };
+    }
+    activeId = id;
+    renderActive();
+    refreshStopMode();
     loadConvList();
   }catch(e){}
 }
 
 function newConv(){
-  convId='c'+Date.now(); convTitle='Nueva conversación'; convMsgs=[]; convSession=null;
-  chat.innerHTML=''; addMsg('bot', WELCOME);
+  activeId = 'c'+Date.now();
+  getConv(activeId);
+  renderActive();
+  refreshStopMode();
   loadConvList();
 }
 
@@ -112,6 +138,7 @@ document.getElementById('btn-newconv').addEventListener('click', newConv);
 document.getElementById('btn-toggle').addEventListener('click', ()=>{
   document.getElementById('sidebar').classList.toggle('hidden');
 });
+renderActive();
 loadConvList();
 
 function setCwd(p){ if(p){ cwdEl.textContent = p; cwdEl.title = p; } }
@@ -124,7 +151,7 @@ document.getElementById('btn-folder').addEventListener('click', async ()=>{
     const r = await fetch('/api/pickfolder');
     const j = await r.json();
     setCwd(j.cwd);
-    if(j.path){ const h='Carpeta cambiada a <code>'+esc(j.path)+'</code>.'; addMsg('bot', h); recordMsg('bot', h); }
+    if(j.path){ const h='Carpeta cambiada a <code>'+esc(j.path)+'</code>.'; const c=getConv(activeId); c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId); }
   }catch(e){ setCwd('~'); }
 });
 
@@ -162,7 +189,7 @@ if (modelSel) {
       opt.selected=true; id=typed;
     }
     fetch('/api/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model: id})})
-      .then(()=> addMsg('bot', 'Modelo cambiado a <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.'));
+      .then(()=>{ const h='Modelo cambiado a <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.'; const c=getConv(activeId); c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId); });
   });
 }
 
@@ -172,57 +199,46 @@ input.addEventListener('keydown', (e)=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); composer.requestSubmit(); }
 });
 
-let processing=false;
-const queue=[];
 let pendingImages=[]; // imágenes adjuntas al mensaje que se está redactando
 
 function enqueue(msg, images){
+  const id = activeId;               // capturamos la conversación destino
+  const c = getConv(id);
   const imgHtml = (images&&images.length) ? images.map(im=>`<img src="${im}" style="max-width:160px;max-height:120px;border-radius:8px;margin:4px 4px 0 0;border:1px solid #33335a;">`).join('') : '';
   const userHtml = renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):'');
-  addMsg('user', userHtml);
-  recordMsg('user', userHtml);
-  queue.push({msg, images: images||[]});
-  updatePending();
-  if(!processing) drainQueue();
+  c.messages.push({role:'user', html:userHtml});
+  if(id===activeId) addMsg('user', userHtml, c.messages.length-1);
+  persistConv(id);
+  c.queue.push({msg, images: images||[]});
+  if(!c.busy) drainConv(id);
 }
 
-function updatePending(){
-  let tag=document.getElementById('pending');
-  const n=queue.length;
-  if(n>0){
-    if(!tag){
-      tag=document.createElement('div');
-      tag.id='pending';
-      tag.style.cssText='position:fixed;right:16px;bottom:82px;background:#1a1a2a;border:1px solid #33335a;color:#8a8aa0;padding:5px 10px;border-radius:8px;font-size:12px;z-index:40;';
-      document.body.appendChild(tag);
-    }
-    tag.textContent='🕓 '+n+' en cola';
-    tag.style.display='block';
-  } else if(tag){ tag.style.display='none'; }
-}
-
-async function drainQueue(){
-  processing=true;
-  while(queue.length){
-    const item=queue.shift();
-    updatePending();
-    await runOne(item.msg, item.images);
+async function drainConv(id){
+  const c = getConv(id);
+  c.busy = true; loadConvList(); refreshStopMode();
+  while(c.queue.length){
+    const item = c.queue.shift();
+    await runOne(id, item.msg, item.images);
   }
-  processing=false;
+  c.busy = false; loadConvList(); refreshStopMode();
 }
 
-let currentAbort = null;
-
-async function runOne(msg, images){
-  const bubble = addMsg('bot', '<span class="typing"><span></span><span></span><span></span></span>');
+async function runOne(id, msg, images){
+  const c = getConv(id);
+  // Crear el mensaje de respuesta en el modelo de datos y (si visible) en el DOM.
+  const botIdx = c.messages.length;
+  c.messages.push({role:'bot', html:'<span class="typing"><span></span><span></span><span></span></span>'});
+  if(id===activeId) addMsg('bot', c.messages[botIdx].html, botIdx);
   let acc='';
-  currentAbort = new AbortController();
-  setStopMode(true);
+  const abort = new AbortController();
+  c.aborts.add(abort);
+  refreshStopMode();
+  const setHtml = (html)=>{ c.messages[botIdx].html = html; updateBubble(id, botIdx, html); };
   try{
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      signal: currentAbort.signal,
-      body: JSON.stringify({ message: msg, images: images||[], sessionId: convSession || '', convId: convId })
+      signal: abort.signal,
+      body: JSON.stringify({ message: msg, images: images||[], sessionId: c.session || '', convId: id })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
@@ -239,28 +255,31 @@ async function runOne(msg, images){
         if(!ev || !dm) continue;
         const type = ev[1];
         let data; try{ data = JSON.parse(dm[1]); }catch(_){ data = dm[1]; }
-        if(type==='chunk'){ acc += data; bubble.innerHTML = renderMd(acc); chat.scrollTop=chat.scrollHeight; }
-        else if(type==='session'){ if(data && data.id){ convSession = data.id; } }
-        else if(type==='error'){ acc += '\n⚠️ '+data; bubble.innerHTML = renderMd(acc); }
+        if(type==='chunk'){ acc += data; setHtml(renderMd(acc)); }
+        else if(type==='session'){ if(data && data.id){ c.session = data.id; } }
+        else if(type==='error'){ acc += '\n⚠️ '+data; setHtml(renderMd(acc)); }
       }
     }
-    if(!acc.trim()){ bubble.innerHTML = '<em style="color:#8a8aa0">(sin respuesta)</em>'; recordMsg('bot', bubble.innerHTML); }
-    else { recordMsg('bot', bubble.innerHTML); speak(acc); }
+    if(!acc.trim()) setHtml('<em style="color:#8a8aa0">(sin respuesta)</em>');
+    else { setHtml(renderMd(acc)); if(id===activeId) speak(acc); }
+    persistConv(id);
   }catch(err){
     if(err.name==='AbortError'){
-      bubble.innerHTML = renderMd(acc) + '<div style="color:#8a8aa0;font-size:12px;margin-top:6px;">⏹ Detenido</div>';
-      if(acc.trim()) recordMsg('bot', bubble.innerHTML);
+      setHtml(renderMd(acc) + '<div style="color:#8a8aa0;font-size:12px;margin-top:6px;">⏹ Detenido</div>');
     } else {
-      bubble.innerHTML = '⚠️ Error de conexión: '+esc(err.message);
-      recordMsg('bot', bubble.innerHTML);
+      setHtml('⚠️ Error de conexión: '+esc(err.message));
     }
+    persistConv(id);
   }finally{
-    currentAbort = null;
-    setStopMode(false);
+    c.aborts.delete(abort);
+    refreshStopMode();
   }
 }
 
-function setStopMode(on){
+// El botón de enviar se vuelve "detener" si la conversación ACTIVA está trabajando.
+function refreshStopMode(){
+  const c = convData[activeId];
+  const on = !!(c && c.aborts && c.aborts.size>0);
   sendBtn.textContent = on ? '⏹' : '➤';
   sendBtn.title = on ? 'Detener' : 'Enviar';
   sendBtn.classList.toggle('stopping', on);
@@ -268,8 +287,9 @@ function setStopMode(on){
 
 composer.addEventListener('submit', (e)=>{
   e.preventDefault();
-  // Si hay una respuesta en curso, el botón funciona como "detener".
-  if(currentAbort){ try{ currentAbort.abort(); }catch(_){}; return; }
+  // Si la conversación activa tiene una respuesta en curso, detenerla.
+  const c = convData[activeId];
+  if(c && c.aborts && c.aborts.size>0){ c.aborts.forEach(a=>{ try{a.abort();}catch(_){}}); return; }
   const msg = input.value.trim();
   const imgs = pendingImages.slice();
   if(!msg && !imgs.length) return;

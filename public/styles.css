@@ -34,6 +34,8 @@ body{
 .conv-item .del{ color:#ff5a7a; }
 .conv-item:hover .del, .conv-item:hover .ren{ opacity:.8; }
 .conv-item .ren:hover, .conv-item .del:hover{ opacity:1; }
+.conv-item .spin{ color:var(--neon2); animation:spin 1s linear infinite; display:inline-block; }
+@keyframes spin{ to{ transform:rotate(360deg); } }
 #mainpane{ flex:1; display:flex; flex-direction:column; min-width:0; height:100vh; }
 #btn-toggle{ background:#1a1a2a; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:7px 10px; font-size:14px; cursor:pointer; }
 #btn-toggle:hover{ border-color:var(--neon); }

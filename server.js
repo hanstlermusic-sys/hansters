@@ -97,9 +97,8 @@ function buildArgs(message, opts, withModel) {
   if (s.noRemote) a.push('--no-remote');
   if (s.disableBuiltinMcps) a.push('--disable-builtin-mcps');
   if (s.noAskUser) a.push('--no-ask-user');
-  // Mantener el hilo: reanudar por id exacto o continuar la sesión más reciente.
+  // Mantener el hilo: reanudar por id exacto de sesión de esta conversación.
   if (opts.sessionId) a.push('--resume=' + opts.sessionId);
-  else if (opts.useContinue && s.continue !== false) a.push('--continue');
   return a;
 }
 
@@ -208,13 +207,12 @@ function handleChatInner(req, res, message, sessionId, convId) {
   const send = (event, data) => { if (ended) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {} };
   res.on('close', () => { ended = true; });
 
-  // Decidir cómo mantener el hilo:
-  //  - si conocemos el session id exacto → --resume
-  //  - si es la misma conversación activa que el último turno → --continue
-  //  - si no → sesión nueva (y marcamos esta conversación como activa)
-  const sameConv = convId && convId === state.activeConvId;
-  const useContinue = !sessionId && sameConv;
-  if (convId) state.activeConvId = convId;
+  // Cada conversación mantiene su PROPIA sesión (independiente de las demás).
+  // Preferimos el sessionId que envía el cliente; si no, el que el servidor
+  // recordó para esta conversación en un turno anterior.
+  state.convSessions = state.convSessions || {};
+  let effSession = sessionId || (convId ? state.convSessions[convId] : '') || '';
+  const useContinue = false; // ya no dependemos de un hilo global
 
   function launchRaw(withModel, opts) {
     const a = buildArgs(message, opts, withModel);
@@ -240,10 +238,13 @@ function handleChatInner(req, res, message, sessionId, convId) {
     let raw = '';
     let gotOutput = false;
     let sessionEmitted = false;
+    const rememberSession = (id) => {
+      if (id && convId) { state.convSessions = state.convSessions || {}; state.convSessions[convId] = id; }
+    };
     const emitSession = (text) => {
       if (sessionEmitted) return;
       const m = /--resume=([a-f0-9-]{8,})/i.exec(text) || /session[ _-]?id["':\s]+([a-f0-9-]{8,})/i.exec(text);
-      if (m) { sessionEmitted = true; send('session', { id: m[1] }); }
+      if (m) { sessionEmitted = true; rememberSession(m[1]); send('session', { id: m[1] }); }
     };
     const filter = makeLineFilter((clean) => { gotOutput = true; send('chunk', clean); });
 
@@ -256,8 +257,8 @@ function handleChatInner(req, res, message, sessionId, convId) {
         state.autoOnly = true;
         return attempt(false, opts, true);
       }
-      // Si --resume/--continue falló (sesión inexistente), reintenta sin reanudar.
-      if (code !== 0 && (opts.sessionId || opts.useContinue) && !gotOutput && !isRetry) {
+      // Si --resume falló (sesión inexistente), reintenta sin reanudar.
+      if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
         return attempt(withModel, {}, true);
       }
       filter.flush();
@@ -265,7 +266,7 @@ function handleChatInner(req, res, message, sessionId, convId) {
       // Respaldo: si no se detectó en la salida, buscar la sesión más reciente en disco.
       if (!sessionEmitted) {
         const id = newestSessionId();
-        if (id) send('session', { id });
+        if (id) { rememberSession(id); send('session', { id }); }
       }
       send('done', { code });
       res.end();
@@ -275,7 +276,7 @@ function handleChatInner(req, res, message, sessionId, convId) {
     req.on('close', () => { try { child.kill(); } catch (e) {} });
   }
 
-  attempt(!state.autoOnly, { sessionId: sessionId, useContinue: useContinue }, false);
+  attempt(!state.autoOnly, { sessionId: effSession }, false);
 }
 
 // ===== Historial de conversaciones (persistente en disco) =====
