@@ -212,6 +212,37 @@ function memoryContextBlock() {
   return 'Datos que debes recordar sobre el usuario y sus proyectos (memoria persistente):\n' + facts + '\n\n';
 }
 
+// ===== Cuota mensual (créditos del plan − gastado) =====
+const USAGE_FILE = path.join(os.homedir(), '.hanstlers', 'usage.json');
+const PLAN_CREDITS = { free: 0, pro: 1500, 'pro+': 7000, proplus: 7000, max: 20000 };
+function monthKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
+function loadUsage() {
+  let u = {};
+  try { u = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch (e) {}
+  // Reinicio automático el día 1 de cada mes (UTC).
+  if (u.month !== monthKey()) { u = { month: monthKey(), spent: 0, plan: u.plan || (process.env.HANSTLERS_PLAN || 'pro') }; saveUsage(u); }
+  if (typeof u.spent !== 'number') u.spent = 0;
+  if (!u.plan) u.plan = process.env.HANSTLERS_PLAN || 'pro';
+  return u;
+}
+function saveUsage(u) {
+  try { fs.mkdirSync(path.dirname(USAGE_FILE), { recursive: true }); fs.writeFileSync(USAGE_FILE, JSON.stringify(u)); } catch (e) {}
+}
+function addSpent(credits) {
+  if (!(credits > 0)) return loadUsage();
+  const u = loadUsage();
+  u.spent = Math.round((u.spent + credits) * 100) / 100;
+  saveUsage(u);
+  return u;
+}
+function quotaInfo() {
+  const u = loadUsage();
+  const plan = (u.plan || 'pro').toLowerCase();
+  const total = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 1500;
+  const remaining = Math.max(0, Math.round((total - u.spent) * 100) / 100);
+  return { plan, total, spent: u.spent, remaining, month: u.month };
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let b = '';
@@ -342,13 +373,15 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote) {
         const id = newestSessionId();
         if (id) { rememberSession(id); send('session', { id }); }
       }
-      // Medidor: extraer créditos AI y tokens de la salida del CLI (si los imprime).
+      // Medidor: extraer créditos AI de la salida del CLI y calcular lo que resta.
       const usage = {};
       const cr = /AI Credits\s+([\d.]+)/i.exec(raw);
       if (cr) usage.credits = parseFloat(cr[1]);
       const tk = /Tokens[\s\S]{0,40}?([\d.]+k?)\b/i.exec(raw);
       if (tk) usage.tokens = tk[1];
-      if (usage.credits !== undefined || usage.tokens) send('usage', usage);
+      if (usage.credits > 0) addSpent(usage.credits);
+      usage.quota = quotaInfo();
+      send('usage', usage);
       send('done', { code });
       res.end();
     });
@@ -411,7 +444,17 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/api/pickfolder') return pickFolder(res);
   if (req.method === 'GET' && req.url === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ cwd: state.cwd, model: state.model }));
+    return res.end(JSON.stringify({ cwd: state.cwd, model: state.model, quota: quotaInfo() }));
+  }
+  if (req.method === 'GET' && req.url === '/api/quota') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(quotaInfo()));
+  }
+  if (req.method === 'POST' && req.url === '/api/plan') {
+    const b = await readBody(req);
+    if (b && b.plan) { const u = loadUsage(); u.plan = String(b.plan).toLowerCase(); saveUsage(u); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(quotaInfo()));
   }
   if (req.method === 'GET' && req.url === '/api/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });

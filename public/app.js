@@ -308,17 +308,20 @@ function showMemoryChip(text){
   chip._t = setTimeout(()=>{ chip.style.display='none'; }, 4000);
 }
 
-// Medidor de consumo pequeño (acumula créditos de la sesión).
-let sessionCredits = 0;
-function updateUsage(u){
-  if(typeof u.credits === 'number' && !isNaN(u.credits)) sessionCredits += u.credits;
+// Medidor de consumo: muestra créditos restantes del plan (cuota − gastado).
+function renderQuota(q){
   const el = document.getElementById('usage-meter');
-  if(!el) return;
-  let s = '';
-  if(sessionCredits > 0) s += '◈ ' + sessionCredits.toFixed(2);
-  if(u.tokens) s += (s?'  ':'') + '⇅ ' + u.tokens;
-  el.textContent = s || '·';
+  if(!el || !q) return;
+  const planName = q.plan==='pro+'||q.plan==='proplus' ? 'Pro+' : (q.plan.charAt(0).toUpperCase()+q.plan.slice(1));
+  el.textContent = '◈ ' + q.remaining + ' / ' + q.total + ' · ' + planName;
+  el.title = 'Créditos restantes este mes: ' + q.remaining + ' de ' + q.total + ' (' + planName + '). Gastado: ' + q.spent + '. Reinicia el 1º de cada mes.';
 }
+function updateUsage(u){
+  if(u.quota) renderQuota(u.quota);
+  else if(typeof u.credits === 'number'){ fetch('/api/quota').then(r=>r.json()).then(renderQuota).catch(()=>{}); }
+}
+// Cargar la cuota al iniciar.
+fetch('/api/quota').then(r=>r.json()).then(renderQuota).catch(()=>{});
 
 composer.addEventListener('submit', (e)=>{
   e.preventDefault();
