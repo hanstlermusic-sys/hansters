@@ -15,6 +15,57 @@ if (!process.env.COPILOT_LARGE_OUTPUT_THRESHOLD_BYTES) {
 const PORT = process.env.HANSTLERS_PORT ? Number(process.env.HANSTLERS_PORT) : 8717;
 const COPILOT_CMD = process.env.HANSTLERS_CMD || 'copilot';
 const PUBLIC = path.join(__dirname, 'public');
+const https = require('https');
+
+// Config de Azure OpenAI (BYOK). Si existe, aparece como modelo en el selector.
+const AZURE_FILE = path.join(os.homedir(), '.hanstlers', 'azure.json');
+function loadAzure() {
+  try { const c = JSON.parse(fs.readFileSync(AZURE_FILE, 'utf8')); if (c && c.endpoint && c.key && c.deployment) return c; } catch (e) {}
+  return null;
+}
+
+// Llama a Azure OpenAI con streaming y envía chunks por SSE (send).
+function runAzure(message, history, send, onDone, onAbort) {
+  const cfg = loadAzure();
+  if (!cfg) { send('error', 'Azure no está configurado.'); return onDone(1); }
+  const ep = cfg.endpoint.replace(/\/$/, '');
+  const url = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
+  const messages = [];
+  messages.push({ role: 'system', content: 'Eres HanstlerS, asistente personal de Cesar. Responde en español, conciso y directo.' });
+  (history || []).forEach((m) => messages.push(m));
+  messages.push({ role: 'user', content: message });
+  const payload = JSON.stringify({ messages, stream: true });
+  const req = https.request({
+    hostname: url.hostname, path: url.pathname + url.search, method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': cfg.key, 'Content-Length': Buffer.byteLength(payload) }
+  }, (resp) => {
+    if (resp.statusCode >= 400) {
+      let err = '';
+      resp.on('data', (d) => (err += d));
+      resp.on('end', () => { send('error', 'Azure ' + resp.statusCode + ': ' + err.slice(0, 200)); onDone(1); });
+      return;
+    }
+    let buf = '';
+    resp.on('data', (d) => {
+      buf += d.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const data = t.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try { const j = JSON.parse(data); const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content; if (delta) send('chunk', delta); } catch (e) {}
+      }
+    });
+    resp.on('end', () => onDone(0));
+  });
+  req.on('error', (e) => { send('error', 'Azure error: ' + e.message); onDone(1); });
+  if (onAbort) onAbort(() => { try { req.destroy(); } catch (e) {} });
+  req.write(payload);
+  req.end();
+}
+
 
 // Resuelve el script real de Copilot (npm-loader.js) para poder ejecutarlo con
 // node directamente y preservar saltos de línea (cmd.exe los rompe).
@@ -307,10 +358,10 @@ function handleChat(req, res, body) {
   const mem = (firstTurn || asksMemory) ? memoryContextBlock() : '';
   const finalMessage = mem ? (mem + 'Mensaje del usuario:\n' + message) : message;
 
-  detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote));
+  detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote, Array.isArray(body.history) ? body.history : []));
 }
 
-function handleChatInner(req, res, message, sessionId, convId, model, memNote) {
+function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -323,10 +374,24 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote) {
   // Avisar al cliente que se guardó un dato en memoria (para mostrar chip discreto).
   if (memNote) send('memory', { text: memNote });
 
+  const effModel = model || state.model;
+
+  // RUTA AZURE (BYOK): si el modelo elegido es Azure, llamar directo a tu recurso.
+  if (effModel === 'azure' || effModel === 'azure-gpt-5-mini') {
+    let aborted = false;
+    runAzure(
+      message,
+      Array.isArray(convHistory) ? convHistory : [],
+      send,
+      (code) => { if (!aborted) { send('done', { code }); } res.end(); },
+      (killer) => { req.on('close', () => { aborted = true; killer(); }); }
+    );
+    return;
+  }
+
   // Cada conversación mantiene su PROPIA sesión (independiente de las demás).
   state.convSessions = state.convSessions || {};
   let effSession = sessionId || (convId ? state.convSessions[convId] : '') || '';
-  const effModel = model || state.model;
 
   function launchRaw(withModel, opts) {
     const a = buildArgs(message, opts, withModel);
@@ -467,27 +532,28 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'GET' && req.url === '/api/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      current: state.model,
-      models: [
-        { id: 'auto', name: 'Automático (recomendado)' },
-        { id: 'claude-sonnet-5', name: 'Claude Sonnet 5 (potente)' },
-        { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6' },
-        { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
-        { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5 (rápido)' },
-        { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' },
-        { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
-        { id: 'gpt-5.4', name: 'GPT-5.4' },
-        { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex (código)' },
-        { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini (rápido)' },
-        { id: 'gpt-5-mini', name: 'GPT-5 mini (rápido)' },
-        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (rápido)' },
-        { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' },
-        { id: 'mai-code-1-flash', name: 'MAI-Code-1-Flash (rápido)' },
-        { id: '__custom__', name: 'Otro… (escribir ID)' }
-      ]
-    }));
+    const models = [
+      { id: 'auto', name: 'Automático (recomendado)' }
+    ];
+    if (loadAzure()) models.push({ id: 'azure', name: '⚡ Azure gpt-5-mini (tu cuota, barato)' });
+    models.push(
+      { id: 'claude-sonnet-5', name: 'Claude Sonnet 5 (potente)' },
+      { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6' },
+      { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
+      { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5 (rápido)' },
+      { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' },
+      { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
+      { id: 'gpt-5.4', name: 'GPT-5.4' },
+      { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex (código)' },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini (rápido)' },
+      { id: 'gpt-5-mini', name: 'GPT-5 mini (rápido)' },
+      { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
+      { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (rápido)' },
+      { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' },
+      { id: 'mai-code-1-flash', name: 'MAI-Code-1-Flash (rápido)' },
+      { id: '__custom__', name: 'Otro… (escribir ID)' }
+    );
+    return res.end(JSON.stringify({ current: state.model, models }));
   }
   if (req.method === 'POST' && req.url === '/api/model') {
     const b = await readBody(req);

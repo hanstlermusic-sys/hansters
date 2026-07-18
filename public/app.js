@@ -240,11 +240,20 @@ async function runOne(id, msg, images){
   c.aborts.add(abort);
   refreshStopMode();
   const setHtml = (html)=>{ c.messages[botIdx].html = html; updateBubble(id, botIdx, html); };
+  // Para Azure (sin sesión server-side), enviamos historial reciente como contexto.
+  const history = [];
+  if(c.model==='azure' || c.model==='azure-gpt-5-mini'){
+    const prev = c.messages.slice(Math.max(0, botIdx-12), botIdx);
+    for(const m of prev){
+      const text = m.html.replace(/<[^>]+>/g,'').trim();
+      if(text && text!=='') history.push({ role: m.role==='user'?'user':'assistant', content: text });
+    }
+  }
   try{
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       signal: abort.signal,
-      body: JSON.stringify({ message: msg, images: images||[], sessionId: c.session || '', convId: id, model: c.model || '' })
+      body: JSON.stringify({ message: msg, images: images||[], sessionId: c.session || '', convId: id, model: c.model || '', history: history })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
