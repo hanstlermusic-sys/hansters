@@ -50,18 +50,44 @@ input.addEventListener('keydown', (e)=>{
   if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); composer.requestSubmit(); }
 });
 
-let busy=false;
-composer.addEventListener('submit', async (e)=>{
-  e.preventDefault();
-  const msg = input.value.trim();
-  if(!msg || busy) return;
-  busy=true; sendBtn.disabled=true;
-  addMsg('user', renderMd(msg));
-  input.value=''; autoGrow();
+let processing=false;
+const queue=[];
 
+function enqueue(msg){
+  addMsg('user', renderMd(msg));
+  queue.push(msg);
+  updatePending();
+  if(!processing) drainQueue();
+}
+
+function updatePending(){
+  let tag=document.getElementById('pending');
+  const n=queue.length;
+  if(n>0){
+    if(!tag){
+      tag=document.createElement('div');
+      tag.id='pending';
+      tag.style.cssText='position:fixed;right:16px;bottom:82px;background:#1a1a2a;border:1px solid #33335a;color:#8a8aa0;padding:5px 10px;border-radius:8px;font-size:12px;z-index:40;';
+      document.body.appendChild(tag);
+    }
+    tag.textContent='🕓 '+n+' en cola';
+    tag.style.display='block';
+  } else if(tag){ tag.style.display='none'; }
+}
+
+async function drainQueue(){
+  processing=true;
+  while(queue.length){
+    const msg=queue.shift();
+    updatePending();
+    await runOne(msg);
+  }
+  processing=false;
+}
+
+async function runOne(msg){
   const bubble = addMsg('bot', '<span class="typing"><span></span><span></span><span></span></span>');
   let acc='';
-
   try{
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -90,9 +116,16 @@ composer.addEventListener('submit', async (e)=>{
     else speak(acc);
   }catch(err){
     bubble.innerHTML = '⚠️ Error de conexión: '+esc(err.message);
-  }finally{
-    busy=false; sendBtn.disabled=false; input.focus();
   }
+}
+
+composer.addEventListener('submit', (e)=>{
+  e.preventDefault();
+  const msg = input.value.trim();
+  if(!msg) return;
+  input.value=''; autoGrow();
+  enqueue(msg);
+  input.focus();
 });
 
 input.focus();
