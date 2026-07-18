@@ -40,11 +40,19 @@ let state = {
 
 // Detecta qué flags soporta la version instalada del CLI (una sola vez).
 let SUPPORTED = null;
+let detectPending = null;
 function detectFlags(cb) {
   if (SUPPORTED) return cb(SUPPORTED);
-  const runner = process.platform === 'win32'
-    ? spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD, '--help'], { env: process.env })
-    : spawn(COPILOT_CMD, ['--help'], { env: process.env });
+  // Si ya hay una detección en curso (p.ej. el pre-calentamiento), engancharse a ella.
+  if (detectPending) { detectPending.push(cb); return; }
+  detectPending = [cb];
+  const loader = resolveLoader();
+  // Usar node directo sobre el loader (más rápido que cmd.exe); fallback a cmd.exe.
+  const runner = loader
+    ? spawn(process.execPath, [loader, '--help'], { env: process.env })
+    : (process.platform === 'win32'
+        ? spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD, '--help'], { env: process.env })
+        : spawn(COPILOT_CMD, ['--help'], { env: process.env }));
   let out = '';
   const done = () => {
     const has = (f) => out.includes(f);
@@ -59,7 +67,8 @@ function detectFlags(cb) {
       effort: has('--effort') || has('--reasoning-effort'),
       maxAiCredits: has('--max-ai-credits')
     };
-    cb(SUPPORTED);
+    const cbs = detectPending || []; detectPending = null;
+    cbs.forEach((f) => { try { f(SUPPORTED); } catch (e) {} });
   };
   let finished = false;
   const finish = () => { if (!finished) { finished = true; done(); } };
@@ -532,6 +541,9 @@ let bindTries = 0;
 function startListen() {
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`HanstlerS escuchando en http://127.0.0.1:${PORT}`);
+    // Pre-calentar la detección de flags en segundo plano para que el
+    // PRIMER mensaje del usuario no pague el costo de `copilot --help`.
+    setTimeout(() => { try { detectFlags(() => {}); } catch (e) {} }, 50);
   });
 }
 
