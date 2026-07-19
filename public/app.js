@@ -444,60 +444,118 @@ document.addEventListener('drop', async (e)=>{
 
 input.focus();
 
-/* ============ VOZ: dictado (STT) y lectura (TTS) ============ */
+/* ============ VOZ: dictado (Azure Speech o navegador) y lectura (TTS) ============ */
 const micBtn = document.getElementById('btn-mic');
 const speakBtn = document.getElementById('btn-speak');
 
+let speechAvailable = false;
+fetch('/api/speech/available').then(r=>r.json()).then(d=>{ speechAvailable = !!d.available; }).catch(()=>{});
+
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recog = null, listening = false;
+let mediaRec = null, audioCtx = null, recStream = null, recProcessor = null, recData = [], recSampleRate = 16000;
 
-if (SR) {
+// --- Dictado con Azure Speech (graba PCM 16kHz y transcribe en el servidor) ---
+async function startAzureDictation(){
+  try{
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount:1, sampleRate:16000 } });
+  }catch(err){
+    setStatusMic('🎤 Permiso de micrófono denegado. Actívalo en el candado 🔒 de la barra.');
+    return;
+  }
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)({ sampleRate: 16000 });
+  recSampleRate = audioCtx.sampleRate;
+  const source = audioCtx.createMediaStreamSource(recStream);
+  recProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+  recData = [];
+  recProcessor.onaudioprocess = (e)=>{
+    const ch = e.inputBuffer.getChannelData(0);
+    recData.push(new Float32Array(ch));
+  };
+  source.connect(recProcessor);
+  recProcessor.connect(audioCtx.destination);
+  listening = true; micBtn.classList.add('listening'); setStatusMic('🎙️ Escuchando… pulsa de nuevo para terminar');
+}
+
+async function stopAzureDictation(){
+  micBtn.classList.remove('listening'); listening = false;
+  try{ if(recProcessor) recProcessor.disconnect(); }catch(_){}
+  try{ if(recStream) recStream.getTracks().forEach(t=>t.stop()); }catch(_){}
+  try{ if(audioCtx) await audioCtx.close(); }catch(_){}
+  if(!recData.length){ setStatusMic('No se grabó audio.'); return; }
+  setStatusMic('Transcribiendo…');
+  const wav = encodeWav(recData, recSampleRate);
+  recData = [];
+  try{
+    const r = await fetch('/api/transcribe', { method:'POST', headers:{'Content-Type':'audio/wav'}, body: wav });
+    const j = await r.json();
+    if(j.text){ input.value = (input.value ? input.value+' ' : '') + j.text; autoGrow(); setStatusMic('✔ '+j.text); }
+    else setStatusMic('No te entendí: ' + (j.error||'intenta de nuevo'));
+  }catch(err){ setStatusMic('Error al transcribir: '+err.message); }
+}
+
+// Codifica Float32 mono a WAV PCM16 (con remuestreo a 16kHz si hace falta).
+function encodeWav(chunks, sampleRate){
+  let len = 0; chunks.forEach(c=>len+=c.length);
+  let data = new Float32Array(len); let off=0;
+  chunks.forEach(c=>{ data.set(c, off); off+=c.length; });
+  // Remuestrear a 16000 si el contexto usó otra tasa
+  const target = 16000;
+  if(sampleRate !== target){
+    const ratio = sampleRate/target;
+    const newLen = Math.round(data.length/ratio);
+    const res = new Float32Array(newLen);
+    for(let i=0;i<newLen;i++){ res[i] = data[Math.floor(i*ratio)]; }
+    data = res;
+  }
+  const buffer = new ArrayBuffer(44 + data.length*2);
+  const view = new DataView(buffer);
+  const ws=(o,s)=>{ for(let i=0;i<s.length;i++) view.setUint8(o+i, s.charCodeAt(i)); };
+  ws(0,'RIFF'); view.setUint32(4, 36+data.length*2, true); ws(8,'WAVE'); ws(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true);
+  view.setUint32(24,target,true); view.setUint32(28,target*2,true); view.setUint16(32,2,true); view.setUint16(34,16,true);
+  ws(36,'data'); view.setUint32(40, data.length*2, true);
+  let o=44;
+  for(let i=0;i<data.length;i++){ let s=Math.max(-1,Math.min(1,data[i])); view.setInt16(o, s<0?s*0x8000:s*0x7FFF, true); o+=2; }
+  return buffer;
+}
+
+// --- Fallback: reconocimiento del navegador ---
+function setupBrowserRecog(){
   recog = new SR();
   recog.lang = 'es-ES';
   recog.interimResults = true;
   recog.continuous = false;
   let baseText = '';
-
   recog.onstart = () => { listening = true; micBtn.classList.add('listening'); setStatusMic('Escuchando… habla ahora'); };
   recog.onerror = (e) => {
-    const m = {
-      'not-allowed': 'Permiso de micrófono denegado. Haz clic en el candado 🔒 de la barra y permite el micrófono.',
-      'service-not-allowed': 'El reconocimiento de voz está bloqueado. Permite el micrófono para este sitio.',
-      'no-speech': 'No te escuché. Intenta de nuevo.',
-      'audio-capture': 'No se detectó micrófono. Conecta uno y reintenta.',
-      'network': 'El dictado necesita conexión a internet.'
-    };
+    const m = { 'not-allowed':'Permiso de micrófono denegado.', 'no-speech':'No te escuché.', 'audio-capture':'No se detectó micrófono.', 'network':'El dictado del navegador necesita internet.' };
     setStatusMic('🎤 ' + (m[e.error] || ('Error de voz: ' + e.error)));
     stopListen();
   };
   recog.onend = () => stopListen();
   recog.onresult = (e) => {
-    let txt = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) txt += e.results[i][0].transcript;
-    input.value = (baseText + ' ' + txt).trim();
-    autoGrow();
+    let txt=''; for(let i=e.resultIndex;i<e.results.length;i++) txt+=e.results[i][0].transcript;
+    input.value=(baseText+' '+txt).trim(); autoGrow();
   };
-
-  micBtn.addEventListener('click', async () => {
-    if (listening) { recog.stop(); return; }
-    // Pedir permiso de micrófono explícitamente (mejora el prompt en modo app).
-    try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-        s.getTracks().forEach(t => t.stop());
-      }
-    } catch (err) {
-      setStatusMic('🎤 Permiso de micrófono denegado. Actívalo en el candado 🔒 de la barra.');
-      return;
-    }
-    baseText = input.value.trim();
-    try { recog.start(); } catch (_) {}
-  });
-} else {
-  micBtn.disabled = true;
-  micBtn.title = 'Tu navegador no soporta dictado por voz';
-  micBtn.style.opacity = .4;
+  micBtn._base = () => baseText = input.value.trim();
 }
+
+micBtn.addEventListener('click', async () => {
+  // Preferir Azure Speech (funciona en la app nativa). Fallback: navegador.
+  if (speechAvailable) {
+    if (listening) { await stopAzureDictation(); } else { await startAzureDictation(); }
+    return;
+  }
+  if (!SR) { setStatusMic('El dictado no está disponible.'); return; }
+  if (!recog) setupBrowserRecog();
+  if (listening) { recog.stop(); return; }
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true }); s.getTracks().forEach(t=>t.stop());
+  } catch (err) { setStatusMic('🎤 Permiso de micrófono denegado.'); return; }
+  micBtn._base && micBtn._base();
+  try { recog.start(); } catch (_) {}
+});
 
 function stopListen(){ listening = false; micBtn.classList.remove('listening'); }
 

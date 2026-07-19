@@ -24,6 +24,41 @@ function loadAzure() {
   return null;
 }
 
+// Config de Azure Speech (para dictado por voz).
+const SPEECH_FILE = path.join(os.homedir(), '.hanstlers', 'speech.json');
+function loadSpeech() {
+  try { const c = JSON.parse(fs.readFileSync(SPEECH_FILE, 'utf8')); if (c && c.key && c.region) return c; } catch (e) {}
+  return null;
+}
+
+// Transcribe audio (WAV/OGG) con Azure Speech REST y devuelve el texto.
+function transcribeSpeech(audioBuffer, contentType, cb) {
+  const cfg = loadSpeech();
+  if (!cfg) return cb(new Error('Azure Speech no configurado'));
+  const host = cfg.region + '.stt.speech.microsoft.com';
+  const pathUrl = '/speech/recognition/conversation/cognitiveservices/v1?language=es-ES';
+  const req = https.request({
+    hostname: host, path: pathUrl, method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': cfg.key,
+      'Content-Type': contentType || 'audio/wav; codecs=audio/pcm; samplerate=16000',
+      'Accept': 'application/json'
+    }
+  }, (resp) => {
+    let body = '';
+    resp.on('data', (d) => (body += d));
+    resp.on('end', () => {
+      try {
+        const j = JSON.parse(body);
+        cb(null, (j.DisplayText || j.NBest && j.NBest[0] && j.NBest[0].Display || '').trim());
+      } catch (e) { cb(new Error('Respuesta inválida: ' + body.slice(0, 150))); }
+    });
+  });
+  req.on('error', (e) => cb(e));
+  req.write(audioBuffer);
+  req.end();
+}
+
 // Llama a Azure OpenAI con streaming y envía chunks por SSE (send).
 function runAzure(message, history, send, onDone, onAbort) {
   const cfg = loadAzure();
@@ -532,6 +567,23 @@ function pickFolder(res) {
 const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/api/chat') return handleChat(req, res, await readBody(req));
   if (req.method === 'GET' && req.url === '/api/pickfolder') return pickFolder(res);
+  if (req.method === 'GET' && req.url === '/api/speech/available') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ available: !!loadSpeech() }));
+  }
+  if (req.method === 'POST' && req.url === '/api/transcribe') {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const audio = Buffer.concat(chunks);
+      const ct = req.headers['content-type'] || 'audio/wav';
+      transcribeSpeech(audio, ct, (err, text) => {
+        res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(err ? { error: err.message } : { text: text }));
+      });
+    });
+    return;
+  }
   if (req.method === 'GET' && req.url === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ cwd: state.cwd, model: state.model, quota: quotaInfo() }));
