@@ -161,6 +161,11 @@ function buildArgs(message, opts, withModel) {
   // El modelo puede venir por conversación (opts.model); si no, usa el global.
   const model = opts.model || state.model;
   if (withModel && s.model && model && model !== 'auto') { a.push('--model', model); }
+  // Modo MÍNIMO: sin flags de optimización (para reintentar si algo los rechaza).
+  if (opts.minimal) {
+    if (opts.sessionId) a.push('--resume=' + opts.sessionId);
+    return a;
+  }
   if (s.silent) a.push('--silent');
   if (s.noBanner) a.push('--no-banner');
   if (s.noAutoUpdate) a.push('--no-auto-update');
@@ -438,7 +443,12 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       }
       // Si --resume falló (sesión inexistente), reintenta sin reanudar (conservando el modelo).
       if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
-        return attempt(withModel, { model: opts.model }, true);
+        return attempt(withModel, { model: opts.model, minimal: opts.minimal }, true);
+      }
+      // Si la respuesta vino VACÍA y usamos flags de optimización, reintentar en
+      // modo MÍNIMO (sin --effort/--silent/etc.) — algunos planes/políticas los rechazan.
+      if (!gotOutput && !opts.minimal && !isRetry) {
+        return attempt(withModel, { model: opts.model, sessionId: opts.sessionId, minimal: true }, true);
       }
       filter.flush();
       emitSession(raw);
@@ -446,6 +456,12 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       if (!sessionEmitted) {
         const id = newestSessionId();
         if (id) { rememberSession(id); send('session', { id }); }
+      }
+      // Si SIGUE sin haber salida, mostrar la salida cruda o un mensaje claro con el error.
+      if (!gotOutput) {
+        const rawClean = (raw || '').trim();
+        if (rawClean) send('chunk', rawClean);
+        else send('chunk', '⚠️ No hubo respuesta del modelo. Verifica que tu sesión de Copilot esté activa (abre "Iniciar sesión en Copilot") y que tu plan permita este modelo. Si acabas de comprar créditos, cierra y vuelve a abrir HanstlerS.');
       }
       // Medidor: extraer créditos AI de la salida del CLI y calcular lo que resta.
       const usage = {};
