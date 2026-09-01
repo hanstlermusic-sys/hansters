@@ -253,7 +253,7 @@ function enqueue(msg, images, files){
   const imgHtml = (images&&images.length) ? images.map(im=>`<img src="${im}" style="max-width:160px;max-height:120px;border-radius:8px;margin:4px 4px 0 0;border:1px solid #33335a;">`).join('') : '';
   const fileHtml = (files&&files.length) ? '<div style="margin-top:4px;">'+files.map(f=>`<span style="display:inline-block;background:#1a2438;border:1px solid #33335a;border-radius:8px;padding:3px 8px;margin:2px 4px 0 0;font-size:12px;">📄 ${f.name}</span>`).join('')+'</div>' : '';
   const userHtml = renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):'') + fileHtml;
-  c.messages.push({role:'user', html:userHtml});
+  c.messages.push({role:'user', html:userHtml, text:msg});
   if(id===activeId) addMsg('user', userHtml, c.messages.length-1);
   persistConv(id);
   maybeSuggestAzure(c, msg);
@@ -323,13 +323,17 @@ async function runOne(id, msg, images, files){
     const st = statusLine ? `<div class="agent-status"><span class="wheel"></span> ${esc(statusLine)}</div>` : (acc.trim()?'':'<span class="working"><span class="wheel"></span> Trabajando…</span>');
     setHtml(base + st);
   };
-  // Para Azure (sin sesión server-side), enviamos historial reciente como contexto.
+  // Historial de respaldo para los motores sin sesion en el servidor. Se manda para
+  // TODOS los modelos: antes solo se llenaba para los de Azure, asi que cualquier otro
+  // motor (Vertex/Gemini) recibia history:[] y arrancaba cada turno sin memoria alguna.
+  // Ademas usamos el texto CRUDO del mensaje: rearmarlo desde el HTML de la burbuja
+  // perdia el contenido de las herramientas y dejaba al modelo a ciegas.
   const history = [];
-  if(c.model==='azure' || c.model==='azure-gpt-5-mini' || c.model==='azure-agent'){
-    const prev = c.messages.slice(Math.max(0, botIdx-12), botIdx);
+  {
+    const prev = c.messages.slice(Math.max(0, botIdx-24), botIdx);
     for(const m of prev){
-      const text = m.html.replace(/<[^>]+>/g,'').trim();
-      if(text && text!=='') history.push({ role: m.role==='user'?'user':'assistant', content: text });
+      const raw = (typeof m.text==='string' && m.text.trim()) ? m.text : m.html.replace(/<[^>]+>/g,'').trim();
+      if(raw) history.push({ role: m.role==='user'?'user':'assistant', content: raw });
     }
   }
   try{
@@ -366,6 +370,7 @@ async function runOne(id, msg, images, files){
         else if(type==='error'){ acc += '\n⚠️ '+data; statusLine=''; renderWithStatus(); }
       }
     }
+    c.messages[botIdx].text = acc;
     if(!acc.trim()) setHtml('<em style="color:#8a8aa0">(sin respuesta)</em>');
     else { setHtml(renderMd(acc)); if(id===activeId) speak(acc); }
     persistConv(id);
