@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Pruebas (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Sin dependencias de produccion: server.js solo usa modulos nativos de Node.
+      - name: Comprobar sintaxis
+        run: |
+          node --check server.js
+          node --check electron-main.js
+          node --check public/app.js
+          node --check tests/context.test.js
+
+      - name: Pruebas del contexto del agente
+        run: npm test

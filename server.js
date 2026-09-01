@@ -1178,17 +1178,77 @@ function dangerReason(name, args) {
   return null;
 }
 
-function runAzureAgent(message, history, historySummary, send, onDone, onAbort, images) {
+// ===== Contexto persistente del agente =====
+// El transcript COMPLETO (incluidos los mensajes role:'tool' con el contenido real
+// de lo que el agente leyo o ejecuto) vive AQUI, en el servidor, indexado por
+// conversacion, y ademas en disco para sobrevivir al reinicio de la app.
+// Antes el contexto se rearmaba en cada turno desde lo que mandaba el cliente, que
+// solo tiene el texto de las burbujas: eso descartaba toda llamada a herramienta y
+// su resultado, asi que el modelo sabia QUE habia leido un archivo pero no QUE
+// decia, y volvia a leerlo una y otra vez.
+// Se guarda solo el CUERPO de la conversacion; el preambulo de mensajes 'system'
+// se vuelve a construir en cada turno porque depende de state.cwd y del proyecto.
+const AGENT_CTX_MAX_CHARS = 200000;
+const AGENT_DIR = path.join(os.homedir(), '.hanstlers', 'agent');
+
+function msgSize(m) { try { return JSON.stringify(m).length; } catch (e) { return 0; } }
+
+// Recorta por el principio. Nunca deja un mensaje role:'tool' huerfano al frente:
+// la API devuelve 400 si un 'tool' no va precedido del 'assistant' que lo pidio.
+function trimAgentMessages(body, maxChars) {
+  if (!Array.isArray(body) || !body.length) return [];
+  const limit = maxChars || AGENT_CTX_MAX_CHARS;
+  let total = 0;
+  for (let i = 0; i < body.length; i++) total += msgSize(body[i]);
+  let cut = 0;
+  while (cut < body.length && total > limit) { total -= msgSize(body[cut]); cut++; }
+  while (cut < body.length && body[cut] && body[cut].role === 'tool') cut++;
+  return cut === 0 ? body : body.slice(cut);
+}
+
+function agentFile(id) { return path.join(AGENT_DIR, String(id).replace(/[^a-z0-9_-]/gi, '') + '.json'); }
+function saveAgentTranscript(convId, body) {
+  if (!convId) return;
+  try {
+    fs.mkdirSync(AGENT_DIR, { recursive: true });
+    fs.writeFileSync(agentFile(convId), JSON.stringify(body));
+  } catch (e) {}
+}
+function loadAgentTranscript(convId) {
+  if (!convId) return null;
+  try {
+    const m = JSON.parse(fs.readFileSync(agentFile(convId), 'utf8'));
+    return (Array.isArray(m) && m.length) ? m : null;
+  } catch (e) { return null; }
+}
+function deleteAgentTranscript(convId) { try { fs.unlinkSync(agentFile(convId)); } catch (e) {} }
+
+// preamble = mensajes 'system' recien construidos. Se antepone al cuerpo guardado.
+function buildAgentMessages(convId, history, preamble) {
+  state.convAgentMessages = state.convAgentMessages || {};
+  let prior = convId ? state.convAgentMessages[convId] : null;
+  if (!(Array.isArray(prior) && prior.length)) prior = loadAgentTranscript(convId);
+  const body = (Array.isArray(prior) && prior.length) ? prior : (history || []);
+  return (preamble || []).concat(body);
+}
+
+// El modelo suele ANUNCIAR lo que hara y devolver el turno sin llamar a ninguna
+// herramienta ("Voy a revisar los archivos..."). El bucle lo tomaba por respuesta
+// final y cerraba el trabajo ahi: de ahi los "jobs muy cortos que no ejecutan nada".
+const ANNOUNCE_RE = /(voy a |vamos a |procedo a |procedere|ahora (voy|procedo|revis|le|cre|ejecut|busc)|dejame |permiteme |empezare|empiezo por|comenzare|primero (voy|le|revis)|a continuacion (voy|le)|revisare|leere|creare|escribire|ejecutare|buscare|manos a la obra|I'll |let me |I will |I'm going to |next,? I)/i;
+
+function runAzureAgent(message, history, historySummary, send, onDone, onAbort, images, convId) {
   const cfg = loadAzure();
   if (!cfg) { send('error', 'Azure no configurado'); return onDone(1); }
   let aborted = false;
   if (onAbort) onAbort(() => { aborted = true; });
-  const messages = [
+  const preamble = [
     { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. EstÃ¡s en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nUsa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tÃº mismo (no solo expliques). SÃ‰ DECIDIDO Y AUTÃ“NOMO: si la intenciÃ³n estÃ¡ clara, ACTÃšA de inmediato sin pedir permiso ni confirmaciÃ³n. NO preguntes "Â¿quieres que...?", "Â¿procedo?", "Â¿te gustarÃ­a?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acciÃ³n es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leÃ­ste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parÃ¡metros. Responde en espaÃ±ol, conciso. Cuando termines, resume lo que hiciste.' },
     { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la pÃ¡gina tÃº con la herramienta de navegador y ejecuta el flujo tÃº mismo. No le pidas al usuario que navegue manualmente.' }
   ];
-  if (historySummary) messages.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
-  (history || []).forEach(m => messages.push(m));
+  if (historySummary) preamble.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
+  const preambleLen = preamble.length;
+  const messages = buildAgentMessages(convId, history, preamble);
   if (images && images.length) {
     const content = [{ type: 'text', text: message }];
     images.forEach((im) => content.push({ type: 'image_url', image_url: { url: im } }));
@@ -1198,7 +1258,16 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
   }
 
   let steps = 0;
+  let nudges = 0;
   const MAX_STEPS = 40;
+  const MAX_NUDGES = 2;
+  const saveTranscript = () => {
+    if (!convId) return;
+    state.convAgentMessages = state.convAgentMessages || {};
+    const body = trimAgentMessages(messages.slice(preambleLen), AGENT_CTX_MAX_CHARS);
+    state.convAgentMessages[convId] = body;
+    saveAgentTranscript(convId, body);
+  };
   const OP_DELAY_MS = 4000;
   const iconOf = (n) => ({ list_dir: 'ðŸ“‚', read_file: 'ðŸ“„', write_file: 'âœï¸', apply_patch: 'ðŸ©¹', search_in_files: 'ðŸ”Ž', delete_file: 'ðŸ—‘ï¸', move_file: 'ðŸ“¦', run_command: 'âš™ï¸' }[n] || 'ðŸ”§');
   // Ejecuta una herramienta, pidiendo confirmaciÃ³n si es peligrosa.
@@ -1274,7 +1343,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     return startExecution();
   }
   function loop() {
-    if (aborted) return onDone(1);
+    if (aborted) { saveTranscript(); return onDone(1); }
     if (steps++ > MAX_STEPS) {
       send('status', 'Cerrando y resumiendoâ€¦');
       messages.push({ role: 'user', content: 'Has alcanzado el lÃ­mite de pasos. Detente ahora: NO uses mÃ¡s herramientas. Resume en espaÃ±ol lo que lograste, lo que quedÃ³ pendiente y cÃ³mo continuar.' });
@@ -1285,6 +1354,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
           send('status', '');
           if (err) send('chunk', '(lÃ­mite de pasos alcanzado)');
           send('canContinue', { reason: 'limite' });
+          saveTranscript();
           onDone(0);
         }
       );
@@ -1292,7 +1362,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     // Indicador vivo mientras Azure "piensa" (evita sensaciÃ³n de colgado).
     send('status', 'Pensandoâ€¦ (paso ' + steps + '/' + MAX_STEPS + ')');
     azureChatStreamTools(cfg, messages, AGENT_TOOLS, (delta) => send('chunk', delta), (err, msg) => {
-      if (aborted) { send('status', ''); return onDone(1); }
+      if (aborted) { send('status', ''); saveTranscript(); return onDone(1); }
       if (err) { send('status', ''); send('error', 'Azure: ' + err.message); return onDone(1); }
       if (!msg) { send('status', ''); send('error', 'Respuesta vacÃ­a de Azure'); return onDone(1); }
       messages.push(msg);
@@ -1311,8 +1381,18 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
           });
         });
       } else {
-        // Respuesta final de texto: ya se streameÃ³ token a token vÃ­a onChunk arriba.
+        // Respuesta final de texto: ya se streameo token a token via onChunk arriba.
+        const text = (msg.content || '').trim();
+        // Si solo ANUNCIO una accion (o devolvio un turno vacio) sin ejecutar nada,
+        // el trabajo NO ha terminado: empujalo a actuar en vez de cerrar el job.
+        if (nudges < MAX_NUDGES && (!text || ANNOUNCE_RE.test(text))) {
+          nudges++;
+          messages.push({ role: 'user', content: 'No ejecutaste ninguna herramienta en este turno: solo anunciaste lo que ibas a hacer. Si la tarea NO esta terminada, HAZLA AHORA llamando a las herramientas en este mismo turno (no vuelvas a anunciarla). Si ya esta completamente terminada, responde solo con el resumen final, sin anunciar acciones futuras.' });
+          send('status', 'Continuando...');
+          return loop();
+        }
         send('status', '');
+        saveTranscript();
         onDone(0);
       }
     });
@@ -2724,7 +2804,8 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
         send('done', { code }); try { res.end(); } catch (e) {}
       },
       (killer) => { req.on('close', () => killer()); },
-      visionImages || []
+      visionImages || [],
+        statelessMode ? '' : convId
     );
     return;
   }
@@ -2859,6 +2940,8 @@ function getConversation(id) {
   return null;
 }
 function deleteConversation(id) {
+  deleteAgentTranscript(id);
+  try { delete (state.convAgentMessages || {})[id]; } catch (e) {}
   try { fs.unlinkSync(convFile(id)); return true; } catch (e) { return false; }
 }
 

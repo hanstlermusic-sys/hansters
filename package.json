@@ -6,7 +6,9 @@
   "author": "Cesar Zumbado",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win nsis"
+    "dist": "electron-builder --win nsis",
+    "test": "node tests/context.test.js",
+    "test:e2e": "node tests/e2e-context.js"
   },
   "build": {
     "appId": "com.hanstler.hanstlers",

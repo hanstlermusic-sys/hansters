@@ -208,7 +208,7 @@ function buildCompactHistory(c, botIdx){
   const recent = prev.slice(Math.max(0, prev.length - HISTORY_RECENT_ITEMS));
   const history = recent.map((m)=>({
     role: m.role==='user' ? 'user' : 'assistant',
-    content: clampText(plainText(m.html || m.content || ''), HISTORY_ITEM_MAX)
+    content: clampText(m.text || plainText(m.html || m.content || ''), HISTORY_ITEM_MAX)
   })).filter(m=>m.content);
   return { history, historySummary: clampText(c.rollupSummary || '', ROLLING_SUMMARY_MAX) };
 }
@@ -645,7 +645,7 @@ function enqueue(msg, images, files){
   const imgHtml = (images&&images.length) ? images.map(im=>`<img src="${im}" style="max-width:160px;max-height:120px;border-radius:8px;margin:4px 4px 0 0;border:1px solid #33335a;">`).join('') : '';
   const fileHtml = (files&&files.length) ? '<div style="margin-top:4px;">'+files.map(f=>`<span style="display:inline-block;background:#1a2438;border:1px solid #33335a;border-radius:8px;padding:3px 8px;margin:2px 4px 0 0;font-size:12px;">📄 ${f.name}</span>`).join('')+'</div>' : '';
   const userHtml = renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):'') + fileHtml;
-  c.messages.push({role:'user', html:userHtml});
+  c.messages.push({role:'user', html:userHtml, text:msg});
   if(id===activeId) addMsg('user', userHtml, c.messages.length-1);
   persistConv(id);
   maybeSuggestAzure(c, msg);
@@ -720,7 +720,7 @@ async function runOne(id, msg, images, files){
   const abort = new AbortController();
   c.aborts.add(abort);
   refreshStopMode();
-  const setHtml = (html)=>{ c.messages[botIdx].html = html; updateBubble(id, botIdx, html); };
+  const setHtml = (html, raw)=>{ c.messages[botIdx].html = html; if(raw!=null) c.messages[botIdx].text = raw; updateBubble(id, botIdx, html); };
   let statusLine = '';
   const renderWithStatus = ()=>{
     const base = acc.trim() ? renderMd(acc) : '';
@@ -790,7 +790,7 @@ async function runOne(id, msg, images, files){
     }
     if(!acc.trim()) setHtml('<em style="color:#8a8aa0">(sin respuesta)</em>');
     else {
-      setHtml(renderMd(acc));
+      setHtml(renderMd(acc), acc);
       if(!stateless) updateRollingSummary(c, msg, acc);
       if(id===activeId) speak(acc);
     }
