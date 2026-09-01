@@ -130,7 +130,7 @@ function xcoreMimeFor(filePath) {
 
 
 // ===== WHISPER LOCAL (offline, sin nube): whisper.cpp =====
-// Binario empaquetado junto a la app; modelo en ~/.hanstlers/whisper (se descarga la 1Âª vez).
+// Binario empaquetado junto a la app; modelo en ~/.hanstlers/whisper (se descarga la 1ª vez).
 const WHISPER_DIR = path.join(os.homedir(), '.hanstlers', 'whisper');
 const WHISPER_MODEL_NAME = 'ggml-base.bin';
 const WHISPER_MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin';
@@ -156,15 +156,15 @@ function whisperModelPath() {
 }
 function whisperAvailable() { return !!whisperCliPath(); }
 
-// Limpia el texto de whisper: quita tokens de ruido y alucinaciones tÃ­picas en silencio.
+// Limpia el texto de whisper: quita tokens de ruido y alucinaciones típicas en silencio.
 function cleanTranscript(t) {
   if (!t) return '';
   let s = String(t).replace(/\r/g, '').split('\n').map(x => x.trim()).filter(Boolean).join(' ').trim();
   s = s.replace(/\[[^\]]*\]/g, ' ').replace(/\*[^*]*\*/g, ' ');
-  s = s.replace(/\((?:m[uÃº]sica|risas|aplausos|silencio|ruido|sonido[^)]*)\)/gi, ' ');
+  s = s.replace(/\((?:m[uú]sica|risas|aplausos|silencio|ruido|sonido[^)]*)\)/gi, ' ');
   const junk = [
-    /subt[iÃ­]tulos?[^.]*amara\.org/gi,
-    /subt[iÃ­]tulos?\s+realizados?\s+por[^.]*/gi,
+    /subt[ií]tulos?[^.]*amara\.org/gi,
+    /subt[ií]tulos?\s+realizados?\s+por[^.]*/gi,
     /gracias por ver[^.]*/gi,
     /www\.[^\s]+/gi
   ];
@@ -176,7 +176,7 @@ let whisperDownloading = false;
 function ensureWhisperModel(cb) {
   const existing = whisperModelPath();
   if (existing) return cb(null, existing);
-  if (whisperDownloading) return cb(new Error('El modelo de voz se estÃ¡ descargando, intenta en unos segundos.'));
+  if (whisperDownloading) return cb(new Error('El modelo de voz se está descargando, intenta en unos segundos.'));
   whisperDownloading = true;
   try { fs.mkdirSync(WHISPER_DIR, { recursive: true }); } catch (e) {}
   const dest = path.join(WHISPER_DIR, WHISPER_MODEL_NAME);
@@ -185,7 +185,7 @@ function ensureWhisperModel(cb) {
   const get = (url) => {
     https.get(url, (resp) => {
       if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) { resp.resume(); return get(resp.headers.location); }
-      if (resp.statusCode !== 200) { whisperDownloading = false; file.close(); try { fs.unlinkSync(tmp); } catch (e) {} return cb(new Error('Descarga del modelo fallÃ³: ' + resp.statusCode)); }
+      if (resp.statusCode !== 200) { whisperDownloading = false; file.close(); try { fs.unlinkSync(tmp); } catch (e) {} return cb(new Error('Descarga del modelo falló: ' + resp.statusCode)); }
       resp.pipe(file);
       file.on('finish', () => { file.close(() => { try { fs.renameSync(tmp, dest); } catch (e) {} whisperDownloading = false; cb(null, dest); }); });
     }).on('error', (e) => { whisperDownloading = false; try { fs.unlinkSync(tmp); } catch (_) {} cb(e); });
@@ -209,7 +209,7 @@ function transcribeLocal(wavBuffer, cb) {
     let out = '', errOut = '';
     let finished = false;
     const done = (e, txt) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (_) {} try { fs.unlinkSync(tmp); } catch (_) {} cb(e, txt); };
-    const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done(new Error('TranscripciÃ³n local excediÃ³ el tiempo')); }, 120000);
+    const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done(new Error('Transcripción local excedió el tiempo')); }, 120000);
     child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (errOut += d));
     child.on('close', () => {
@@ -241,7 +241,7 @@ function transcribeSpeech(audioBuffer, contentType, cb) {
       try {
         const j = JSON.parse(body);
         cb(null, (j.DisplayText || j.NBest && j.NBest[0] && j.NBest[0].Display || '').trim());
-      } catch (e) { cb(new Error('Respuesta invÃ¡lida: ' + body.slice(0, 150))); }
+      } catch (e) { cb(new Error('Respuesta inválida: ' + body.slice(0, 150))); }
     });
   });
   req.on('error', (e) => cb(e));
@@ -278,18 +278,18 @@ function synthSpeech(text, cb) {
 
 function runAzure(message, history, historySummary, send, onDone, onAbort, images) {
   const cfg = loadAzure();
-  if (!cfg) { send('error', 'Azure no estÃ¡ configurado.'); return onDone(1); }
+  if (!cfg) { send('error', 'Azure no está configurado.'); return onDone(1); }
   const ep = cfg.endpoint.replace(/\/$/, '');
   const url = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
   const messages = [];
-  messages.push({ role: 'system', content: 'Eres HanstlerS, asistente personal de Cesar. Responde en espaÃ±ol, conciso y directo.' });
+  messages.push({ role: 'system', content: 'Eres HanstlerS, asistente personal de Cesar. Responde en español, conciso y directo.' });
   if (historySummary) {
     messages.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
   }
   (history || []).forEach((m) => messages.push(m));
-  // Si hay imÃ¡genes, el mensaje del usuario va como contenido multimodal (texto + imÃ¡genes).
+  // Si hay imágenes, el mensaje del usuario va como contenido multimodal (texto + imágenes).
   if (images && images.length) {
-    const content = [{ type: 'text', text: message || 'Â¿QuÃ© ves en esta imagen?' }];
+    const content = [{ type: 'text', text: message || '¿Qué ves en esta imagen?' }];
     images.forEach((im) => content.push({ type: 'image_url', image_url: { url: im } }));
     messages.push({ role: 'user', content });
   } else {
@@ -809,15 +809,15 @@ const AGENT_TOOLS = [
   { type: 'function', function: { name: 'list_dir', description: 'Lista archivos y carpetas de un directorio', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Ruta (por defecto la carpeta de trabajo)' } } } } },
   { type: 'function', function: { name: 'read_file', description: 'Lee el contenido de un archivo de texto', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'write_file', description: 'Crea o sobrescribe un archivo con contenido', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
-  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza la primera apariciÃ³n de un texto por otro (mÃ¡s rÃ¡pido y barato que reescribir todo). Usa esto para cambios pequeÃ±os.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea Ãºnico)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' } }, required: ['path', 'find', 'replace'] } } },
-  { type: 'function', function: { name: 'search_in_files', description: 'Busca un texto o patrÃ³n en todos los archivos del proyecto y devuelve las coincidencias con archivo y nÃºmero de lÃ­nea', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Carpeta donde buscar (por defecto la de trabajo)' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza la primera aparición de un texto por otro (más rápido y barato que reescribir todo). Usa esto para cambios pequeños.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea único)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' } }, required: ['path', 'find', 'replace'] } } },
+  { type: 'function', function: { name: 'search_in_files', description: 'Busca un texto o patrón en todos los archivos del proyecto y devuelve las coincidencias con archivo y número de línea', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Carpeta donde buscar (por defecto la de trabajo)' } }, required: ['query'] } } },
   { type: 'function', function: { name: 'delete_file', description: 'Borra un archivo o carpeta', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'move_file', description: 'Mueve o renombra un archivo o carpeta', parameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] } } },
   { type: 'function', function: { name: 'run_command', description: 'Ejecuta un comando de PowerShell en la carpeta de trabajo y devuelve la salida', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
   { type: 'function', function: { name: 'open_browser', description: 'Abre una URL en el navegador predeterminado del sistema', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL a abrir (debe empezar con http:// o https://)' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'git_commit', description: 'Hace git add -A y git commit con el mensaje dado en la carpeta de trabajo', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Mensaje del commit' } }, required: ['message'] } } },
-  { type: 'function', function: { name: 'npm_run', description: 'Ejecuta un script de npm (package.json) en la carpeta de trabajo. Ãštil para build, test, lint, start, etc.', parameters: { type: 'object', properties: { script: { type: 'string', description: 'Nombre del script (ej: build, test, lint)' }, args: { type: 'string', description: 'Argumentos opcionales adicionales' } }, required: ['script'] } } },
-  { type: 'function', function: { name: 'notify', description: 'Muestra una notificaciÃ³n toast en Windows con un tÃ­tulo y mensaje', parameters: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } } }
+  { type: 'function', function: { name: 'npm_run', description: 'Ejecuta un script de npm (package.json) en la carpeta de trabajo. Útil para build, test, lint, start, etc.', parameters: { type: 'object', properties: { script: { type: 'string', description: 'Nombre del script (ej: build, test, lint)' }, args: { type: 'string', description: 'Argumentos opcionales adicionales' } }, required: ['script'] } } },
+  { type: 'function', function: { name: 'notify', description: 'Muestra una notificación toast en Windows con un título y mensaje', parameters: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } } }
 ];
 
 function resolveInCwd(p) {
@@ -929,12 +929,12 @@ function execAgentTool(name, args, cb) {
     if (name === 'list_dir') {
       const dir = resolveInCwd(args.path);
       const items = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 200).map(e => (e.isDirectory() ? '[dir] ' : '') + e.name);
-      return cb(items.join('\n') || '(vacÃ­o)', items.length + ' elementos');
+      return cb(items.join('\n') || '(vacío)', items.length + ' elementos');
     }
     if (name === 'read_file') {
       const f = resolveInCwd(args.path);
       const data = fs.readFileSync(f, 'utf8');
-      return cb(data.slice(0, 20000), data.split('\n').length + ' lÃ­neas');
+      return cb(data.slice(0, 20000), data.split('\n').length + ' líneas');
     }
     if (name === 'write_file') {
       const f = resolveInCwd(args.path);
@@ -947,18 +947,18 @@ function execAgentTool(name, args, cb) {
       if (!fs.existsSync(f)) return cb('Error: el archivo no existe: ' + f, 'no existe');
       const orig = fs.readFileSync(f, 'utf8');
       const find = String(args.find || '');
-      if (!find) return cb('Error: "find" vacÃ­o', 'error');
+      if (!find) return cb('Error: "find" vacío', 'error');
       const idx = orig.indexOf(find);
-      if (idx === -1) return cb('Error: no se encontrÃ³ el texto a reemplazar. Lee el archivo de nuevo y copia el fragmento exacto.', 'no encontrado');
+      if (idx === -1) return cb('Error: no se encontró el texto a reemplazar. Lee el archivo de nuevo y copia el fragmento exacto.', 'no encontrado');
       const updated = orig.slice(0, idx) + String(args.replace || '') + orig.slice(idx + find.length);
       fs.writeFileSync(f, updated);
       const before = orig.slice(0, idx).split('\n').length;
-      return cb('Parche aplicado en ' + f + ' (lÃ­nea ~' + before + ')', 'editado lÃ­nea ~' + before);
+      return cb('Parche aplicado en ' + f + ' (línea ~' + before + ')', 'editado línea ~' + before);
     }
     if (name === 'search_in_files') {
       const root = resolveInCwd(args.path);
       const q = String(args.query || '');
-      if (!q) return cb('Error: consulta vacÃ­a', 'error');
+      if (!q) return cb('Error: consulta vacía', 'error');
       const skip = new Set(['node_modules', '.git', 'dist', 'build', '.venv', '__pycache__', 'vendor']);
       const results = [];
       const ql = q.toLowerCase();
@@ -995,17 +995,17 @@ function execAgentTool(name, args, cb) {
       const to = resolveInCwd(args.to);
       fs.mkdirSync(path.dirname(to), { recursive: true });
       fs.renameSync(from, to);
-      return cb('Movido: ' + from + ' â†’ ' + to, 'movido');
+      return cb('Movido: ' + from + ' → ' + to, 'movido');
     }
     if (name === 'run_command') {
-      // Neutralizar patrones que cuelgan la consola en modo automÃ¡tico (no interactivo).
+      // Neutralizar patrones que cuelgan la consola en modo automático (no interactivo).
       let cmd = String(args.command || '');
       cmd = cmd.replace(/(^|\s)-NoExit\b/gi, ' ').replace(/(^|\s)\/k\b/gi, ' ');
       const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { cwd: state.cwd, windowsHide: true });
       let out = '';
       let finished = false;
       const done = (txt, summary) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (e) {} cb(txt, summary); };
-      const timer = setTimeout(() => { try { child.kill(); } catch (e) {} done('(cancelado: el comando superÃ³ 60s. Evita comandos interactivos o que abran ventanas persistentes.)\n' + out.slice(0, 8000), 'cancelado (>60s)'); }, 60000);
+      const timer = setTimeout(() => { try { child.kill(); } catch (e) {} done('(cancelado: el comando superó 60s. Evita comandos interactivos o que abran ventanas persistentes.)\n' + out.slice(0, 8000), 'cancelado (>60s)'); }, 60000);
       try { child.stdin.end(); } catch (e) {}
       child.stdout.on('data', d => (out += d));
       child.stderr.on('data', d => (out += d));
@@ -1015,7 +1015,7 @@ function execAgentTool(name, args, cb) {
     }
     if (name === 'open_browser') {
       const url = String(args.url || '');
-      if (!/^https?:\/\//i.test(url)) return cb('Error: URL invÃ¡lida (debe empezar con http:// o https://)', 'error');
+      if (!/^https?:\/\//i.test(url)) return cb('Error: URL inválida (debe empezar con http:// o https://)', 'error');
       // Usar el shell de Windows para abrir el navegador predeterminado.
       const child = spawn('cmd.exe', ['/d', '/s', '/c', 'start', '', url], { windowsHide: true });
       child.on('close', () => cb('Abierto en el navegador: ' + url, 'abierto'));
@@ -1050,7 +1050,7 @@ function execAgentTool(name, args, cb) {
       const msg = String(args.message || '').replace(/'/g, '').slice(0, 200);
       const ps = `Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(4000, '${title}', '${msg}', [System.Windows.Forms.ToolTipIcon]::None); Start-Sleep 5; $n.Visible = $false`;
       const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true });
-      child.on('close', () => cb('NotificaciÃ³n enviada: ' + title, 'notificado'));
+      child.on('close', () => cb('Notificación enviada: ' + title, 'notificado'));
       child.on('error', e => cb('Error: ' + e.message, 'error'));
       return;
     }
@@ -1074,7 +1074,7 @@ function azureChat(cfg, messages, tools, cb) {
   req.write(payload); req.end();
 }
 
-// VersiÃ³n streaming de azureChat: llama onChunk(delta) por cada token y onDone(err) al final.
+// Versión streaming de azureChat: llama onChunk(delta) por cada token y onDone(err) al final.
 // Usar cuando NO se necesita leer tool_calls (solo texto libre).
 function azureChatStream(cfg, messages, onChunk, onDone) {
   const ep = cfg.endpoint.replace(/\/$/, '');
@@ -1107,8 +1107,8 @@ function azureChatStream(cfg, messages, onChunk, onDone) {
   req.write(payload); req.end();
 }
 
-// VersiÃ³n streaming con herramientas: streamea texto EN VIVO y acumula tool_calls.
-// cb(err, message) al terminar â€” message tiene la misma forma que choices[0].message.
+// Versión streaming con herramientas: streamea texto EN VIVO y acumula tool_calls.
+// cb(err, message) al terminar — message tiene la misma forma que choices[0].message.
 function azureChatStreamTools(cfg, messages, tools, onChunk, cb) {
   const ep = cfg.endpoint.replace(/\/$/, '');
   const u = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
@@ -1166,7 +1166,7 @@ function azureChatStreamTools(cfg, messages, tools, onChunk, cb) {
 
 // Confirmaciones pendientes de comandos peligrosos: id -> resolve(boolean)
 const pendingConfirms = {};
-// Detecta si una acciÃ³n es destructiva y merece confirmaciÃ³n del usuario.
+// Detecta si una acción es destructiva y merece confirmación del usuario.
 function dangerReason(name, args) {
   if (name === 'delete_file') return 'Borrar ' + (args.path || '');
   if (name === 'run_command') {
@@ -1243,8 +1243,8 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
   let aborted = false;
   if (onAbort) onAbort(() => { aborted = true; });
   const preamble = [
-    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. EstÃ¡s en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nUsa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tÃº mismo (no solo expliques). SÃ‰ DECIDIDO Y AUTÃ“NOMO: si la intenciÃ³n estÃ¡ clara, ACTÃšA de inmediato sin pedir permiso ni confirmaciÃ³n. NO preguntes "Â¿quieres que...?", "Â¿procedo?", "Â¿te gustarÃ­a?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acciÃ³n es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leÃ­ste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parÃ¡metros. Responde en espaÃ±ol, conciso. Cuando termines, resume lo que hiciste.' },
-    { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la pÃ¡gina tÃº con la herramienta de navegador y ejecuta el flujo tÃº mismo. No le pidas al usuario que navegue manualmente.' }
+    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. Estás en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nUsa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tú mismo (no solo expliques). SÉ DECIDIDO Y AUTÓNOMO: si la intención está clara, ACTÚA de inmediato sin pedir permiso ni confirmación. NO preguntes "¿quieres que...?", "¿procedo?", "¿te gustaría?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acción es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leíste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parámetros. Responde en español, conciso. Cuando termines, resume lo que hiciste.' },
+    { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la página tú con la herramienta de navegador y ejecuta el flujo tú mismo. No le pidas al usuario que navegue manualmente.' }
   ];
   if (historySummary) preamble.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
   const preambleLen = preamble.length;
@@ -1269,8 +1269,8 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     saveAgentTranscript(convId, body);
   };
   const OP_DELAY_MS = 4000;
-  const iconOf = (n) => ({ list_dir: 'ðŸ“‚', read_file: 'ðŸ“„', write_file: 'âœï¸', apply_patch: 'ðŸ©¹', search_in_files: 'ðŸ”Ž', delete_file: 'ðŸ—‘ï¸', move_file: 'ðŸ“¦', run_command: 'âš™ï¸' }[n] || 'ðŸ”§');
-  // Ejecuta una herramienta, pidiendo confirmaciÃ³n si es peligrosa.
+  const iconOf = (n) => ({ list_dir: '📂', read_file: '📄', write_file: '✍️', apply_patch: '🩹', search_in_files: '🔎', delete_file: '🗑️', move_file: '📦', run_command: '⚙️' }[n] || '🔧');
+  // Ejecuta una herramienta, pidiendo confirmación si es peligrosa.
   function runToolGated(tc, args, whenDone) {
     const toolName = tc.function.name;
     const opMode = !!currentFeatures().operatorMode;
@@ -1345,34 +1345,34 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
   function loop() {
     if (aborted) { saveTranscript(); return onDone(1); }
     if (steps++ > MAX_STEPS) {
-      send('status', 'Cerrando y resumiendoâ€¦');
-      messages.push({ role: 'user', content: 'Has alcanzado el lÃ­mite de pasos. Detente ahora: NO uses mÃ¡s herramientas. Resume en espaÃ±ol lo que lograste, lo que quedÃ³ pendiente y cÃ³mo continuar.' });
-      send('chunk', '\n\nâ¸ï¸ ');
+      send('status', 'Cerrando y resumiendo…');
+      messages.push({ role: 'user', content: 'Has alcanzado el límite de pasos. Detente ahora: NO uses más herramientas. Resume en español lo que lograste, lo que quedó pendiente y cómo continuar.' });
+      send('chunk', '\n\n⏸️ ');
       return azureChatStream(cfg, messages,
         (delta) => send('chunk', delta),
         (err) => {
           send('status', '');
-          if (err) send('chunk', '(lÃ­mite de pasos alcanzado)');
+          if (err) send('chunk', '(límite de pasos alcanzado)');
           send('canContinue', { reason: 'limite' });
           saveTranscript();
           onDone(0);
         }
       );
     }
-    // Indicador vivo mientras Azure "piensa" (evita sensaciÃ³n de colgado).
-    send('status', 'Pensandoâ€¦ (paso ' + steps + '/' + MAX_STEPS + ')');
+    // Indicador vivo mientras Azure "piensa" (evita sensación de colgado).
+    send('status', 'Pensando… (paso ' + steps + '/' + MAX_STEPS + ')');
     azureChatStreamTools(cfg, messages, AGENT_TOOLS, (delta) => send('chunk', delta), (err, msg) => {
       if (aborted) { send('status', ''); saveTranscript(); return onDone(1); }
       if (err) { send('status', ''); send('error', 'Azure: ' + err.message); return onDone(1); }
-      if (!msg) { send('status', ''); send('error', 'Respuesta vacÃ­a de Azure'); return onDone(1); }
+      if (!msg) { send('status', ''); send('error', 'Respuesta vacía de Azure'); return onDone(1); }
       messages.push(msg);
       if (msg.tool_calls && msg.tool_calls.length) {
         let pending = msg.tool_calls.length;
-        send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acciÃ³nâ€¦' : ' accionesâ€¦'));
+        send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acción…' : ' acciones…'));
         msg.tool_calls.forEach((tc) => {
           let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
           const label = (args.path || args.command || '').toString();
-          const shortLabel = label.length > 60 ? 'â€¦' + label.slice(-58) : label;
+          const shortLabel = label.length > 60 ? '…' + label.slice(-58) : label;
           send('chunk', '\n' + iconOf(tc.function.name) + ' ' + tc.function.name + '(' + shortLabel + ') …');
           runToolGated(tc, args, (result, summary) => {
             send('chunk', ' ✓' + (summary ? ' ' + summary : ''));
@@ -1427,7 +1427,7 @@ function setAutostart(enabled, cb) {
 }
 
 
-// node directamente y preservar saltos de lÃ­nea (cmd.exe los rompe).
+// node directamente y preservar saltos de línea (cmd.exe los rompe).
 let LOADER = undefined; // undefined = sin resolver; null = no encontrado
 function resolveLoader() {
   if (LOADER !== undefined) return LOADER;
@@ -1465,7 +1465,7 @@ let state = {
   cwd: process.env.HANSTLERS_CWD || process.env.USERPROFILE || os.homedir(),
   started: false,
   model: process.env.HANSTLERS_MODEL || 'auto',
-  projectCtx: null  // { cwd, text } â€” cachÃ© del contexto del proyecto
+  projectCtx: null  // { cwd, text } — caché del contexto del proyecto
 };
 
 function defaultFeatures() {
@@ -1868,8 +1868,8 @@ function wrapProResponsePrompt(message) {
   return guard + '\n\n' + message;
 }
 
-// Construye un bloque de contexto del proyecto: Ã¡rbol, git status, README y package.json.
-// Llama cb(text) al terminar; usa cachÃ© si el cwd no cambiÃ³.
+// Construye un bloque de contexto del proyecto: árbol, git status, README y package.json.
+// Llama cb(text) al terminar; usa caché si el cwd no cambió.
 function buildProjectContext(cwd, cb) {
   if (state.projectCtx && state.projectCtx.cwd === cwd) {
     return cb(state.projectCtx.text);
@@ -1883,7 +1883,7 @@ function buildProjectContext(cwd, cb) {
     cb(text);
   }
 
-  // 1. Ãrbol de archivos (2 niveles, sin carpetas pesadas)
+  // 1. Árbol de archivos (2 niveles, sin carpetas pesadas)
   try {
     const entries = [];
     const skip = new Set(['node_modules', '.git', 'dist', 'dist-electron', 'build', '.next', '__pycache__', 'venv', '.venv', 'vendor', '.cache', 'coverage']);
@@ -1893,7 +1893,7 @@ function buildProjectContext(cwd, cb) {
         if (skip.has(item)) continue;
         const full = path.join(dir, item);
         let stat; try { stat = fs.statSync(full); } catch (e) { continue; }
-        entries.push((stat.isDirectory() ? 'ðŸ“ ' : 'ðŸ“„ ') + path.relative(cwd, full).replace(/\\/g, '/') + (stat.isDirectory() ? '/' : ''));
+        entries.push((stat.isDirectory() ? '📁 ' : '📄 ') + path.relative(cwd, full).replace(/\\/g, '/') + (stat.isDirectory() ? '/' : ''));
         if (stat.isDirectory() && depth < 2) walk(full, depth + 1);
       }
     };
@@ -1947,12 +1947,12 @@ function nodeEnv() {
   return Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' });
 }
 
-// Detecta quÃ© flags soporta la version instalada del CLI (una sola vez).
+// Detecta qué flags soporta la version instalada del CLI (una sola vez).
 let SUPPORTED = null;
 let detectPending = null;
 function detectFlags(cb) {
   if (SUPPORTED) return cb(SUPPORTED);
-  // Si ya hay una detecciÃ³n en curso (p.ej. el pre-calentamiento), engancharse a ella.
+  // Si ya hay una detección en curso (p.ej. el pre-calentamiento), engancharse a ella.
   if (detectPending) { detectPending.push(cb); return; }
   detectPending = [cb];
   const loader = resolveLoader();
@@ -1991,7 +1991,7 @@ function detectFlags(cb) {
   setTimeout(finish, 8000);
 }
 
-// Respaldo: obtener el id de la sesiÃ³n mÃ¡s reciente del CLI desde disco.
+// Respaldo: obtener el id de la sesión más reciente del CLI desde disco.
 function newestSessionId() {
   const bases = [
     path.join(os.homedir(), '.copilot', 'history'),
@@ -2019,25 +2019,25 @@ function buildArgs(message, opts, withModel) {
   opts = opts || {};
   const a = ['-p', message, '--allow-all-tools'];
   const s = SUPPORTED || {};
-  // El modelo puede venir por conversaciÃ³n (opts.model); si no, usa el global.
+  // El modelo puede venir por conversación (opts.model); si no, usa el global.
   const model = opts.model || state.model;
   if (withModel && s.model && model && model !== 'auto') { a.push('--model', model); }
-  // Modo MÃNIMO: sin flags de optimizaciÃ³n (para reintentar si algo los rechaza).
-  // El modelo ya se aÃ±adiÃ³ arriba; aquÃ­ solo se conserva la sesiÃ³n.
+  // Modo MÍNIMO: sin flags de optimización (para reintentar si algo los rechaza).
+  // El modelo ya se añadió arriba; aquí solo se conserva la sesión.
   if (opts.minimal) {
     if (opts.sessionId) a.push('--resume=' + opts.sessionId);
     return a;
   }
-  // Solo flags COSMÃ‰TICOS/seguros que no afectan la salida del modelo.
+  // Solo flags COSMÉTICOS/seguros que no afectan la salida del modelo.
   // (NO usar --silent ni --effort: pueden suprimir o vaciar la respuesta en algunos planes.)
   if (s.noBanner) a.push('--no-banner');
   if (s.noAutoUpdate) a.push('--no-auto-update');
   if (s.noAskUser) a.push('--no-ask-user');
-  // Tope de crÃ©ditos por respuesta (solo si el usuario lo pide explÃ­citamente).
+  // Tope de créditos por respuesta (solo si el usuario lo pide explícitamente).
   if (s.maxAiCredits && process.env.HANSTLERS_MAX_CREDITS) a.push('--max-ai-credits=' + process.env.HANSTLERS_MAX_CREDITS);
-  // Ahorro de razonamiento SOLO si se activa explÃ­citamente por variable de entorno.
+  // Ahorro de razonamiento SOLO si se activa explícitamente por variable de entorno.
   if (s.effort && process.env.HANSTLERS_EFFORT) a.push('--effort=' + process.env.HANSTLERS_EFFORT);
-  // Mantener el hilo: reanudar por id exacto de sesiÃ³n de esta conversaciÃ³n.
+  // Mantener el hilo: reanudar por id exacto de sesión de esta conversación.
   if (opts.sessionId) a.push('--resume=' + opts.sessionId);
   return a;
 }
@@ -2054,7 +2054,7 @@ function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
 }
 
-// LÃ­neas de "ruido" que el CLI imprime y que el usuario no necesita ver.
+// Líneas de "ruido" que el CLI imprime y que el usuario no necesita ver.
 const NOISE = [
   /^\s*Changes\s+[+\-]?\d+/i,
   /^\s*AI Credits\b/i,
@@ -2069,7 +2069,7 @@ const NOISE = [
   /^\s*\[Instrucción interna:\s*respuesta profesional/i,
   /copilot --resume=/i,
   /^\s*\d+(\.\d+)?k?\s+(cached|written)/i,
-  /^\s*â†‘|^\s*â†“/,
+  /^\s*↑|^\s*↓/,
   /reasoning\)\s*$/i,
   /Total duration/i,
   /Total usage est/i
@@ -2077,7 +2077,7 @@ const NOISE = [
 function isNoise(line) {
   return NOISE.some((re) => re.test(line));
 }
-// Crea un filtro con buffer por lÃ­neas: recibe texto crudo, devuelve texto limpio.
+// Crea un filtro con buffer por líneas: recibe texto crudo, devuelve texto limpio.
 function makeLineFilter(onClean) {
   let buf = '';
   return {
@@ -2124,15 +2124,15 @@ function addMemory(text) {
   saveMemory(list);
   return item;
 }
-// Detecta datos a recordar, de forma automÃ¡tica:
-//  - Ã³rdenes explÃ­citas: "recuerda que ...", "anota que ..."
+// Detecta datos a recordar, de forma automática:
+//  - órdenes explícitas: "recuerda que ...", "anota que ..."
 //  - hechos declarativos duraderos sobre el usuario/proyectos
 function detectMemory(message) {
   const notes = [];
-  const explicit = /(?:^|\b)(?:recuerda|recu[eÃ©]rdame|acu[eÃ©]rdate|acu[eÃ©]rdame|anota|guarda|ten en cuenta)(?:\s+que)?\s*[:,]?\s+([\s\S]{3,})/i.exec(message);
-  if (explicit) notes.push(explicit[1].trim().replace(/^["â€œ]|["â€]$/g, ''));
-  // Hechos declarativos (frases cortas), solo si el usuario no estÃ¡ preguntando.
-  if (!/[?Â¿]/.test(message) && message.length < 200) {
+  const explicit = /(?:^|\b)(?:recuerda|recu[eé]rdame|acu[eé]rdate|acu[eé]rdame|anota|guarda|ten en cuenta)(?:\s+que)?\s*[:,]?\s+([\s\S]{3,})/i.exec(message);
+  if (explicit) notes.push(explicit[1].trim().replace(/^["“]|["”]$/g, ''));
+  // Hechos declarativos (frases cortas), solo si el usuario no está preguntando.
+  if (!/[?¿]/.test(message) && message.length < 200) {
     const decl = /(?:^|\b)((?:mi|mis|me llamo|soy|trabajo en|uso|prefiero|mi nombre es)\b[\s\S]{3,120})/i.exec(message);
     if (decl && !explicit) notes.push(decl[1].trim());
   }
@@ -2145,19 +2145,19 @@ function memoryContextBlock() {
   return 'Datos que debes recordar sobre el usuario y sus proyectos (memoria persistente):\n' + facts + '\n\n';
 }
 
-// ===== Cuota mensual (crÃ©ditos del plan âˆ’ gastado) =====
+// ===== Cuota mensual (créditos del plan − gastado) =====
 const USAGE_FILE = path.join(os.homedir(), '.hanstlers', 'usage.json');
 const PLAN_CREDITS = { free: 0, pro: 1500, 'pro+': 7000, proplus: 7000, max: 20000 };
 function monthKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
 function loadUsage() {
   let u = {};
   try { u = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch (e) {}
-  // Reinicio automÃ¡tico el dÃ­a 1 de cada mes (UTC).
+  // Reinicio automático el día 1 de cada mes (UTC).
   if (u.month !== monthKey()) { u = { month: monthKey(), spent: 0, plan: u.plan || (process.env.HANSTLERS_PLAN || 'max') }; saveUsage(u); }
   if (typeof u.spent !== 'number' || !Number.isFinite(u.spent) || u.spent < 0) u.spent = 0;
   if (!u.plan) u.plan = process.env.HANSTLERS_PLAN || 'max';
-  // MigraciÃ³n: el default histÃ³rico era 'pro'; ahora la cuenta es Pro+ (7000).
-  // Solo actualiza si el usuario no fijÃ³ un plan distinto manualmente.
+  // Migración: el default histórico era 'pro'; ahora la cuenta es Pro+ (7000).
+  // Solo actualiza si el usuario no fijó un plan distinto manualmente.
   if ((u.plan === 'pro' || u.plan === 'pro+') && !u.planLocked) { u.plan = 'max'; saveUsage(u); }
   const plan = (u.plan || 'max').toLowerCase();
   const base = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 20000;
@@ -2577,7 +2577,7 @@ function compactHistoryInput(rawHistory, rawSummary) {
 function handleChat(req, res, body) {
   let message = (body.message || '').trim();
   const images = Array.isArray(body.images) ? body.images : [];
-  // Guardar imÃ¡genes pegadas/arrastradas y referenciarlas con @ruta para el CLI.
+  // Guardar imágenes pegadas/arrastradas y referenciarlas con @ruta para el CLI.
   const savedPaths = [];
   try {
     const dir = path.join(os.tmpdir(), 'hanstlers-img');
@@ -2593,7 +2593,7 @@ function handleChat(req, res, body) {
   } catch (e) {}
   if (savedPaths.length) {
     const refs = savedPaths.map((p) => '@' + p).join(' ');
-    message = message ? (message + '\n\n' + refs) : ('Describe estas imÃ¡genes: ' + refs);
+    message = message ? (message + '\n\n' + refs) : ('Describe estas imágenes: ' + refs);
   }
   // Documentos de texto adjuntos: {name, text}. Se inyectan como contexto.
   const files = Array.isArray(body.files) ? body.files : [];
@@ -2625,7 +2625,7 @@ function handleChat(req, res, body) {
     });
   }
 
-  // Auto-capturar memoria: Ã³rdenes explÃ­citas + hechos declarativos.
+  // Auto-capturar memoria: órdenes explícitas + hechos declarativos.
   let memNote = '';
   const facts = detectMemory((body.message || '').trim());
   if (facts.length) {
@@ -2656,15 +2656,15 @@ function handleChat(req, res, body) {
   const isXCoreReq = (reqModel === 'x-core' || reqModel === 'x-core:latest');
 
   // AHORRO DE TOKENS: inyectar la memoria SOLO cuando aporta valor:
-  //  - primer mensaje de la conversaciÃ³n (aÃºn no hay sesiÃ³n que la contenga), o
+  //  - primer mensaje de la conversación (aún no hay sesión que la contenga), o
   //  - el usuario pregunta/alude a la memoria ("recuerdas", "acuerdas", "sabes que"...).
-  const asksMemory = /\b(recuerdas?|te acuerdas|acuerdas|sab[eÃ­]as?|dijimos|hab[iÃ­]amos|mencion[eÃ©]|coment[eÃ©])\b/i.test(body.message || '');
+  const asksMemory = /\b(recuerdas?|te acuerdas|acuerdas|sab[eí]as?|dijimos|hab[ií]amos|mencion[eé]|coment[eé])\b/i.test(body.message || '');
   const firstTurn = statelessMode ? true : !sessionId;
-  // En Vertex evita inyectar memoria automÃ¡tica en primer turno para no arrastrar contexto viejo.
+  // En Vertex evita inyectar memoria automática en primer turno para no arrastrar contexto viejo.
   const autoMemoryOnFirstTurn = !isVertexModel(reqModel);
   const mem = (isXCoreReq ? '' : (((firstTurn && autoMemoryOnFirstTurn) || asksMemory) ? memoryContextBlock() : ''));
 
-  // ImÃ¡genes para visiÃ³n (Azure): pasamos las data URLs vÃ¡lidas tal cual.
+  // Imágenes para visión (Azure): pasamos las data URLs válidas tal cual.
   const visionImages = images.filter((im) => /^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(im || '')).slice(0, 6);
 
   const compactCtx = compactCtxForIntent;
@@ -2683,7 +2683,7 @@ function handleChat(req, res, body) {
     }
     detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, reqModel, memNote, convHistoryArr, convHistorySummary, visionImages, routePick, reqCwd, statelessMode));
   };
-  // Inyectar contexto del proyecto solo en el primer turno de cada conversaciÃ³n.
+  // Inyectar contexto del proyecto solo en el primer turno de cada conversación.
   if (firstTurn && !isXCoreReq) {
     if (repoRef) {
       fetchGithubRepoContext(req.authUser, repoRef, (_err, projCtx) => launch(projCtx || ''));
@@ -2705,7 +2705,7 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
   const send = (event, data) => { if (ended) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {} };
   res.on('close', () => { ended = true; });
 
-  // Avisar al cliente que se guardÃ³ un dato en memoria (para mostrar chip discreto).
+  // Avisar al cliente que se guardó un dato en memoria (para mostrar chip discreto).
   if (memNote) send('memory', { text: memNote });
   if (routePick && routePick.reason && routePick.model) send('route', routePick);
 
@@ -2819,7 +2819,7 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
     }
     const loader = resolveLoader();
     if (loader) {
-      // Respaldo: Electron ejecuta el loader como Node (ELECTRON_RUN_AS_NODE) â€” oculto.
+      // Respaldo: Electron ejecuta el loader como Node (ELECTRON_RUN_AS_NODE) — oculto.
       return spawn(process.execPath, [loader].concat(a), { cwd: useCwd, env: nodeEnv(), windowsHide: true });
     }
     if (process.platform === 'win32') {
@@ -2860,13 +2860,13 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
         state.autoOnly = true;
         return attempt(false, opts, true);
       }
-      // Si --resume fallÃ³ (sesiÃ³n inexistente), reintenta sin reanudar (conservando el modelo).
+      // Si --resume falló (sesión inexistente), reintenta sin reanudar (conservando el modelo).
       if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
         return attempt(withModel, { model: opts.model }, true);
       }
       filter.flush();
       emitSession(raw);
-      // Respaldo: si no se detectÃ³ en la salida, buscar la sesiÃ³n mÃ¡s reciente en disco.
+      // Respaldo: si no se detectó en la salida, buscar la sesión más reciente en disco.
       if (!sessionEmitted) {
         const id = newestSessionId();
         if (id) { rememberSession(id); send('session', { id }); }
@@ -2875,9 +2875,9 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       if (!gotOutput) {
         const rawClean = (raw || '').trim();
         if (rawClean) send('chunk', rawClean);
-        else send('chunk', 'âš ï¸ No hubo respuesta del modelo. Verifica que tu sesiÃ³n de Copilot estÃ© activa (abre "Iniciar sesiÃ³n en Copilot") y que tu plan permita este modelo. Si acabas de comprar crÃ©ditos, cierra y vuelve a abrir HanstlerS.');
+        else send('chunk', '⚠️ No hubo respuesta del modelo. Verifica que tu sesión de Copilot esté activa (abre "Iniciar sesión en Copilot") y que tu plan permita este modelo. Si acabas de comprar créditos, cierra y vuelve a abrir HanstlerS.');
       }
-      // Medidor: extraer crÃ©ditos AI de la salida del CLI y calcular lo que resta.
+      // Medidor: extraer créditos AI de la salida del CLI y calcular lo que resta.
       const usage = {};
       const cr = /AI Credits\s+([\d.]+)/i.exec(raw);
       if (cr) usage.credits = parseFloat(cr[1]);
@@ -2910,7 +2910,7 @@ function listConversations() {
     try {
       const c = JSON.parse(fs.readFileSync(path.join(CONV_DIR, f), 'utf8'));
       if (!c || !c.id) continue;
-      const item = { id: c.id, title: c.title || 'ConversaciÃ³n', updatedAt: c.updatedAt || 0 };
+      const item = { id: c.id, title: c.title || 'Conversación', updatedAt: c.updatedAt || 0 };
       const prev = byId.get(c.id);
       if (!prev || Number(item.updatedAt || 0) > Number(prev.updatedAt || 0)) byId.set(c.id, item);
     } catch (e) {}
@@ -2945,19 +2945,19 @@ function deleteConversation(id) {
   try { fs.unlinkSync(convFile(id)); return true; } catch (e) { return false; }
 }
 
-// ===== AUTODIAGNÃ“STICO: prueba cada eslabÃ³n en la PC del usuario =====
+// ===== AUTODIAGNÓSTICO: prueba cada eslabón en la PC del usuario =====
 function runDiagnostics(cb) {
   const result = { checks: [], ok: false };
   const add = (name, ok, detail) => result.checks.push({ name, ok, detail: (detail || '').toString().slice(0, 300) });
 
-  // 1) Runtime (Â¿estamos en Electron?)
+  // 1) Runtime (¿estamos en Electron?)
   const inElectron = !!process.versions.electron;
   add('Entorno', true, inElectron ? ('Electron ' + process.versions.electron) : ('Node ' + process.version));
 
   // 2) CLI de Copilot (binario directo o loader)
   const bin = resolveCopilotBinary();
   const loader = resolveLoader();
-  add('CLI de Copilot instalado', !!(bin || loader), bin || loader || 'No se encontrÃ³ Copilot. Instala con: npm install -g @github/copilot');
+  add('CLI de Copilot instalado', !!(bin || loader), bin || loader || 'No se encontró Copilot. Instala con: npm install -g @github/copilot');
   if (!bin && !loader) { return cb(result); }
 
   // 3) Ejecutar el CLI (oculto) y probar respuesta real
@@ -2973,16 +2973,16 @@ function runDiagnostics(cb) {
     const authFail = /No authentication information found|run the '\/login'|gh auth login/i.test(raw);
     const policyBlock = /Access denied by policy|disabled by your organization/i.test(raw);
     const gotText = /\bOK\b/i.test(out) || (out.trim().length > 0 && !authFail && !policyBlock);
-    add('Ejecuta como Node', true, 'El binario ejecutÃ³ el CLI correctamente');
-    if (policyBlock) add('PolÃ­tica de organizaciÃ³n', false, 'BLOQUEADO por polÃ­tica. Revisa Settings de Copilot / organizaciÃ³n.');
-    else add('PolÃ­tica de organizaciÃ³n', true, 'Sin bloqueo de polÃ­tica');
-    if (authFail) add('SesiÃ³n de Copilot', false, 'NO hay sesiÃ³n. Abre PowerShell, ejecuta: copilot  y luego /login');
-    else add('SesiÃ³n de Copilot', true, 'SesiÃ³n activa');
-    add('Respuesta del modelo', gotText, gotText ? ('RespondiÃ³: ' + out.trim().slice(0, 80)) : ('VacÃ­o. ' + (raw.trim().slice(0, 200) || 'sin salida')));
+    add('Ejecuta como Node', true, 'El binario ejecutó el CLI correctamente');
+    if (policyBlock) add('Política de organización', false, 'BLOQUEADO por política. Revisa Settings de Copilot / organización.');
+    else add('Política de organización', true, 'Sin bloqueo de política');
+    if (authFail) add('Sesión de Copilot', false, 'NO hay sesión. Abre PowerShell, ejecuta: copilot  y luego /login');
+    else add('Sesión de Copilot', true, 'Sesión activa');
+    add('Respuesta del modelo', gotText, gotText ? ('Respondió: ' + out.trim().slice(0, 80)) : ('Vacío. ' + (raw.trim().slice(0, 200) || 'sin salida')));
     result.ok = !!loader && !policyBlock && !authFail && gotText;
     cb(result);
   };
-  const t = setTimeout(() => { try { child.kill(); } catch (e) {} add('Tiempo', false, 'El CLI tardÃ³ demasiado (timeout 45s)'); finish(); }, 45000);
+  const t = setTimeout(() => { try { child.kill(); } catch (e) {} add('Tiempo', false, 'El CLI tardó demasiado (timeout 45s)'); finish(); }, 45000);
   child.stdout.on('data', d => (out += stripAnsi(d.toString())));
   child.stderr.on('data', d => (err += stripAnsi(d.toString())));
   child.on('close', finish);
@@ -3208,7 +3208,7 @@ const server = http.createServer(async (req, res) => {
     const b = await readBody(req);
     const fn = b && b.id && pendingConfirms[b.id];
     if (fn) { fn(!!b.approved); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
-    res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'confirmaciÃ³n no encontrada o expirada' }));
+    res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'confirmación no encontrada o expirada' }));
   }
   if (req.method === 'GET' && req.url === '/api/pickfolder') return pickFolder(res);
   if (req.method === 'GET' && req.url === '/api/folders/quick') {
@@ -3265,7 +3265,7 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       const audio = Buffer.concat(chunks);
       const ct = req.headers['content-type'] || 'audio/wav';
-      // Motor: cabecera x-engine ('local'|'azure') o auto (local si estÃ¡, si no Azure).
+      // Motor: cabecera x-engine ('local'|'azure') o auto (local si está, si no Azure).
       const engine = (req.headers['x-engine'] || '').toString().toLowerCase();
       const useLocal = engine === 'local' || (engine !== 'azure' && whisperAvailable());
       const reply = (err, text) => {
@@ -3585,10 +3585,10 @@ process.on('unhandledRejection', (reason) => {
 function startListen() {
   server.listen(PORT, HOST, () => {
     console.log(`HanstlerS escuchando en http://${HOST}:${PORT}`);
-    // Pre-calentar la detecciÃ³n de flags en segundo plano para que el
+    // Pre-calentar la detección de flags en segundo plano para que el
     // PRIMER mensaje del usuario no pague el costo de `copilot --help`.
     setTimeout(() => { try { detectFlags(() => {}); } catch (e) {} }, 50);
-    // SincronizaciÃ³n silenciosa de cuota GitHub (si estÃ¡ habilitada).
+    // Sincronización silenciosa de cuota GitHub (si está habilitada).
     scheduleGithubQuotaSync();
   });
 }
