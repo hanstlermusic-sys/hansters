@@ -38,7 +38,13 @@ function loadAzure() {
 const VERTEX_FILE = path.join(os.homedir(), '.hanstlers', 'vertex.json');
 function loadVertex() {
   let fileCfg = {};
-  try { fileCfg = JSON.parse(fs.readFileSync(VERTEX_FILE, 'utf8')) || {}; } catch (e) {}
+  try {
+    let crudo = fs.readFileSync(VERTEX_FILE, 'utf8');
+    // Un BOM invisible tumbaba JSON.parse y dejaba Vertex "sin configurar" en
+    // silencio: el usuario elegia Gemini y le respondia otro modelo.
+    if (crudo.charCodeAt(0) === 0xFEFF) crudo = crudo.slice(1);
+    fileCfg = JSON.parse(crudo) || {};
+  } catch (e) {}
   const projectId = String(process.env.GCP_PROJECT_ID || fileCfg.projectId || '').trim();
   const region = String(process.env.GCP_REGION || process.env.ANTHROPIC_VERTEX_REGION || fileCfg.region || 'us-central1').trim();
   let apiKey = String(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || fileCfg.apiKey || '').trim();
@@ -51,8 +57,8 @@ function loadVertex() {
     region,
     apiKey,
     models: {
-      pro: String(process.env.VERTEX_MODEL_PRO || fileCfg.modelPro || 'gemini-2.5-pro').trim(),
-      flash: String(process.env.VERTEX_MODEL_FLASH || fileCfg.modelFlash || 'gemini-2.5-flash').trim(),
+      pro: String(process.env.VERTEX_MODEL_PRO || fileCfg.modelPro || 'gemini-3.7-flash').trim(),
+      flash: String(process.env.VERTEX_MODEL_FLASH || fileCfg.modelFlash || 'gemini-3.5-flash').trim(),
       opus: String(process.env.VERTEX_MODEL_OPUS || fileCfg.modelOpus || 'claude-opus-5').trim()
     },
     authMode: hasProjectCfg ? 'adc' : 'api-key'
@@ -1185,6 +1191,242 @@ function azureChatStreamTools(cfg, messages, tools, onChunk, cb) {
   req.write(payload); req.end();
 }
 
+// ===== Cerebro Gemini: function calling para el bucle de agente =====
+// Convierte AGENT_TOOLS (formato OpenAI) a functionDeclarations de Gemini. Solo
+// cambia el envoltorio: el JSON Schema de `parameters` es compatible tal cual.
+function geminiFunctionDeclarations(tools) {
+  return (tools || [])
+    .map((t) => (t && t.function) ? t.function : t)
+    .filter((f) => f && f.name)
+    .map((f) => {
+      const decl = { name: f.name, description: f.description || '' };
+      const p = f.parameters;
+      // Gemini rechaza un objeto de parametros sin propiedades: se omite.
+      if (p && p.properties && Object.keys(p.properties).length) decl.parameters = p;
+      return decl;
+    });
+}
+
+// Contenido OpenAI (texto suelto, o array con texto e imagenes) -> parts de Gemini.
+function geminiPartsFromContent(content) {
+  if (content == null) return [];
+  if (typeof content === 'string') return content ? [{ text: content }] : [];
+  const parts = [];
+  (Array.isArray(content) ? content : []).forEach((c) => {
+    if (!c) return;
+    if (c.type === 'text' && c.text) parts.push({ text: String(c.text) });
+    if (c.type === 'image_url' && c.image_url && c.image_url.url) {
+      const m = /^data:([^;]+);base64,(.*)$/.exec(String(c.image_url.url));
+      if (m) parts.push({ inline_data: { mime_type: m[1], data: m[2] } });
+    }
+  });
+  return parts;
+}
+
+// Historial estilo OpenAI -> contents + systemInstruction de Gemini.
+// Los turnos del mismo rol se fusionan porque Gemini exige alternancia y porque
+// el numero de functionResponse debe casar con el de functionCall del turno
+// anterior del modelo (varias herramientas en paralelo = un solo turno).
+function toGeminiAgentContents(messages) {
+  const sys = [];
+  const contents = [];
+  const nombrePorId = {};
+  const push = (role, parts) => {
+    if (!parts || !parts.length) return;
+    const ultimo = contents[contents.length - 1];
+    if (ultimo && ultimo.role === role) { ultimo.parts = ultimo.parts.concat(parts); return; }
+    contents.push({ role: role, parts: parts });
+  };
+  (messages || []).forEach((m) => {
+    if (!m) return;
+    if (m.role === 'system') { if (m.content) sys.push(String(m.content)); return; }
+    if (m.role === 'user') { push('user', geminiPartsFromContent(m.content)); return; }
+    if (m.role === 'assistant') {
+      (m.tool_calls || []).forEach((tc) => {
+        nombrePorId[tc.id] = {
+          name: (tc.function && tc.function.name) || 'tool',
+          gid: tc._geminiId || null
+        };
+      });
+      // Gemini 3.x firma cada part con un `thoughtSignature` opaco y EXIGE que se
+      // le devuelva tal cual; reconstruir la part desde {name,args} da un 400.
+      // Por eso se reenvian las parts crudas del modelo cuando las tenemos.
+      if (m._geminiParts && m._geminiParts.length) { push('model', m._geminiParts); return; }
+      const parts = [];
+      if (m.content) parts.push({ text: String(m.content) });
+      (m.tool_calls || []).forEach((tc) => {
+        let args = {};
+        try { args = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) { args = {}; }
+        parts.push({ functionCall: { name: (tc.function && tc.function.name) || 'tool', args: args } });
+      });
+      push('model', parts);
+      return;
+    }
+    if (m.role === 'tool') {
+      const info = nombrePorId[m.tool_call_id] || {};
+      const salida = String(m.content == null ? '' : m.content);
+      const fr = { name: info.name || 'tool', response: { output: salida } };
+      if (info.gid) fr.id = info.gid;
+      push('user', [{ functionResponse: fr }]);
+    }
+  });
+  // Gemini rechaza un historial que no empiece por un turno de 'user'.
+  while (contents.length && contents[0].role !== 'user') contents.shift();
+  return {
+    contents: contents,
+    systemInstruction: sys.length ? { parts: [{ text: sys.join('\n\n') }] } : null
+  };
+}
+
+// Los flash se saturan a ratos: 503/429 son transitorios y merecen reintento.
+const GEMINI_REINTENTABLES = [429, 500, 502, 503];
+const GEMINI_MAX_REINTENTOS = 3;
+
+// Misma firma que azureChatStreamTools, para que el bucle de agente no note la
+// diferencia: (messages, tools, onChunk, cb) -> cb(err, {role, content, tool_calls}).
+function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
+  const conv = toGeminiAgentContents(messages);
+  const body = {
+    contents: conv.contents,
+    generationConfig: { temperature: 0.2, maxOutputTokens: 8192 }
+  };
+  if (conv.systemInstruction) body.systemInstruction = conv.systemInstruction;
+  const decls = geminiFunctionDeclarations(tools);
+  if (decls.length) body.tools = [{ functionDeclarations: decls }];
+  const payload = JSON.stringify(body);
+  let liquidado = false;
+  const terminar = (err, msg) => { if (liquidado) return; liquidado = true; cb(err, msg); };
+  let intento = 0;
+
+  const lanzar = (endpoint, authHeader) => {
+    const u = new URL(endpoint);
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'POST',
+      timeout: 180000,
+      headers: Object.assign({
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }, authHeader || {})
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (d) => {
+        raw += d.toString();
+        if (raw.length > 4 * 1024 * 1024) raw = raw.slice(-4 * 1024 * 1024);
+      });
+      resp.on('end', () => {
+        if (liquidado) return;
+        if (resp.statusCode >= 400) {
+          if (GEMINI_REINTENTABLES.indexOf(resp.statusCode) !== -1 && intento < GEMINI_MAX_REINTENTOS) {
+            intento++;
+            return setTimeout(() => lanzar(endpoint, authHeader), 1500 * intento);
+          }
+          return terminar(new Error(summarizeVertexError(resp.statusCode, raw)));
+        }
+        let j = null;
+        try { j = JSON.parse(raw || '{}'); } catch (e) { return terminar(new Error('Gemini devolvio una respuesta invalida.')); }
+        const cand = ((j.candidates || [])[0]) || {};
+        const parts = (cand.content && cand.content.parts) || [];
+        let texto = '';
+        const tool_calls = [];
+        parts.forEach((p, i) => {
+          if (!p) return;
+          if (typeof p.text === 'string') texto += p.text;
+          if (p.functionCall) {
+            tool_calls.push({
+              id: p.functionCall.id || ('gc_' + Date.now().toString(36) + '_' + i + '_' + Math.random().toString(36).slice(2, 6)),
+              _geminiId: p.functionCall.id || null,
+              type: 'function',
+              function: {
+                name: p.functionCall.name,
+                arguments: JSON.stringify(p.functionCall.args || {})
+              }
+            });
+          }
+        });
+        const usage = j.usageMetadata || {};
+        const pt = Number(usage.promptTokenCount);
+        const ot = Number(usage.candidatesTokenCount);
+        if ((Number.isFinite(pt) && pt > 0) || (Number.isFinite(ot) && ot > 0)) {
+          try { addGoogleTokens(model, pt, ot); } catch (e) {}
+        }
+        if (!texto && !tool_calls.length) {
+          const fin = cand.finishReason || 'sin contenido';
+          if (fin !== 'STOP') return terminar(new Error('Gemini no devolvio contenido (' + fin + ').'));
+        }
+        if (texto && onChunk) onChunk(texto);
+        const msg = { role: 'assistant', content: texto || null };
+        if (tool_calls.length) msg.tool_calls = tool_calls;
+        // Se conservan para poder reenviarlas intactas en el siguiente turno.
+        if (parts.length) msg._geminiParts = parts;
+        return terminar(null, msg);
+      });
+    });
+    req.on('error', (e) => {
+      if (liquidado) return;
+      if (intento < GEMINI_MAX_REINTENTOS) {
+        intento++;
+        return setTimeout(() => lanzar(endpoint, authHeader), 1500 * intento);
+      }
+      return terminar(e);
+    });
+    req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) {} });
+    req.write(payload);
+    req.end();
+  };
+
+  if (cfg.authMode === 'api-key') {
+    return lanzar('https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(cfg.apiKey), {});
+  }
+  try {
+    getGcpAccessToken((tokErr, token) => {
+      if (tokErr) return terminar(new Error('Vertex auth: ' + tokErr.message));
+      return lanzar('https://' + cfg.region + '-aiplatform.googleapis.com/v1/projects/' +
+        encodeURIComponent(cfg.projectId) + '/locations/' + encodeURIComponent(cfg.region) +
+        '/publishers/google/models/' + encodeURIComponent(model) + ':generateContent',
+        { 'Authorization': 'Bearer ' + token });
+    });
+  } catch (e) {
+    terminar(new Error('Vertex auth: ' + e.message));
+  }
+}
+
+// Cerebros intercambiables para el bucle de agente.
+// Quita los campos internos (_geminiParts, _geminiId) antes de hablar con Azure,
+// por si una conversacion empezada en Vertex sigue con otro proveedor.
+function sinCamposInternos(messages) {
+  return (messages || []).map((m) => {
+    if (!m || (!m._geminiParts && !(m.tool_calls || []).some((t) => t && t._geminiId !== undefined))) return m;
+    const copia = Object.assign({}, m);
+    delete copia._geminiParts;
+    if (copia.tool_calls) {
+      copia.tool_calls = copia.tool_calls.map((t) => {
+        const tc = Object.assign({}, t);
+        delete tc._geminiId;
+        return tc;
+      });
+    }
+    return copia;
+  });
+}
+function azureBrain(cfg) {
+  return {
+    label: 'Azure',
+    chatTools: (messages, tools, onChunk, cb) => azureChatStreamTools(cfg, sinCamposInternos(messages), tools, onChunk, cb),
+    chatPlain: (messages, onChunk, cb) => azureChatStream(cfg, sinCamposInternos(messages), onChunk, cb)
+  };
+}
+function vertexBrain(cfg, model) {
+  return {
+    label: 'Vertex (' + model + ')',
+    chatTools: (messages, tools, onChunk, cb) => geminiChatWithTools(cfg, model, messages, tools, onChunk, cb),
+    // Cierre sin herramientas: se pide texto puro y se avisa al terminar.
+    chatPlain: (messages, onChunk, cb) => geminiChatWithTools(cfg, model, messages, null, onChunk, (err) => cb(err))
+  };
+}
+
 // Confirmaciones pendientes de comandos peligrosos: id -> resolve(boolean)
 const pendingConfirms = {};
 // Detecta si una acción es destructiva y merece confirmación del usuario.
@@ -1258,9 +1500,14 @@ function buildAgentMessages(convId, history, preamble) {
 // final y cerraba el trabajo ahi: de ahi los "jobs muy cortos que no ejecutan nada".
 const ANNOUNCE_RE = /(voy a |vamos a |procedo a |procedere|ahora (voy|procedo|revis|le|cre|ejecut|busc)|dejame |permiteme |empezare|empiezo por|comenzare|primero (voy|le|revis)|a continuacion (voy|le)|revisare|leere|creare|escribire|ejecutare|buscare|manos a la obra|I'll |let me |I will |I'm going to |next,? I)/i;
 
-function runAzureAgent(message, history, historySummary, send, onDone, onAbort, images, convId) {
-  const cfg = loadAzure();
-  if (!cfg) { send('error', 'Azure no configurado'); return onDone(1); }
+function runAzureAgent(message, history, historySummary, send, onDone, onAbort, images, convId, brain) {
+  // `brain` = cerebro del modelo (Azure o Vertex). Si no se pasa, se usa Azure:
+  // la ruta historica queda intacta.
+  if (!brain) {
+    const cfg = loadAzure();
+    if (!cfg) { send('error', 'Azure no configurado'); return onDone(1); }
+    brain = azureBrain(cfg);
+  }
   let aborted = false;
   if (onAbort) onAbort(() => { aborted = true; });
   const preamble = [
@@ -1369,7 +1616,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
       send('status', 'Cerrando y resumiendo…');
       messages.push({ role: 'user', content: 'Has alcanzado el límite de pasos. Detente ahora: NO uses más herramientas. Resume en español lo que lograste, lo que quedó pendiente y cómo continuar.' });
       send('chunk', '\n\n⏸️ ');
-      return azureChatStream(cfg, messages,
+      return brain.chatPlain(messages,
         (delta) => send('chunk', delta),
         (err) => {
           send('status', '');
@@ -1382,10 +1629,10 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     }
     // Indicador vivo mientras Azure "piensa" (evita sensación de colgado).
     send('status', 'Pensando… (paso ' + steps + '/' + MAX_STEPS + ')');
-    azureChatStreamTools(cfg, messages, AGENT_TOOLS, (delta) => send('chunk', delta), (err, msg) => {
+    brain.chatTools(messages, AGENT_TOOLS, (delta) => send('chunk', delta), (err, msg) => {
       if (aborted) { send('status', ''); saveTranscript(); return onDone(1); }
-      if (err) { send('status', ''); send('error', 'Azure: ' + err.message); return onDone(1); }
-      if (!msg) { send('status', ''); send('error', 'Respuesta vacía de Azure'); return onDone(1); }
+      if (err) { send('status', ''); send('error', brain.label + ': ' + err.message); return onDone(1); }
+      if (!msg) { send('status', ''); send('error', 'Respuesta vacía de ' + brain.label); return onDone(1); }
       messages.push(msg);
       if (msg.tool_calls && msg.tool_calls.length) {
         let pending = msg.tool_calls.length;
@@ -1419,6 +1666,16 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     });
   }
   loop();
+}
+
+// Bucle de agente (con herramientas) usando Gemini como cerebro. Reutiliza
+// runAzureAgent entero, asi que hereda gating, post-check, rollback y transcript.
+function runVertexAgent(message, history, historySummary, pick, send, onDone, onAbort, images, convId) {
+  const cfg = loadVertex();
+  if (!cfg) { send('error', 'Vertex no configurado'); return onDone(1); }
+  send('route', { model: 'vertex:' + pick.model, reason: pick.reason + '+tools' });
+  return runAzureAgent(message, history, historySummary, send, onDone, onAbort, images, convId,
+    vertexBrain(cfg, pick.model));
 }
 
 // ===== Auto-arranque con Windows (registry Run key) =====
@@ -1495,6 +1752,9 @@ function defaultFeatures() {
     proResponseMode: false,
     agentBridgeMode: true,
     routeExecutionToAzureAgent: true,
+    // Gemini ejecuta herramientas por si mismo: las tareas de ejecucion en modo
+    // vertex ya no se desvian al agente de Azure.
+    vertexAgentTools: true,
     preferClaudeForStrategy: true,
     preferXCoreForAudio: true,
     autoRouteForLocalAgent: true,
@@ -1895,6 +2155,8 @@ function chooseModelForRequest(requestedModel, message, hasAttachments, fromLoca
     const wantsExecution = looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments;
     const explicitVertex = explicit === 'vertex-auto' || explicit === 'vertex-gemini-pro' || explicit === 'vertex-gemini-flash' || explicit === 'vertex-claude-opus-5';
     if (explicitVertex && wantsExecution) {
+      // Con herramientas conectadas, Vertex se basta: no lo desviamos.
+      if (feats.vertexAgentTools && loadVertex()) return { model: base, reason: 'explicit-vertex-agent-tools' };
       if (feats.routeExecutionToAzureAgent && loadAzure()) return { model: 'azure-agent', reason: 'explicit-vertex-execution-reroute' };
       return { model: 'auto', reason: 'explicit-vertex-execution-fallback-auto' };
     }
@@ -2776,6 +3038,32 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
   // RUTA VERTEX (Google): auto + selección manual de modelo.
   if (isVertexModel(effModel)) {
     let aborted = false;
+    // Si la tarea pide ejecutar (crear/correr codigo, tocar archivos, web), se
+    // usa el bucle de agente con herramientas en vez del chat a secas.
+    const vxCfg = loadVertex();
+    const vxPick = vxCfg ? pickVertexTarget(effModel, message, !!(visionImages && visionImages.length)) : null;
+    const vxUsaAgente = !!(vxCfg && vxPick && vxPick.model && vxPick.publisher !== 'anthropic' &&
+      currentFeatures().vertexAgentTools &&
+      (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message)));
+    if (vxUsaAgente) {
+      let vxDone = false;
+      runVertexAgent(
+        message,
+        Array.isArray(convHistory) ? convHistory : [],
+        convHistorySummary || '',
+        vxPick,
+        send,
+        (code) => {
+          if (vxDone || aborted) return; vxDone = true;
+          send('done', { code });
+          try { res.end(); } catch (e) {}
+        },
+        (killer) => { req.on('close', () => { aborted = true; killer(); }); },
+        visionImages || [],
+        statelessMode ? '' : convId
+      );
+      return;
+    }
     runVertex(
       message,
       Array.isArray(convHistory) ? convHistory : [],
@@ -2796,6 +3084,9 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
           return;
         }
         send('status', (reason ? (reason + ' ') : '') + 'Usando respaldo…');
+        // Que se vea POR QUE cambio el modelo, en vez de solo mutar la insignia.
+        send('chunk', '\n⚠️ Vertex no pudo responder' + (reason ? (': ' + reason) : '') +
+          '\nRespondo con claude-sonnet-5 como respaldo.\n\n');
         send('route', { model: 'claude-sonnet-5', reason: 'vertex-fallback' });
         return attempt(!state.autoOnly, { sessionId: effSession, model: 'claude-sonnet-5' }, false);
       },
@@ -3547,8 +3838,8 @@ const server = http.createServer(async (req, res) => {
     }
     const next = Object.assign({}, cur, {
       region,
-      modelPro: cur.modelPro || 'gemini-2.5-pro',
-      modelFlash: cur.modelFlash || 'gemini-2.5-flash'
+      modelPro: cur.modelPro || 'gemini-3.7-flash',
+      modelFlash: cur.modelFlash || 'gemini-3.5-flash'
     });
     if (apiKey) next.apiKey = apiKey; else delete next.apiKey;
     if (projectId) next.projectId = projectId;
