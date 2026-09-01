@@ -844,12 +844,126 @@ const AGENT_TOOLS = [
   { type: 'function', function: { name: 'open_browser', description: 'Abre una URL en el navegador predeterminado del sistema', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL a abrir (debe empezar con http:// o https://)' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'git_commit', description: 'Hace git add -A y git commit con el mensaje dado en la carpeta de trabajo', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Mensaje del commit' } }, required: ['message'] } } },
   { type: 'function', function: { name: 'npm_run', description: 'Ejecuta un script de npm (package.json) en la carpeta de trabajo. Útil para build, test, lint, start, etc.', parameters: { type: 'object', properties: { script: { type: 'string', description: 'Nombre del script (ej: build, test, lint)' }, args: { type: 'string', description: 'Argumentos opcionales adicionales' } }, required: ['script'] } } },
-  { type: 'function', function: { name: 'notify', description: 'Muestra una notificación toast en Windows con un título y mensaje', parameters: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } } }
+  { type: 'function', function: { name: 'notify', description: 'Muestra una notificación toast en Windows con un título y mensaje', parameters: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } } },
+  { type: 'function', function: { name: 'open_repo', description: 'Abre un repositorio de GitHub para trabajar en él: lo clona automáticamente si no está en disco (o hace git pull si ya estaba) y cambia la carpeta de trabajo a ese repo. Úsala SIEMPRE que el usuario diga "abre el repo X", "trabaja en X", "clona X" o mencione un repositorio de GitHub que aún no es la carpeta actual.', parameters: { type: 'object', properties: { repo: { type: 'string', description: 'owner/repo, URL de GitHub, o solo el nombre del repo si es de la cuenta del usuario' } }, required: ['repo'] } } }
 ];
 
 function resolveInCwd(p) {
   if (!p) return state.cwd;
   return path.isAbsolute(p) ? p : path.join(state.cwd, p);
+}
+
+// ===== Abrir repos de GitHub con clonado automatico =====
+// El panel de repos solo ponia una etiqueta "GitHub · owner/repo": no habia copia
+// local, asi que el agente no podia leer ni editar nada. Aqui se clona (o actualiza)
+// el repo en disco y se mueve la carpeta de trabajo hacia el.
+const REPOS_BASE = path.join(os.homedir(), 'Documents', 'HanstlerS');
+
+function parseRepoSpec(spec) {
+  const s = String(spec || '').trim().replace(/^[<"']+|[>"'.,;]+$/g, '');
+  if (!s) return null;
+  let m = /^(?:https?:\/\/)?(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[\/?#].*)?$/i.exec(s);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = /^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/i.exec(s);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(s);
+  if (m) return { owner: m[1], repo: m[2] };
+  m = /^([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(s);
+  if (m) return { owner: '', repo: m[1] };
+  return null;
+}
+
+// Candidatos donde ya podria existir una copia local, para no reclonar de mas.
+function existingRepoDirs(repoName) {
+  const home = os.homedir();
+  return [
+    path.join(REPOS_BASE, repoName),
+    path.join(home, 'Documents', repoName),
+    path.join(home, repoName)
+  ];
+}
+
+function isGitRepoDir(dir) {
+  try { return fs.statSync(path.join(dir, '.git')).isDirectory() || fs.statSync(path.join(dir, '.git')).isFile(); }
+  catch (e) { return false; }
+}
+
+function runQuiet(bin, args, cwd, cb) {
+  // Sin prompts interactivos: un git clone que pide credenciales colgaria el
+  // agente con un dialogo invisible (windowsHide) hasta el timeout.
+  const env = Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' });
+  execFile(bin, args, { cwd: cwd || undefined, env: env, windowsHide: true, timeout: 180000, maxBuffer: 8 * 1024 * 1024 },
+    (err, stdout, stderr) => cb(err || null, String(stdout || '') + String(stderr || '')));
+}
+
+// Resuelve owner/repo cuando el usuario solo dijo el nombre ("abre hansters").
+function resolveRepoOwner(name, cb) {
+  ghJson(['repo', 'view', name, '--json', 'nameWithOwner'], (err, obj) => {
+    if (!err && obj && obj.nameWithOwner) {
+      const p = parseRepoSpec(obj.nameWithOwner);
+      if (p && p.owner) return cb(null, p);
+    }
+    ghJson(['repo', 'list', '@me', '--limit', '100', '--json', 'nameWithOwner'], (err2, items) => {
+      if (err2 || !Array.isArray(items)) return cb(new Error('No pude resolver el dueño del repo "' + name + '". Usa owner/repo.'));
+      const hit = items.find((r) => {
+        const p = parseRepoSpec(String(r && r.nameWithOwner || ''));
+        return p && p.repo.toLowerCase() === String(name).toLowerCase();
+      });
+      const p = hit ? parseRepoSpec(String(hit.nameWithOwner)) : null;
+      if (!p || !p.owner) return cb(new Error('No encontré el repo "' + name + '" en tu cuenta de GitHub. Usa owner/repo.'));
+      cb(null, p);
+    });
+  });
+}
+
+// Clona si falta, actualiza si ya existe, y deja el repo como carpeta de trabajo.
+function openRepoWorkspace(spec, cb) {
+  const parsed = parseRepoSpec(spec);
+  if (!parsed || !parsed.repo) return cb(new Error('Repo inválido: "' + spec + '". Usa owner/repo o la URL de GitHub.'));
+
+  const proceed = (info) => {
+    const ref = (info.owner ? info.owner + '/' : '') + info.repo;
+    const existing = existingRepoDirs(info.repo).find((d) => isGitRepoDir(d));
+    if (existing) {
+      return runQuiet('git', ['-C', existing, 'pull', '--ff-only'], null, (_e, out) => {
+        finish(existing, ref, 'actualizado', out);
+      });
+    }
+    if (!info.owner) return cb(new Error('Falta el dueño del repo "' + info.repo + '". Usa owner/repo.'));
+    const target = path.join(REPOS_BASE, info.repo);
+    try { fs.mkdirSync(REPOS_BASE, { recursive: true }); } catch (e) {}
+    const url = 'https://github.com/' + ref + '.git';
+    runQuiet('git', ['clone', url, target], null, (err, out) => {
+      if (!err) return finish(target, ref, 'clonado', out);
+      // Repo privado o sin credenciales en git: reintento con la GitHub CLI.
+      runQuiet(resolveGhBinary(), ['repo', 'clone', ref, target], null, (err2, out2) => {
+        if (err2) return cb(new Error('No pude clonar ' + ref + ': ' + String(out || out2 || err2.message).trim().slice(0, 400)));
+        finish(target, ref, 'clonado', out2);
+      });
+    });
+  };
+
+  const finish = (dir, ref, action, out) => {
+    if (!isGitRepoDir(dir)) return cb(new Error('El clonado de ' + ref + ' no dejó un repo válido en ' + dir));
+    state.cwd = dir;
+    state.started = false;
+    state.projectCtx = null;
+    cb(null, { path: dir, repoRef: ref, action: action, output: String(out || '').slice(0, 2000) });
+  };
+
+  if (parsed.owner) return proceed(parsed);
+  // Sin owner: si ya hay copia local, se usa sin tocar la red.
+  const local = existingRepoDirs(parsed.repo).find((d) => isGitRepoDir(d));
+  if (local) {
+    return runQuiet('git', ['-C', local, 'remote', 'get-url', 'origin'], null, (_e, out) => {
+      const p = parseRepoSpec(String(out || '').trim().split(/\r?\n/)[0] || '');
+      proceed(p && p.owner ? p : { owner: '', repo: parsed.repo, _localOnly: true });
+    });
+  }
+  resolveRepoOwner(parsed.repo, (err, p) => {
+    if (err) return cb(err);
+    proceed(p);
+  });
 }
 function isMutatingTool(name) {
   return name === 'write_file' || name === 'apply_patch' || name === 'delete_file' || name === 'move_file';
@@ -864,6 +978,7 @@ function isExplicitMainEditRequest(text) {
 function operatorTargetLabel(name, args) {
   if (name === 'move_file') return String(args.from || '') + ' → ' + String(args.to || '');
   if (name === 'run_command') return String(args.command || '').slice(0, 120);
+  if (name === 'open_repo') return String(args.repo || '').slice(0, 120);
   return String(args.path || args.url || '').slice(0, 120);
 }
 function buildOperatorSuggestion(name, args) {
@@ -1080,6 +1195,13 @@ function execAgentTool(name, args, cb) {
       child.on('close', () => cb('Notificación enviada: ' + title, 'notificado'));
       child.on('error', e => cb('Error: ' + e.message, 'error'));
       return;
+    }
+    if (name === 'open_repo') {
+      return openRepoWorkspace(args.repo, (err, info) => {
+        if (err) return cb('Error: ' + err.message, 'error');
+        cb('Repo ' + info.action + ': ' + info.repoRef + '\nCarpeta de trabajo ahora: ' + info.path +
+          '\nYa puedes leer/editar sus archivos con rutas relativas.', info.action + ' ' + info.repoRef);
+      });
     }
     cb('Herramienta desconocida: ' + name);
   } catch (e) { cb('Error: ' + e.message); }
@@ -1512,7 +1634,8 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
   if (onAbort) onAbort(() => { aborted = true; });
   const preamble = [
     { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. Estás en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nUsa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tú mismo (no solo expliques). SÉ DECIDIDO Y AUTÓNOMO: si la intención está clara, ACTÚA de inmediato sin pedir permiso ni confirmación. NO preguntes "¿quieres que...?", "¿procedo?", "¿te gustaría?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acción es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leíste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parámetros. Responde en español, conciso. Cuando termines, resume lo que hiciste.' },
-    { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la página tú con la herramienta de navegador y ejecuta el flujo tú mismo. No le pidas al usuario que navegue manualmente.' }
+    { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la página tú con la herramienta de navegador y ejecuta el flujo tú mismo. No le pidas al usuario que navegue manualmente.' },
+    { role: 'system', content: 'REPOS: si el usuario menciona un repositorio de GitHub (por nombre, owner/repo o URL) y no es ya la carpeta de trabajo, llama PRIMERO a open_repo. Esa herramienta clona el repo automáticamente si no está en disco, hace git pull si ya estaba, y deja la carpeta de trabajo dentro del repo; después trabaja con rutas relativas. Nunca le pidas al usuario que clone a mano ni que te dé la ruta local: dedúcela con open_repo. Interpreta la intención en lenguaje natural ("abre X", "trabaja en X", "revisa X", "arregla Y en X") y ejecuta la tarea completa sobre ese repo.' }
   ];
   if (historySummary) preamble.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
   const preambleLen = preamble.length;
@@ -1537,7 +1660,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     saveAgentTranscript(convId, body);
   };
   const OP_DELAY_MS = 4000;
-  const iconOf = (n) => ({ list_dir: '📂', read_file: '📄', write_file: '✍️', apply_patch: '🩹', search_in_files: '🔎', delete_file: '🗑️', move_file: '📦', run_command: '⚙️' }[n] || '🔧');
+  const iconOf = (n) => ({ list_dir: '📂', read_file: '📄', write_file: '✍️', apply_patch: '🩹', search_in_files: '🔎', delete_file: '🗑️', move_file: '📦', run_command: '⚙️', open_repo: '📥' }[n] || '🔧');
   // Ejecuta una herramienta, pidiendo confirmación si es peligrosa.
   function runToolGated(tc, args, whenDone) {
     const toolName = tc.function.name;
@@ -1554,6 +1677,8 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
         to: toolName === 'move_file' ? snapshotPathForRollback(resolveInCwd(args.to)) : null
       } : null;
       execAgentTool(toolName, args, (result, summary) => {
+        // El agente puede mover la carpeta de trabajo (open_repo): avisar a la UI.
+        if (toolName === 'open_repo' && !/^Error:/.test(String(result || ''))) send('cwd', { cwd: state.cwd });
         const chk = verifyPostCheck(toolName, args, result, summary);
         if (!mut) {
           if (chk.ok) return whenDone(result, ((summary || '') + ' · post-check ok').trim());
@@ -3038,13 +3163,13 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
   // RUTA VERTEX (Google): auto + selección manual de modelo.
   if (isVertexModel(effModel)) {
     let aborted = false;
-    // Si la tarea pide ejecutar (crear/correr codigo, tocar archivos, web), se
-    // usa el bucle de agente con herramientas en vez del chat a secas.
+    // Vertex se comporta IGUAL que el agente de Azure: siempre con herramientas.
+    // Antes un heuristico de texto decidia si usar el bucle de agente, asi que
+    // pedidos como "abre el repo X" caian en chat plano y solo describian el plan.
     const vxCfg = loadVertex();
     const vxPick = vxCfg ? pickVertexTarget(effModel, message, !!(visionImages && visionImages.length)) : null;
     const vxUsaAgente = !!(vxCfg && vxPick && vxPick.model && vxPick.publisher !== 'anthropic' &&
-      currentFeatures().vertexAgentTools &&
-      (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message)));
+      currentFeatures().vertexAgentTools);
     if (vxUsaAgente) {
       let vxDone = false;
       runVertexAgent(
@@ -3573,6 +3698,19 @@ const server = http.createServer(async (req, res) => {
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ items: items || [], cwd: state.cwd, source: 'github' }));
+    });
+  }
+  if (req.method === 'POST' && req.url === '/api/repos/open') {
+    const b = await readBody(req);
+    const spec = String((b && (b.repo || b.repoRef)) || '').trim();
+    if (!spec) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'falta el repo' }));
+    }
+    return openRepoWorkspace(spec, (err, info) => {
+      res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
+      if (err) return res.end(JSON.stringify({ ok: false, error: err.message, cwd: state.cwd }));
+      return res.end(JSON.stringify({ ok: true, cwd: info.path, repoRef: info.repoRef, action: info.action }));
     });
   }
   if (req.method === 'POST' && req.url === '/api/cwd') {

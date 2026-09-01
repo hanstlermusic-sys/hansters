@@ -46,3 +46,32 @@ por conversacion.
 - Cuando Vertex falla y se usa el respaldo, ahora se explica **por que** en el
   chat, en vez de solo cambiar la insignia del modelo.
 
+
+### Vertex se comporta igual que el agente de Azure
+
+Antes un heuristico de texto decidia si Vertex usaba herramientas o solo
+conversaba, asi que peticiones como "abre el repo X" caian en chat plano y el
+modelo se limitaba a describir el plan. Ahora **toda** peticion a un modelo
+Gemini de Vertex entra al bucle de agente (mismas herramientas, mismo gating,
+mismo post-check y rollback). `vertex-claude-opus-5` sigue en chat plano.
+
+## Abrir un repo con clonado automatico
+
+El panel de repos ya no solo pone una etiqueta `GitHub - owner/repo`: al elegir
+un repo se **clona en disco** (o se hace `git pull` si ya estaba) y la carpeta de
+trabajo pasa a apuntar ahi, que es lo que el agente necesita para leer y editar.
+
+Tambien puedes pedirlo hablando, sin tocar la UI:
+
+- "abre el repo hanstlermusic-sys/hansters"
+- "trabaja en hansters y arregla el boton de voz"
+- "clona https://github.com/owner/repo y corre los tests"
+
+El agente llama a la herramienta `open_repo`, que acepta `owner/repo`, la URL de
+GitHub, la URL ssh, o solo el nombre (lo resuelve con la GitHub CLI contra tu
+cuenta). Los clones nuevos van a `~\Documents\HanstlerS\<repo>`; si ya existe una
+copia en `~\Documents\HanstlerS`, `~\Documents` o `~`, se reutiliza en vez de
+clonar de nuevo. Los comandos corren sin prompts interactivos
+(`GIT_TERMINAL_PROMPT=0`), asi que un repo sin acceso falla con un mensaje claro
+en lugar de colgarse esperando credenciales. Para repos privados se reintenta con
+`gh repo clone`, que usa tu sesion de la GitHub CLI.

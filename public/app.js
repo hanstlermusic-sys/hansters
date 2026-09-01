@@ -485,12 +485,29 @@ async function selectRepoItem(it, emitNote){
   const repoRef = String(it.repoRef || '').trim();
   const repoPath = String(it.path || '').trim();
   if(repoRef){
+    // Clonado automatico: sin copia local el agente no puede leer ni editar nada.
     activeRepoRef = repoRef;
     activeRepoPath = '';
-    setCwd('GitHub · ' + repoRef);
-    if(emitNote){
+    setCwd('Clonando ' + repoRef + '…');
+    let j = null;
+    try{
+      const r = await fetch('/api/repos/open', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ repo: repoRef }) });
+      j = await r.json();
+    }catch(e){ j = { ok:false, error:'No se pudo contactar al servidor.' }; }
+    if(j && j.ok){
+      activeRepoPath = j.cwd;
+      it.path = j.cwd;
+      setCwd(j.cwd);
+      if(emitNote){
+        const c = getConv(activeId);
+        c.messages.push({ role:'bot', html:'Repo <code>' + esc(repoRef) + '</code> ' + esc(j.action || 'listo') + ' en <code>' + esc(j.cwd) + '</code>.' });
+        renderActive();
+        persistConv(activeId);
+      }
+    } else {
+      setCwd('GitHub · ' + repoRef);
       const c = getConv(activeId);
-      c.messages.push({ role:'bot', html:'Repo GitHub activo: <code>' + esc(repoRef) + '</code>.' });
+      c.messages.push({ role:'bot', html:'No pude clonar <code>' + esc(repoRef) + '</code>: ' + esc(String((j && j.error) || 'error desconocido')) });
       renderActive();
       persistConv(activeId);
     }
@@ -543,14 +560,15 @@ async function loadRepoList(){
   }
   if(!activeRepoRef && !activeRepoPath){
     const first = items[0];
-    if(first && first.repoRef){ activeRepoRef = String(first.repoRef); setCwd('GitHub · ' + activeRepoRef); }
+    // Marca el primero como sugerido, pero sin falsear la carpeta de trabajo real:
+    // hasta que se clona no hay repo local al que apuntar.
+    if(first && first.repoRef) activeRepoRef = String(first.repoRef);
     else if(first && first.path) activeRepoPath = String(first.path);
   }
   items.forEach((it)=>{
     const el = document.createElement('div');
-    const isActive = it.repoRef
-      ? (String(it.repoRef).toLowerCase() === String(activeRepoRef || '').toLowerCase())
-      : (pathKey(it.path) === pathKey(activeRepoPath || cwdEl.textContent || ''));
+    const isActive = (it.path && pathKey(it.path) === pathKey(activeRepoPath || cwdEl.textContent || ''))
+      || (it.repoRef && String(it.repoRef).toLowerCase() === String(activeRepoRef || '').toLowerCase());
     el.className = 'conv-item repo-item' + (isActive ? ' active' : '');
     const sub = String(it.repoRef || it.path || '');
     const desc = String(it.subtitle || (it.private ? 'Privado' : ''));
@@ -853,6 +871,7 @@ async function runOne(id, msg, images, files){
         }
         else if(type==='session'){ if(!stateless && data && data.id){ c.session = data.id; } }
         else if(type==='memory'){ if(data && data.text) showMemoryChip(data.text); }
+        else if(type==='cwd'){ if(data && data.cwd){ activeRepoPath = data.cwd; activeRepoRef = ''; setCwd(data.cwd); loadRepoList(); } }
         else if(type==='route'){
           if(data && data.model){
             statusLine = 'Modelo enrutado: ' + data.model;

@@ -7,7 +7,7 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win nsis",
-    "test": "node tests/context.test.js && node tests/vertex-tools.test.js",
+    "test": "node tests/context.test.js && node tests/vertex-tools.test.js && node tests/repo-open.test.js",
     "test:e2e": "node tests/e2e-context.js"
   },
   "build": {
