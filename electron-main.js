@@ -12,6 +12,7 @@ if (!gotLock) {
 // Arranca el servidor interno de HanstlerS (el mismo server.js) dentro de Electron.
 process.env.HANSTLERS_PORT = process.env.HANSTLERS_PORT || '8717';
 process.env.HANSTLERS_ELECTRON = '1';
+process.env.HANSTLERS_EXE = process.execPath;
 require(path.join(__dirname, 'server.js'));
 
 let mainWindow = null;

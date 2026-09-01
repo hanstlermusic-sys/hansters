@@ -31,7 +31,99 @@ function loadSpeech() {
   return null;
 }
 
-// Transcribe audio (WAV/OGG) con Azure Speech REST y devuelve el texto.
+// ===== WHISPER LOCAL (offline, sin nube): whisper.cpp =====
+// Binario empaquetado junto a la app; modelo en ~/.hanstlers/whisper (se descarga la 1ª vez).
+const WHISPER_DIR = path.join(os.homedir(), '.hanstlers', 'whisper');
+const WHISPER_MODEL_NAME = 'ggml-base.bin';
+const WHISPER_MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin';
+function whisperCliPath() {
+  // Buscar whisper-cli.exe empaquetado en varias ubicaciones posibles.
+  const cands = [
+    process.env.HANSTLERS_WHISPER_CLI,
+    path.join(__dirname, 'whisper', 'whisper-cli.exe'),
+    path.join(__dirname, 'vendor', 'whisper', 'dist', 'whisper-cli.exe'),
+    path.join(process.resourcesPath || '', 'whisper', 'whisper-cli.exe')
+  ].filter(Boolean);
+  for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch (e) {} }
+  return null;
+}
+function whisperModelPath() {
+  const cands = [
+    path.join(WHISPER_DIR, WHISPER_MODEL_NAME),
+    path.join(__dirname, 'whisper', 'models', WHISPER_MODEL_NAME),
+    path.join(__dirname, 'vendor', 'whisper', 'models', WHISPER_MODEL_NAME)
+  ];
+  for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch (e) {} }
+  return null;
+}
+function whisperAvailable() { return !!whisperCliPath(); }
+
+// Limpia el texto de whisper: quita tokens de ruido y alucinaciones típicas en silencio.
+function cleanTranscript(t) {
+  if (!t) return '';
+  let s = String(t).replace(/\r/g, '').split('\n').map(x => x.trim()).filter(Boolean).join(' ').trim();
+  s = s.replace(/\[[^\]]*\]/g, ' ').replace(/\*[^*]*\*/g, ' ');
+  s = s.replace(/\((?:m[uú]sica|risas|aplausos|silencio|ruido|sonido[^)]*)\)/gi, ' ');
+  const junk = [
+    /subt[ií]tulos?[^.]*amara\.org/gi,
+    /subt[ií]tulos?\s+realizados?\s+por[^.]*/gi,
+    /gracias por ver[^.]*/gi,
+    /www\.[^\s]+/gi
+  ];
+  for (const j of junk) s = s.replace(j, ' ');
+  return s.replace(/\s{2,}/g, ' ').trim();
+}
+
+let whisperDownloading = false;
+function ensureWhisperModel(cb) {
+  const existing = whisperModelPath();
+  if (existing) return cb(null, existing);
+  if (whisperDownloading) return cb(new Error('El modelo de voz se está descargando, intenta en unos segundos.'));
+  whisperDownloading = true;
+  try { fs.mkdirSync(WHISPER_DIR, { recursive: true }); } catch (e) {}
+  const dest = path.join(WHISPER_DIR, WHISPER_MODEL_NAME);
+  const tmp = dest + '.part';
+  const file = fs.createWriteStream(tmp);
+  const get = (url) => {
+    https.get(url, (resp) => {
+      if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) { resp.resume(); return get(resp.headers.location); }
+      if (resp.statusCode !== 200) { whisperDownloading = false; file.close(); try { fs.unlinkSync(tmp); } catch (e) {} return cb(new Error('Descarga del modelo falló: ' + resp.statusCode)); }
+      resp.pipe(file);
+      file.on('finish', () => { file.close(() => { try { fs.renameSync(tmp, dest); } catch (e) {} whisperDownloading = false; cb(null, dest); }); });
+    }).on('error', (e) => { whisperDownloading = false; try { fs.unlinkSync(tmp); } catch (_) {} cb(e); });
+  };
+  get(WHISPER_MODEL_URL);
+}
+
+// Transcribe un WAV (16kHz mono PCM) con whisper.cpp local y devuelve el texto.
+function transcribeLocal(wavBuffer, cb) {
+  const cli = whisperCliPath();
+  if (!cli) return cb(new Error('Whisper local no disponible'));
+  ensureWhisperModel((err, model) => {
+    if (err) return cb(err);
+    let tmp;
+    try {
+      tmp = path.join(os.tmpdir(), 'hs_whisper_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.wav');
+      fs.writeFileSync(tmp, wavBuffer);
+    } catch (e) { return cb(e); }
+    const args = ['-m', model, '-f', tmp, '-l', 'es', '-nt', '-np', '-t', String(Math.max(2, Math.min(8, (os.cpus() || []).length || 4)))];
+    const child = spawn(cli, args, { cwd: path.dirname(cli) });
+    let out = '', errOut = '';
+    let finished = false;
+    const done = (e, txt) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (_) {} try { fs.unlinkSync(tmp); } catch (_) {} cb(e, txt); };
+    const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done(new Error('Transcripción local excedió el tiempo')); }, 120000);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (errOut += d));
+    child.on('close', () => {
+      const text = cleanTranscript(out);
+      if (!text && errOut && !out.trim()) return done(new Error('Whisper: ' + errOut.slice(-150)));
+      done(null, text);
+    });
+    child.on('error', (e) => done(e));
+  });
+}
+
+
 function transcribeSpeech(audioBuffer, contentType, cb) {
   const cfg = loadSpeech();
   if (!cfg) return cb(new Error('Azure Speech no configurado'));
@@ -59,8 +151,34 @@ function transcribeSpeech(audioBuffer, contentType, cb) {
   req.end();
 }
 
-// Llama a Azure OpenAI con streaming y envía chunks por SSE (send).
-function runAzure(message, history, send, onDone, onAbort) {
+// Genera audio (TTS) con Azure Speech y devuelve el buffer MP3.
+function synthSpeech(text, cb) {
+  const cfg = loadSpeech();
+  if (!cfg) return cb(new Error('Azure Speech no configurado'));
+  const host = cfg.region + '.tts.speech.microsoft.com';
+  const voice = cfg.voice || 'es-ES-ElviraNeural';
+  const safe = String(text).slice(0, 3000).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const ssml = `<speak version='1.0' xml:lang='es-ES'><voice xml:lang='es-ES' name='${voice}'>${safe}</voice></speak>`;
+  const req = https.request({
+    hostname: host, path: '/cognitiveservices/v1', method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': cfg.key,
+      'Content-Type': 'application/ssml+xml',
+      'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
+      'User-Agent': 'HanstlerS'
+    }
+  }, (resp) => {
+    if (resp.statusCode >= 400) { let e = ''; resp.on('data', d => e += d); resp.on('end', () => cb(new Error('TTS ' + resp.statusCode))); return; }
+    const chunks = [];
+    resp.on('data', (d) => chunks.push(d));
+    resp.on('end', () => cb(null, Buffer.concat(chunks)));
+  });
+  req.on('error', (e) => cb(e));
+  req.write(ssml);
+  req.end();
+}
+
+function runAzure(message, history, send, onDone, onAbort, images) {
   const cfg = loadAzure();
   if (!cfg) { send('error', 'Azure no está configurado.'); return onDone(1); }
   const ep = cfg.endpoint.replace(/\/$/, '');
@@ -68,7 +186,14 @@ function runAzure(message, history, send, onDone, onAbort) {
   const messages = [];
   messages.push({ role: 'system', content: 'Eres HanstlerS, asistente personal de Cesar. Responde en español, conciso y directo.' });
   (history || []).forEach((m) => messages.push(m));
-  messages.push({ role: 'user', content: message });
+  // Si hay imágenes, el mensaje del usuario va como contenido multimodal (texto + imágenes).
+  if (images && images.length) {
+    const content = [{ type: 'text', text: message || '¿Qué ves en esta imagen?' }];
+    images.forEach((im) => content.push({ type: 'image_url', image_url: { url: im } }));
+    messages.push({ role: 'user', content });
+  } else {
+    messages.push({ role: 'user', content: message });
+  }
   const payload = JSON.stringify({ messages, stream: true });
   const req = https.request({
     hostname: url.hostname, path: url.pathname + url.search, method: 'POST',
@@ -101,8 +226,262 @@ function runAzure(message, history, send, onDone, onAbort) {
   req.end();
 }
 
+// ===== MODO AGENTE sobre Azure: el modelo usa herramientas (archivos/comandos) =====
+const AGENT_TOOLS = [
+  { type: 'function', function: { name: 'list_dir', description: 'Lista archivos y carpetas de un directorio', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Ruta (por defecto la carpeta de trabajo)' } } } } },
+  { type: 'function', function: { name: 'read_file', description: 'Lee el contenido de un archivo de texto', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  { type: 'function', function: { name: 'write_file', description: 'Crea o sobrescribe un archivo con contenido', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
+  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza la primera aparición de un texto por otro (más rápido y barato que reescribir todo). Usa esto para cambios pequeños.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea único)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' } }, required: ['path', 'find', 'replace'] } } },
+  { type: 'function', function: { name: 'search_in_files', description: 'Busca un texto o patrón en todos los archivos del proyecto y devuelve las coincidencias con archivo y número de línea', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Carpeta donde buscar (por defecto la de trabajo)' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'delete_file', description: 'Borra un archivo o carpeta (acción destructiva; se pedirá confirmación al usuario)', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  { type: 'function', function: { name: 'move_file', description: 'Mueve o renombra un archivo o carpeta', parameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] } } },
+  { type: 'function', function: { name: 'run_command', description: 'Ejecuta un comando de PowerShell en la carpeta de trabajo y devuelve la salida', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } }
+];
 
-// Resuelve el script real de Copilot (npm-loader.js) para poder ejecutarlo con
+function resolveInCwd(p) {
+  if (!p) return state.cwd;
+  return path.isAbsolute(p) ? p : path.join(state.cwd, p);
+}
+
+function execAgentTool(name, args, cb) {
+  try {
+    if (name === 'list_dir') {
+      const dir = resolveInCwd(args.path);
+      const items = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 200).map(e => (e.isDirectory() ? '[dir] ' : '') + e.name);
+      return cb(items.join('\n') || '(vacío)', items.length + ' elementos');
+    }
+    if (name === 'read_file') {
+      const f = resolveInCwd(args.path);
+      const data = fs.readFileSync(f, 'utf8');
+      return cb(data.slice(0, 20000), data.split('\n').length + ' líneas');
+    }
+    if (name === 'write_file') {
+      const f = resolveInCwd(args.path);
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, args.content || '');
+      return cb('Archivo escrito: ' + f, Math.max(1, Math.round(Buffer.byteLength(args.content || '') / 1024)) + ' KB');
+    }
+    if (name === 'apply_patch') {
+      const f = resolveInCwd(args.path);
+      if (!fs.existsSync(f)) return cb('Error: el archivo no existe: ' + f, 'no existe');
+      const orig = fs.readFileSync(f, 'utf8');
+      const find = String(args.find || '');
+      if (!find) return cb('Error: "find" vacío', 'error');
+      const idx = orig.indexOf(find);
+      if (idx === -1) return cb('Error: no se encontró el texto a reemplazar. Lee el archivo de nuevo y copia el fragmento exacto.', 'no encontrado');
+      const updated = orig.slice(0, idx) + String(args.replace || '') + orig.slice(idx + find.length);
+      fs.writeFileSync(f, updated);
+      const before = orig.slice(0, idx).split('\n').length;
+      return cb('Parche aplicado en ' + f + ' (línea ~' + before + ')', 'editado línea ~' + before);
+    }
+    if (name === 'search_in_files') {
+      const root = resolveInCwd(args.path);
+      const q = String(args.query || '');
+      if (!q) return cb('Error: consulta vacía', 'error');
+      const skip = new Set(['node_modules', '.git', 'dist', 'build', '.venv', '__pycache__', 'vendor']);
+      const results = [];
+      const ql = q.toLowerCase();
+      const walk = (dir, depth) => {
+        if (depth > 6 || results.length >= 100) return;
+        let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+        for (const e of entries) {
+          if (results.length >= 100) break;
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) { if (!skip.has(e.name)) walk(full, depth + 1); continue; }
+          if (e.size > 2 * 1024 * 1024) continue;
+          let content; try { content = fs.readFileSync(full, 'utf8'); } catch (e2) { continue; }
+          if (content.indexOf('\u0000') !== -1) continue; // binario
+          const lines = content.split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].toLowerCase().indexOf(ql) !== -1) {
+              results.push(path.relative(state.cwd, full) + ':' + (i + 1) + ': ' + lines[i].trim().slice(0, 160));
+              if (results.length >= 100) break;
+            }
+          }
+        }
+      };
+      walk(root, 0);
+      return cb(results.length ? results.join('\n') : '(sin coincidencias)', results.length + ' coincidencias');
+    }
+    if (name === 'delete_file') {
+      const f = resolveInCwd(args.path);
+      if (!fs.existsSync(f)) return cb('Error: no existe: ' + f, 'no existe');
+      fs.rmSync(f, { recursive: true, force: true });
+      return cb('Borrado: ' + f, 'borrado');
+    }
+    if (name === 'move_file') {
+      const from = resolveInCwd(args.from);
+      const to = resolveInCwd(args.to);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.renameSync(from, to);
+      return cb('Movido: ' + from + ' → ' + to, 'movido');
+    }
+    if (name === 'run_command') {
+      // Neutralizar patrones que cuelgan la consola en modo automático (no interactivo).
+      let cmd = String(args.command || '');
+      cmd = cmd.replace(/(^|\s)-NoExit\b/gi, ' ').replace(/(^|\s)\/k\b/gi, ' ');
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { cwd: state.cwd });
+      let out = '';
+      let finished = false;
+      const done = (txt, summary) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (e) {} cb(txt, summary); };
+      const timer = setTimeout(() => { try { child.kill(); } catch (e) {} done('(cancelado: el comando superó 60s. Evita comandos interactivos o que abran ventanas persistentes.)\n' + out.slice(0, 8000), 'cancelado (>60s)'); }, 60000);
+      try { child.stdin.end(); } catch (e) {}
+      child.stdout.on('data', d => (out += d));
+      child.stderr.on('data', d => (out += d));
+      child.on('close', (code) => done('(exit ' + code + ')\n' + out.slice(0, 8000), 'exit ' + code));
+      child.on('error', e => done('Error: ' + e.message, 'error'));
+      return;
+    }
+    cb('Herramienta desconocida: ' + name);
+  } catch (e) { cb('Error: ' + e.message); }
+}
+
+function azureChat(cfg, messages, tools, cb) {
+  const ep = cfg.endpoint.replace(/\/$/, '');
+  const u = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
+  const body = { messages }; if (tools) body.tools = tools;
+  const payload = JSON.stringify(body);
+  const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': cfg.key, 'Content-Length': Buffer.byteLength(payload) } },
+    (resp) => { let d = ''; resp.on('data', c => (d += c)); resp.on('end', () => {
+      let j; try { j = JSON.parse(d); } catch (e) { return cb(new Error('Azure ' + resp.statusCode + ': ' + d.slice(0, 200))); }
+      if (j && j.error) return cb(new Error(j.error.message || JSON.stringify(j.error).slice(0, 200)));
+      cb(null, j);
+    }); });
+  req.on('error', e => cb(e));
+  req.write(payload); req.end();
+}
+
+// Confirmaciones pendientes de comandos peligrosos: id -> resolve(boolean)
+const pendingConfirms = {};
+// Detecta si una acción es destructiva y merece confirmación del usuario.
+function dangerReason(name, args) {
+  if (name === 'delete_file') return 'Borrar ' + (args.path || '');
+  if (name === 'run_command') {
+    const c = String(args.command || '');
+    if (/\bremove-item\b[\s\S]*(-recurse|-force)|\brm\b\s+-[rf]|\brmdir\b|\bdel\b\s|\bformat\b|\bformat-volume\b|\bclear-disk\b/i.test(c)) return 'Comando destructivo: ' + c.slice(0, 120);
+    if (/\bgit\b\s+reset\s+--hard|\bgit\b\s+clean\s+-[a-z]*f|\bgit\b\s+push\s+.*--force/i.test(c)) return 'Git destructivo: ' + c.slice(0, 120);
+    if (/\bshutdown\b|\brestart-computer\b|\bstop-computer\b/i.test(c)) return 'Apagar/reiniciar el equipo';
+  }
+  return null;
+}
+
+function runAzureAgent(message, history, send, onDone, onAbort, images) {
+  const cfg = loadAzure();
+  if (!cfg) { send('error', 'Azure no configurado'); return onDone(1); }
+  let aborted = false;
+  if (onAbort) onAbort(() => { aborted = true; });
+  const messages = [
+    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. Estás en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '. Usa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tú mismo (no solo expliques). SÉ DECIDIDO Y AUTÓNOMO: si la intención está clara, ACTÚA de inmediato sin pedir permiso ni confirmación. NO preguntes "¿quieres que...?", "¿procedo?", "¿te gustaría?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acción es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leíste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parámetros. Responde en español, conciso. Cuando termines, resume lo que hiciste.' }
+  ];
+  (history || []).forEach(m => messages.push(m));
+  if (images && images.length) {
+    const content = [{ type: 'text', text: message }];
+    images.forEach((im) => content.push({ type: 'image_url', image_url: { url: im } }));
+    messages.push({ role: 'user', content });
+  } else {
+    messages.push({ role: 'user', content: message });
+  }
+
+  let steps = 0;
+  const MAX_STEPS = 40;
+  const iconOf = (n) => ({ list_dir: '📂', read_file: '📄', write_file: '✍️', apply_patch: '🩹', search_in_files: '🔎', delete_file: '🗑️', move_file: '📦', run_command: '⚙️' }[n] || '🔧');
+  // Ejecuta una herramienta, pidiendo confirmación si es peligrosa.
+  function runToolGated(tc, args, whenDone) {
+    const reason = dangerReason(tc.function.name, args);
+    if (!reason) {
+      return execAgentTool(tc.function.name, args, (result, summary) => whenDone(result, summary));
+    }
+    // Pedir confirmación al usuario y esperar su decisión.
+    const cid = 'cf_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+    send('status', 'Esperando tu confirmación…');
+    send('confirm', { id: cid, reason: reason, tool: tc.function.name });
+    let settled = false;
+    const timer = setTimeout(() => { if (!settled) { settled = true; delete pendingConfirms[cid]; whenDone('Acción cancelada: el usuario no confirmó a tiempo.', 'sin confirmar'); } }, 120000);
+    pendingConfirms[cid] = (approved) => {
+      if (settled) return; settled = true; clearTimeout(timer); delete pendingConfirms[cid];
+      if (approved) {
+        send('chunk', ' ▶️ aprobado');
+        execAgentTool(tc.function.name, args, (result, summary) => whenDone(result, summary));
+      } else {
+        send('chunk', ' ✋ rechazado por el usuario');
+        whenDone('El usuario RECHAZÓ esta acción. No la ejecutes; busca otra forma o continúa con el resto de la tarea.', 'rechazado');
+      }
+    };
+  }
+  function loop() {
+    if (aborted) return onDone(1);
+    if (steps++ > MAX_STEPS) {
+      send('status', 'Cerrando y resumiendo…');
+      messages.push({ role: 'user', content: 'Has alcanzado el límite de pasos. Detente ahora: NO uses más herramientas. Resume en español lo que lograste, lo que quedó pendiente y cómo continuar.' });
+      return azureChat(cfg, messages, null, (err, resp) => {
+        send('status', '');
+        if (!err) { const m = resp.choices && resp.choices[0] && resp.choices[0].message; if (m && m.content) send('chunk', '\n\n⏸️ ' + m.content); }
+        else send('chunk', '\n\n(límite de pasos alcanzado)');
+        send('canContinue', { reason: 'limite' });
+        onDone(0);
+      });
+    }
+    // Indicador vivo mientras Azure "piensa" (evita sensación de colgado).
+    send('status', 'Pensando… (paso ' + steps + '/' + MAX_STEPS + ')');
+    azureChat(cfg, messages, AGENT_TOOLS, (err, resp) => {
+      if (aborted) { send('status', ''); return onDone(1); }
+      if (err) { send('status', ''); send('error', 'Azure: ' + err.message); return onDone(1); }
+      const msg = resp.choices && resp.choices[0] && resp.choices[0].message;
+      if (!msg) { send('status', ''); send('error', 'Respuesta vacía de Azure'); return onDone(1); }
+      messages.push(msg);
+      // Mostrar el PLAN/razonamiento del modelo si lo escribió antes de actuar.
+      if (msg.content && msg.content.trim()) send('chunk', msg.content.trim() + '\n');
+      if (msg.tool_calls && msg.tool_calls.length) {
+        let pending = msg.tool_calls.length;
+        send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acción…' : ' acciones…'));
+        msg.tool_calls.forEach((tc) => {
+          let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
+          const label = (args.path || args.command || '').toString();
+          const shortLabel = label.length > 60 ? '…' + label.slice(-58) : label;
+          send('chunk', '\n' + iconOf(tc.function.name) + ' ' + tc.function.name + '(' + shortLabel + ') …');
+          runToolGated(tc, args, (result, summary) => {
+            send('chunk', ' ✓' + (summary ? ' ' + summary : ''));
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 12000) });
+            if (--pending === 0) { send('chunk', '\n'); loop(); }
+          });
+        });
+      } else {
+        send('status', '');
+        onDone(0);
+      }
+    });
+  }
+  loop();
+}
+
+// ===== Auto-arranque con Windows (registry Run key) =====
+const AUTOSTART_NAME = 'HanstlerS';
+function autostartExe() {
+  // En Electron empaquetado, HANSTLERS_EXE = ruta de HanstlerS.exe.
+  return process.env.HANSTLERS_EXE || process.execPath;
+}
+function getAutostart(cb) {
+  if (process.platform !== 'win32') return cb(false, false);
+  const child = spawn('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME]);
+  let out = '';
+  child.stdout.on('data', d => (out += d));
+  child.on('close', () => cb(out.indexOf(AUTOSTART_NAME) !== -1, true));
+  child.on('error', () => cb(false, true));
+}
+function setAutostart(enabled, cb) {
+  if (process.platform !== 'win32') return cb(false, false);
+  let child;
+  if (enabled) {
+    child = spawn('reg.exe', ['add', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME, '/t', 'REG_SZ', '/d', '"' + autostartExe() + '"', '/f']);
+  } else {
+    child = spawn('reg.exe', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME, '/f']);
+  }
+  child.on('close', (code) => cb(code === 0, enabled));
+  child.on('error', () => cb(false, enabled));
+}
+
+
 // node directamente y preservar saltos de línea (cmd.exe los rompe).
 let LOADER = undefined; // undefined = sin resolver; null = no encontrado
 function resolveLoader() {
@@ -118,11 +497,36 @@ function resolveLoader() {
   return LOADER;
 }
 
+// Localiza el binario nativo copilot.exe (para ejecutarlo DIRECTO, sin ventana negra).
+let COPILOT_BIN = undefined;
+function resolveCopilotBinary() {
+  if (COPILOT_BIN !== undefined) return COPILOT_BIN;
+  if (process.env.HANSTLERS_CMD) { COPILOT_BIN = null; return COPILOT_BIN; } // modo test
+  const exe = process.platform === 'win32' ? 'copilot.exe' : 'copilot';
+  const pkg = '@github/copilot-' + process.platform + '-' + process.arch;
+  const roots = [];
+  const loader = resolveLoader();
+  if (loader) roots.push(path.dirname(loader));
+  if (process.env.APPDATA) roots.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@github', 'copilot'));
+  for (const r of roots) {
+    const cand = path.join(r, 'node_modules', pkg, exe);
+    try { if (fs.existsSync(cand)) { COPILOT_BIN = cand; return COPILOT_BIN; } } catch (e) {}
+  }
+  COPILOT_BIN = null;
+  return COPILOT_BIN;
+}
+
 let state = {
   cwd: process.env.HANSTLERS_CWD || process.env.USERPROFILE || os.homedir(),
   started: false,
   model: process.env.HANSTLERS_MODEL || 'auto'
 };
+
+// Entorno para ejecutar node dentro de Electron: process.execPath es HanstlerS.exe,
+// y ELECTRON_RUN_AS_NODE=1 lo obliga a comportarse como Node puro.
+function nodeEnv() {
+  return Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' });
+}
 
 // Detecta qué flags soporta la version instalada del CLI (una sola vez).
 let SUPPORTED = null;
@@ -133,12 +537,15 @@ function detectFlags(cb) {
   if (detectPending) { detectPending.push(cb); return; }
   detectPending = [cb];
   const loader = resolveLoader();
-  // Usar node directo sobre el loader (más rápido que cmd.exe); fallback a cmd.exe.
-  const runner = loader
-    ? spawn(process.execPath, [loader, '--help'], { env: process.env })
-    : (process.platform === 'win32'
-        ? spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD, '--help'], { env: process.env })
-        : spawn(COPILOT_CMD, ['--help'], { env: process.env }));
+  const bin = resolveCopilotBinary();
+  // Preferir binario nativo directo (oculto). Respaldo: node+loader; luego cmd.
+  const runner = bin
+    ? spawn(bin, ['--help'], { env: process.env, windowsHide: true })
+    : (loader
+        ? spawn(process.execPath, [loader, '--help'], { env: nodeEnv(), windowsHide: true })
+        : (process.platform === 'win32'
+            ? spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD, '--help'], { env: process.env, windowsHide: true })
+            : spawn(COPILOT_CMD, ['--help'], { env: process.env, windowsHide: true })));
   let out = '';
   const done = () => {
     const has = (f) => out.includes(f);
@@ -197,20 +604,20 @@ function buildArgs(message, opts, withModel) {
   const model = opts.model || state.model;
   if (withModel && s.model && model && model !== 'auto') { a.push('--model', model); }
   // Modo MÍNIMO: sin flags de optimización (para reintentar si algo los rechaza).
+  // El modelo ya se añadió arriba; aquí solo se conserva la sesión.
   if (opts.minimal) {
     if (opts.sessionId) a.push('--resume=' + opts.sessionId);
     return a;
   }
-  if (s.silent) a.push('--silent');
+  // Solo flags COSMÉTICOS/seguros que no afectan la salida del modelo.
+  // (NO usar --silent ni --effort: pueden suprimir o vaciar la respuesta en algunos planes.)
   if (s.noBanner) a.push('--no-banner');
   if (s.noAutoUpdate) a.push('--no-auto-update');
-  if (s.noRemote) a.push('--no-remote');
-  if (s.disableBuiltinMcps) a.push('--disable-builtin-mcps');
   if (s.noAskUser) a.push('--no-ask-user');
-  // AHORRO: menor esfuerzo de razonamiento (menos tokens de "pensamiento").
-  if (s.effort) a.push('--effort=' + (process.env.HANSTLERS_EFFORT || 'low'));
-  // AHORRO/seguridad: tope de créditos por respuesta (evita gastos desbocados).
+  // Tope de créditos por respuesta (solo si el usuario lo pide explícitamente).
   if (s.maxAiCredits && process.env.HANSTLERS_MAX_CREDITS) a.push('--max-ai-credits=' + process.env.HANSTLERS_MAX_CREDITS);
+  // Ahorro de razonamiento SOLO si se activa explícitamente por variable de entorno.
+  if (s.effort && process.env.HANSTLERS_EFFORT) a.push('--effort=' + process.env.HANSTLERS_EFFORT);
   // Mantener el hilo: reanudar por id exacto de sesión de esta conversación.
   if (opts.sessionId) a.push('--resume=' + opts.sessionId);
   return a;
@@ -320,9 +727,12 @@ function loadUsage() {
   let u = {};
   try { u = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch (e) {}
   // Reinicio automático el día 1 de cada mes (UTC).
-  if (u.month !== monthKey()) { u = { month: monthKey(), spent: 0, plan: u.plan || (process.env.HANSTLERS_PLAN || 'pro') }; saveUsage(u); }
+  if (u.month !== monthKey()) { u = { month: monthKey(), spent: 0, plan: u.plan || (process.env.HANSTLERS_PLAN || 'pro+') }; saveUsage(u); }
   if (typeof u.spent !== 'number') u.spent = 0;
-  if (!u.plan) u.plan = process.env.HANSTLERS_PLAN || 'pro';
+  if (!u.plan) u.plan = process.env.HANSTLERS_PLAN || 'pro+';
+  // Migración: el default histórico era 'pro'; ahora la cuenta es Pro+ (7000).
+  // Solo actualiza si el usuario no fijó un plan distinto manualmente.
+  if (u.plan === 'pro' && !u.planLocked) { u.plan = 'pro+'; saveUsage(u); }
   return u;
 }
 function saveUsage(u) {
@@ -337,8 +747,8 @@ function addSpent(credits) {
 }
 function quotaInfo() {
   const u = loadUsage();
-  const plan = (u.plan || 'pro').toLowerCase();
-  const total = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 1500;
+  const plan = (u.plan || 'pro+').toLowerCase();
+  const total = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 7000;
   const remaining = Math.max(0, Math.round((total - u.spent) * 100) / 100);
   return { plan, total, spent: u.spent, remaining, month: u.month };
 }
@@ -374,6 +784,17 @@ function handleChat(req, res, body) {
     const refs = savedPaths.map((p) => '@' + p).join(' ');
     message = message ? (message + '\n\n' + refs) : ('Describe estas imágenes: ' + refs);
   }
+  // Documentos de texto adjuntos: {name, text}. Se inyectan como contexto.
+  const files = Array.isArray(body.files) ? body.files : [];
+  if (files.length) {
+    let block = '\n\n--- DOCUMENTOS ADJUNTOS ---\n';
+    files.forEach((f) => {
+      if (!f || !f.name) return;
+      const txt = String(f.text || '').slice(0, 40000);
+      block += '\n[Archivo: ' + f.name + ']\n' + txt + '\n';
+    });
+    message = (message || 'Analiza los documentos adjuntos.') + block;
+  }
   if (!message) { res.writeHead(400); return res.end('empty'); }
 
   // Auto-capturar memoria: órdenes explícitas + hechos declarativos.
@@ -398,10 +819,13 @@ function handleChat(req, res, body) {
   const mem = (firstTurn || asksMemory) ? memoryContextBlock() : '';
   const finalMessage = mem ? (mem + 'Mensaje del usuario:\n' + message) : message;
 
-  detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote, Array.isArray(body.history) ? body.history : []));
+  // Imágenes para visión (Azure): pasamos las data URLs válidas tal cual.
+  const visionImages = images.filter((im) => /^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(im || '')).slice(0, 6);
+
+  detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote, Array.isArray(body.history) ? body.history : [], visionImages));
 }
 
-function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory) {
+function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory, visionImages) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -424,25 +848,46 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       Array.isArray(convHistory) ? convHistory : [],
       send,
       (code) => { if (!aborted) { send('done', { code }); } res.end(); },
-      (killer) => { req.on('close', () => { aborted = true; killer(); }); }
+      (killer) => { req.on('close', () => { aborted = true; killer(); }); },
+      visionImages || []
     );
     return;
   }
 
-  // Cada conversación mantiene su PROPIA sesión (independiente de las demás).
+  // RUTA AZURE AGENTE: modelo con herramientas (lee/escribe archivos, ejecuta comandos).
+  if (effModel === 'azure-agent') {
+    let agentDone = false;
+    runAzureAgent(
+      message,
+      Array.isArray(convHistory) ? convHistory : [],
+      send,
+      (code) => { if (agentDone) return; agentDone = true; send('done', { code }); try { res.end(); } catch (e) {} },
+      (killer) => { req.on('close', () => killer()); },
+      visionImages || []
+    );
+    return;
+  }
+
+
   state.convSessions = state.convSessions || {};
   let effSession = sessionId || (convId ? state.convSessions[convId] : '') || '';
 
   function launchRaw(withModel, opts) {
     const a = buildArgs(message, opts, withModel);
+    // PREFERIDO: ejecutar el binario nativo copilot.exe DIRECTO y OCULTO (sin ventana negra).
+    const bin = resolveCopilotBinary();
+    if (bin) {
+      return spawn(bin, a, { cwd: state.cwd, env: process.env, windowsHide: true });
+    }
     const loader = resolveLoader();
     if (loader) {
-      return spawn(process.execPath, [loader].concat(a), { cwd: state.cwd, env: process.env });
+      // Respaldo: Electron ejecuta el loader como Node (ELECTRON_RUN_AS_NODE) — oculto.
+      return spawn(process.execPath, [loader].concat(a), { cwd: state.cwd, env: nodeEnv(), windowsHide: true });
     }
     if (process.platform === 'win32') {
-      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: state.cwd, env: process.env });
+      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: state.cwd, env: process.env, windowsHide: true });
     }
-    return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env });
+    return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env, windowsHide: true });
   }
 
   function attempt(withModel, opts, isRetry) {
@@ -478,12 +923,7 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       }
       // Si --resume falló (sesión inexistente), reintenta sin reanudar (conservando el modelo).
       if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
-        return attempt(withModel, { model: opts.model, minimal: opts.minimal }, true);
-      }
-      // Si la respuesta vino VACÍA y usamos flags de optimización, reintentar en
-      // modo MÍNIMO (sin --effort/--silent/etc.) — algunos planes/políticas los rechazan.
-      if (!gotOutput && !opts.minimal && !isRetry) {
-        return attempt(withModel, { model: opts.model, sessionId: opts.sessionId, minimal: true }, true);
+        return attempt(withModel, { model: opts.model }, true);
       }
       filter.flush();
       emitSession(raw);
@@ -549,6 +989,50 @@ function deleteConversation(id) {
   try { fs.unlinkSync(convFile(id)); return true; } catch (e) { return false; }
 }
 
+// ===== AUTODIAGNÓSTICO: prueba cada eslabón en la PC del usuario =====
+function runDiagnostics(cb) {
+  const result = { checks: [], ok: false };
+  const add = (name, ok, detail) => result.checks.push({ name, ok, detail: (detail || '').toString().slice(0, 300) });
+
+  // 1) Runtime (¿estamos en Electron?)
+  const inElectron = !!process.versions.electron;
+  add('Entorno', true, inElectron ? ('Electron ' + process.versions.electron) : ('Node ' + process.version));
+
+  // 2) CLI de Copilot (binario directo o loader)
+  const bin = resolveCopilotBinary();
+  const loader = resolveLoader();
+  add('CLI de Copilot instalado', !!(bin || loader), bin || loader || 'No se encontró Copilot. Instala con: npm install -g @github/copilot');
+  if (!bin && !loader) { return cb(result); }
+
+  // 3) Ejecutar el CLI (oculto) y probar respuesta real
+  const dArgs = ['-p', 'responde solo con la palabra OK', '--allow-all-tools'];
+  const child = bin
+    ? spawn(bin, dArgs, { cwd: state.cwd, env: process.env, windowsHide: true })
+    : spawn(process.execPath, [loader].concat(dArgs), { cwd: state.cwd, env: nodeEnv(), windowsHide: true });
+  let out = '', err = '';
+  let finished = false;
+  const finish = () => {
+    if (finished) return; finished = true; try { clearTimeout(t); } catch (e) {}
+    const raw = (out + '\n' + err);
+    const authFail = /No authentication information found|run the '\/login'|gh auth login/i.test(raw);
+    const policyBlock = /Access denied by policy|disabled by your organization/i.test(raw);
+    const gotText = /\bOK\b/i.test(out) || (out.trim().length > 0 && !authFail && !policyBlock);
+    add('Ejecuta como Node', true, 'El binario ejecutó el CLI correctamente');
+    if (policyBlock) add('Política de organización', false, 'BLOQUEADO por política. Revisa Settings de Copilot / organización.');
+    else add('Política de organización', true, 'Sin bloqueo de política');
+    if (authFail) add('Sesión de Copilot', false, 'NO hay sesión. Abre PowerShell, ejecuta: copilot  y luego /login');
+    else add('Sesión de Copilot', true, 'Sesión activa');
+    add('Respuesta del modelo', gotText, gotText ? ('Respondió: ' + out.trim().slice(0, 80)) : ('Vacío. ' + (raw.trim().slice(0, 200) || 'sin salida')));
+    result.ok = !!loader && !policyBlock && !authFail && gotText;
+    cb(result);
+  };
+  const t = setTimeout(() => { try { child.kill(); } catch (e) {} add('Tiempo', false, 'El CLI tardó demasiado (timeout 45s)'); finish(); }, 45000);
+  child.stdout.on('data', d => (out += stripAnsi(d.toString())));
+  child.stderr.on('data', d => (err += stripAnsi(d.toString())));
+  child.on('close', finish);
+  child.on('error', (e) => { add('Ejecuta como Node', false, 'No se pudo lanzar: ' + e.message); finish(); });
+}
+
 function pickFolder(res) {
   const ps = [
     'Add-Type -AssemblyName System.Windows.Forms;',
@@ -565,11 +1049,30 @@ function pickFolder(res) {
 }
 
 const server = http.createServer(async (req, res) => {
+ try {
   if (req.method === 'POST' && req.url === '/api/chat') return handleChat(req, res, await readBody(req));
+  if (req.method === 'POST' && req.url === '/api/agent/confirm') {
+    const b = await readBody(req);
+    const fn = b && b.id && pendingConfirms[b.id];
+    if (fn) { fn(!!b.approved); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
+    res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'confirmación no encontrada o expirada' }));
+  }
   if (req.method === 'GET' && req.url === '/api/pickfolder') return pickFolder(res);
+  if (req.method === 'GET' && req.url === '/api/diagnose') {
+    return runDiagnostics((result) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(result)); });
+  }
   if (req.method === 'GET' && req.url === '/api/speech/available') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ available: !!loadSpeech() }));
+    return res.end(JSON.stringify({ available: !!loadSpeech() || whisperAvailable(), azure: !!loadSpeech(), local: whisperAvailable(), localModelReady: !!whisperModelPath() }));
+  }
+  if (req.method === 'POST' && req.url === '/api/tts') {
+    const b = await readBody(req);
+    synthSpeech((b && b.text) || '', (err, audio) => {
+      if (err) { res.writeHead(500, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: err.message })); }
+      res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': audio.length });
+      res.end(audio);
+    });
+    return;
   }
   if (req.method === 'POST' && req.url === '/api/transcribe') {
     const chunks = [];
@@ -577,10 +1080,27 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       const audio = Buffer.concat(chunks);
       const ct = req.headers['content-type'] || 'audio/wav';
-      transcribeSpeech(audio, ct, (err, text) => {
+      // Motor: cabecera x-engine ('local'|'azure') o auto (local si está, si no Azure).
+      const engine = (req.headers['x-engine'] || '').toString().toLowerCase();
+      const useLocal = engine === 'local' || (engine !== 'azure' && whisperAvailable());
+      const reply = (err, text) => {
         res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(err ? { error: err.message } : { text: text }));
-      });
+      };
+      if (useLocal && whisperAvailable()) {
+        return transcribeLocal(audio, (err, text) => {
+          if (err && loadSpeech()) return transcribeSpeech(audio, ct, reply); // fallback a Azure
+          reply(err, text);
+        });
+      }
+      transcribeSpeech(audio, ct, reply);
+    });
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/speech/download-model') {
+    ensureWhisperModel((err, p) => {
+      res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(err ? { error: err.message } : { ok: true, path: p }));
     });
     return;
   }
@@ -594,7 +1114,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'POST' && req.url === '/api/plan') {
     const b = await readBody(req);
-    if (b && b.plan) { const u = loadUsage(); u.plan = String(b.plan).toLowerCase(); saveUsage(u); }
+    if (b && b.plan) { const u = loadUsage(); u.plan = String(b.plan).toLowerCase(); u.planLocked = true; saveUsage(u); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(quotaInfo()));
   }
@@ -604,6 +1124,7 @@ const server = http.createServer(async (req, res) => {
       { id: 'auto', name: 'Automático (recomendado)' }
     ];
     if (loadAzure()) models.push({ id: 'azure', name: '⚡ Azure gpt-5-mini (tu cuota, barato)' });
+    if (loadAzure()) models.push({ id: 'azure-agent', name: '🤖 Azure Agente (ejecuta archivos/comandos)' });
     models.push(
       { id: 'claude-sonnet-5', name: 'Claude Sonnet 5 (potente)' },
       { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6' },
@@ -628,6 +1149,17 @@ const server = http.createServer(async (req, res) => {
     if (b && b.model) { state.model = b.model; state.started = false; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, model: state.model }));
+  }
+  if (req.method === 'GET' && req.url === '/api/autostart') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return getAutostart((enabled, supported) => res.end(JSON.stringify({ enabled, supported })));
+  }
+  if (req.method === 'POST' && req.url === '/api/autostart') {
+    const b = await readBody(req);
+    return setAutostart(!!(b && b.enabled), (ok, enabled) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, enabled }));
+    });
   }
   if (req.method === 'GET' && req.url === '/api/conv/list') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -670,9 +1202,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   serveStatic(req, res);
+ } catch (e) {
+   try { console.error('Handler error:', e && e.message); } catch (_) {}
+   try { if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Error interno: ' + (e && e.message) })); } else { res.end(); } } catch (_) {}
+ }
 });
 
 let bindTries = 0;
+
+// BLINDAJE: nunca dejar que un error no capturado tumbe la app.
+process.on('uncaughtException', (err) => {
+  try { console.error('uncaughtException:', err && err.stack || err); } catch (_) {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { console.error('unhandledRejection:', reason && reason.stack || reason); } catch (_) {}
+});
 function startListen() {
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`HanstlerS escuchando en http://127.0.0.1:${PORT}`);

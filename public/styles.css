@@ -30,16 +30,17 @@ body{
 .conv-item:hover{ background:#14141f; color:var(--text); }
 .conv-item.active{ background:#181828; color:var(--text); border-color:var(--border); }
 .conv-item .t{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.conv-item .del, .conv-item .ren{ opacity:0; cursor:pointer; font-size:13px; }
+.conv-item .del, .conv-item .ren{ opacity:0; cursor:pointer; display:inline-flex; align-items:center; color:var(--muted); }
 .conv-item .del{ color:#ff5a7a; }
-.conv-item:hover .del, .conv-item:hover .ren{ opacity:.8; }
-.conv-item .ren:hover, .conv-item .del:hover{ opacity:1; }
+.conv-item:hover .del, .conv-item:hover .ren{ opacity:.75; }
+.conv-item .ren:hover{ opacity:1; color:var(--neon2); }
+.conv-item .del:hover{ opacity:1; }
 .conv-item .spin{ color:var(--neon2); animation:spin 1s linear infinite; display:inline-block; }
 @keyframes spin{ to{ transform:rotate(360deg); } }
 #usage-meter{
-  position:fixed; right:10px; bottom:8px; font-size:13px; color:#9a9ab5;
-  background:rgba(18,18,30,.85); border:1px solid var(--border); padding:5px 11px; border-radius:10px; z-index:30;
-  pointer-events:none; letter-spacing:.2px; font-weight:500;
+  font-size:12.5px; color:#9a9ab5;
+  background:rgba(18,18,30,.6); border:1px solid var(--border); padding:4px 10px; border-radius:9px;
+  pointer-events:none; letter-spacing:.2px; font-weight:500; white-space:nowrap;
 }
 #mainpane{ flex:1; display:flex; flex-direction:column; min-width:0; height:100vh; }
 #btn-toggle{ background:#1a1a2a; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:7px 10px; font-size:14px; cursor:pointer; }
@@ -61,12 +62,18 @@ body{
   flex:1;font-size:12px;color:var(--muted);background:#0c0c16;border:1px solid var(--border);
   border-radius:8px;padding:7px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-.actions{display:flex;gap:8px;}
+.actions{display:flex;gap:8px;align-items:center;}
 #topbar button{
   background:#1a1a2a;color:var(--text);border:1px solid var(--border);border-radius:8px;
   padding:7px 12px;font-size:13px;cursor:pointer;transition:all .15s;
 }
 #topbar button:hover{border-color:var(--neon);box-shadow:0 0 10px rgba(176,38,255,.35);}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;color:#c8c8dc;padding:7px 9px !important;}
+.icon-btn svg{display:block;}
+.icon-btn.wide{padding:7px 12px !important;}
+.icon-btn.wide span{font-size:12.5px;}
+.icon-btn:hover{color:#fff;}
+#btn-autostart.on{color:var(--neon2);border-color:var(--neon2);}
 
 #model-sel{
   background:#1a1a2a;color:var(--text);border:1px solid var(--border);border-radius:8px;
@@ -100,6 +107,16 @@ body{
 @keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
 
 .working{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:14px;}
+.agent-status{display:inline-flex;align-items:center;gap:8px;color:var(--neon);font-size:13px;margin-top:8px;padding:5px 10px;background:rgba(176,38,255,.08);border:1px solid rgba(176,38,255,.25);border-radius:8px;animation:statusPulse 1.4s ease-in-out infinite;}
+@keyframes statusPulse{0%,100%{opacity:.6}50%{opacity:1}}
+.danger-confirm{position:fixed;bottom:96px;left:50%;transform:translateX(-50%);z-index:80;background:#2a1020;border:1px solid #ff2668;border-radius:12px;padding:14px 16px;box-shadow:0 6px 28px rgba(255,38,104,.45);max-width:90%;display:flex;flex-direction:column;gap:10px;animation:statusPulse 1.6s ease-in-out infinite;}
+.danger-confirm .dc-txt{color:#ffe0e8;font-size:13.5px;line-height:1.4;}
+.danger-confirm .dc-btns{display:flex;gap:10px;justify-content:flex-end;}
+.danger-confirm button{border:none;border-radius:8px;padding:7px 16px;font-size:13px;cursor:pointer;font-weight:600;}
+.danger-confirm .dc-yes{background:linear-gradient(135deg,#ff8c26,#ff2668);color:#fff;}
+.danger-confirm .dc-no{background:#33223a;color:#e8e8f0;border:1px solid #664;}
+.continue-box{background:rgba(176,38,255,.08);border:1px solid rgba(176,38,255,.3);border-radius:8px;padding:10px 12px;font-size:13px;color:var(--muted);display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.continue-box button{background:linear-gradient(135deg,#26e0ff,#b026ff);border:none;color:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;}
 .wheel{
   width:15px;height:15px;border-radius:50%;
   border:2.5px solid rgba(176,38,255,.25);border-top-color:var(--neon);
@@ -136,6 +153,7 @@ body{
 #send{
   width:44px;height:44px;flex:0 0 44px;border:none;border-radius:12px;color:#fff;font-size:18px;cursor:pointer;
   background:linear-gradient(135deg,var(--neon),var(--neon2));box-shadow:0 0 14px rgba(176,38,255,.4);
+  display:flex;align-items:center;justify-content:center;
 }
 #send:disabled{opacity:.4;cursor:default;box-shadow:none;}
 #send.stopping{background:linear-gradient(135deg,#ff2668,#ff5a3c);}
@@ -149,6 +167,7 @@ body{
 .mic, .speak{
   width:44px;height:44px;flex:0 0 44px;border:1px solid var(--border);border-radius:12px;background:#0c0c16;
   color:var(--text);font-size:17px;cursor:pointer;transition:all .15s;
+  display:flex;align-items:center;justify-content:center;
 }
 .mic:hover, .speak:hover{border-color:var(--neon2);box-shadow:0 0 10px rgba(38,224,255,.35);}
 .mic.listening{
@@ -157,3 +176,19 @@ body{
 }
 .speak.on{background:linear-gradient(135deg,var(--neon),var(--neon2));border-color:transparent;color:#fff;}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,38,104,.5)}50%{box-shadow:0 0 0 8px rgba(255,38,104,0)}}
+
+/* ===== Buscador en sidebar ===== */
+#conv-search{
+  margin:0 12px 8px; padding:8px 10px; border-radius:8px; border:1px solid var(--border);
+  background:#0c0c16; color:var(--text); font-size:13px; outline:none;
+}
+#conv-search:focus{ border-color:var(--neon); }
+
+/* ===== Temas ===== */
+body[data-theme="ocean"]{ --bg:#0a1420; --panel:#0f2036; --neon:#26a0ff; --neon2:#26e0ff; --border:#1c3550; }
+body[data-theme="light"]{ --bg:#f4f6fb; --panel:#ffffff; --neon:#7c3aed; --neon2:#0aa5c9; --text:#1a1a28; --muted:#5a5a70; --border:#d6d9e6; }
+body[data-theme="light"] .bubble{ background:#ffffff; }
+body[data-theme="light"] .msg.user .bubble{ background:#e8ecf8; border-color:#c8d0ea; }
+body[data-theme="light"] #chat{ background:#eef1f8; }
+body[data-theme="light"] #conv-search, body[data-theme="light"] #input{ background:#ffffff; }
+body[data-theme="light"] .bubble strong{ color:#000; }

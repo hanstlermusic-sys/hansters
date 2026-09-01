@@ -1,5 +1,12 @@
-﻿node_modules/
+node_modules/
 build/
 dist/
 *.log
 body.json
+
+# Salidas de electron-builder (regenerables con: npm run dist)
+dist-electron/
+electron-app/
+
+# Modelos de Whisper: ggml-base.bin pesa 141 MB y GitHub rechaza >100 MB
+vendor/
