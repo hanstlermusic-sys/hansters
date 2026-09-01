@@ -4,6 +4,14 @@ const input = document.getElementById('input');
 const composer = document.getElementById('composer');
 const sendBtn = document.getElementById('send');
 const cwdEl = document.getElementById('cwd');
+const xcorePanel = document.getElementById('xcore-player');
+const xcoreAudio = document.getElementById('xcore-audio');
+const xcoreNow = document.getElementById('xcore-now');
+const xcoreList = document.getElementById('xcore-list');
+const xcoreAudioInput = document.getElementById('xcore-audio-input');
+const ROLLING_SUMMARY_MAX = 2200;
+const HISTORY_RECENT_ITEMS = 6;
+const HISTORY_ITEM_MAX = 360;
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
@@ -51,6 +59,9 @@ function renderMd(text){
   html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
   html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
   html = html.replace(/^# (.+)$/gm, '<h3>$1</h3>');
+  // trazas operativas (tooling) en tamaño discreto
+  html = html.replace(/^• (.+)$/gm, '<div class="op-trace-item">• $1</div>');
+  html = html.replace(/^[\u2502\u2514]\s*(.+)$/gm, '<div class="op-trace-sub">$1</div>');
   // listas
   html = html.replace(/^(\s*)[-*] (.+)$/gm, '$1<li>$2</li>');
   html = html.replace(/^(\s*)\d+\. (.+)$/gm, '$1<li>$2</li>');
@@ -74,22 +85,166 @@ function addMsg(role, html, idx){
 const WELCOME = '¡Hola! Soy <strong>HanstlerS</strong>. Elige tu carpeta de proyecto arriba y dime en qué trabajamos. Puedo leer y editar archivos, ejecutar comandos y usar tu agente <code>hanstler-dev</code>.';
 
 // ===== Estado por conversación (independiente / paralelo) =====
-const convData = {}; // id -> {title, messages:[], session, queue:[], busy, aborts:Set}
+const convData = {}; // id -> {title, messages:[], session, queue:[], busy, aborts:Set, xcore}
 let activeId = 'c' + Date.now();
+let reposData = [];
+let sidebarMode = 'conv';
+let repoChatId = '';
+let prevConvId = '';
+let activeRepoPath = '';
+let activeRepoRef = '';
+let reposLoadError = '';
+let repoAuth = { enabled:false, ok:false, user:null, ghLogged:false, ghUser:'' };
+
+function normModelId(m){
+  return String(m || '').replace(/\s*\(.*\)/, '').trim().toLowerCase();
+}
+function isXcoreModel(m){
+  const mm = normModelId(m);
+  return mm === 'x-core' || mm === 'xcore';
+}
+function ensureXcoreState(c){
+  c.xcore = c.xcore || {};
+  c.xcore.tracks = Array.isArray(c.xcore.tracks) ? c.xcore.tracks : [];
+  c.xcore.activeTrackId = c.xcore.activeTrackId || null;
+  c.xcore.lastPos = typeof c.xcore.lastPos === 'number' ? c.xcore.lastPos : 0;
+  return c.xcore;
+}
+function getActiveTrack(c){
+  ensureXcoreState(c);
+  return c.xcore.tracks.find(t => t.id === c.xcore.activeTrackId) || null;
+}
+function renderXcorePanel(){
+  if(!xcorePanel || !xcoreAudio || !xcoreNow || !xcoreList) return;
+  const c = getConv(activeId);
+  const on = isXcoreModel(c.model || 'auto');
+  xcorePanel.style.display = on ? 'flex' : 'none';
+  if(!on) return;
+  ensureXcoreState(c);
+  const tr = getActiveTrack(c);
+  xcoreNow.textContent = tr ? ('Track activo: ' + tr.name) : 'Sin track seleccionado.';
+  if (!tr && xcoreAudio) xcoreAudio.removeAttribute('src');
+  xcoreList.innerHTML = '';
+  c.xcore.tracks.forEach((t)=>{
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'xcore-track' + (t.id === c.xcore.activeTrackId ? ' active' : '');
+    b.textContent = '[audio] ' + (t.name || 'audio');
+    b.onclick = ()=>{
+      c.xcore.activeTrackId = t.id;
+      if (xcoreAudio.src !== t.url) xcoreAudio.src = t.url;
+      xcoreAudio.currentTime = 0;
+      xcoreAudio.play().catch(()=>{});
+      renderXcorePanel();
+    };
+    xcoreList.appendChild(b);
+  });
+}
+function xcoreContextForChat(c){
+  if(!isXcoreModel(c.model || 'auto')) return null;
+  ensureXcoreState(c);
+  const tr = getActiveTrack(c);
+  return {
+    activeTrackId: tr ? tr.id : null,
+    activeTrackName: tr ? tr.name : '',
+    positionSec: Number(xcoreAudio ? (xcoreAudio.currentTime || 0) : 0),
+    durationSec: Number(xcoreAudio ? (xcoreAudio.duration || 0) : 0),
+    trackCount: c.xcore.tracks.length
+  };
+}
+
+function registerXcoreGeneratedTrack(convId, data){
+  const c = getConv(convId);
+  if(!c || !isXcoreModel(c.model || 'auto') || !data || !data.path) return;
+  ensureXcoreState(c);
+  const audioPath = String(data.path).trim();
+  if(!audioPath) return;
+  const fileName = audioPath.split(/[\\/]/).pop() || 'audio';
+  const name = String(data.name || fileName);
+  const streamUrl = '/api/xcore/stream?path=' + encodeURIComponent(audioPath);
+  let tr = c.xcore.tracks.find(t => t && t.path === audioPath);
+  if(!tr){
+    tr = { id: 'gen-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name, path: audioPath, url: streamUrl };
+    c.xcore.tracks.push(tr);
+  } else {
+    tr.name = name;
+    tr.url = streamUrl;
+  }
+  c.xcore.activeTrackId = tr.id;
+  c.xcore.lastPos = 0;
+  if(convId === activeId){
+    if(xcoreAudio){
+      xcoreAudio.src = streamUrl;
+      xcoreAudio.currentTime = 0;
+      xcoreAudio.play().catch(()=>{});
+    }
+    renderXcorePanel();
+  }
+  persistConv(convId);
+}
+
+function ensureConvMeta(c){
+  if(!c) return;
+  if(typeof c.rollupSummary !== 'string') c.rollupSummary = '';
+  if(!Number.isFinite(Number(c.rollupTurns))) c.rollupTurns = 0;
+}
+function plainText(s){
+  return String(s||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+}
+function clampText(s, n){
+  const t = String(s||'').trim();
+  if(t.length<=n) return t;
+  return t.slice(0, Math.max(0,n-1)) + '…';
+}
+function pathKey(p){
+  return String(p||'').replace(/[\\/]+$/,'').toLowerCase();
+}
+function isRepoDirectMode(){
+  return sidebarMode === 'repo' && (!!activeRepoPath || !!activeRepoRef);
+}
+function buildCompactHistory(c, botIdx){
+  ensureConvMeta(c);
+  const prev = c.messages.slice(0, botIdx).filter(m=>m && (m.role==='user' || m.role==='bot' || m.role==='assistant'));
+  const recent = prev.slice(Math.max(0, prev.length - HISTORY_RECENT_ITEMS));
+  const history = recent.map((m)=>({
+    role: m.role==='user' ? 'user' : 'assistant',
+    content: clampText(plainText(m.html || m.content || ''), HISTORY_ITEM_MAX)
+  })).filter(m=>m.content);
+  return { history, historySummary: clampText(c.rollupSummary || '', ROLLING_SUMMARY_MAX) };
+}
+function updateRollingSummary(c, userMsg, assistantMsg){
+  ensureConvMeta(c);
+  const u = clampText(plainText(userMsg), 220);
+  const a = clampText(plainText(assistantMsg), 320);
+  if(!u && !a) return;
+  const turn = `U: ${u}\nA: ${a}`;
+  c.rollupSummary = c.rollupSummary ? (c.rollupSummary + '\n' + turn) : turn;
+  if(c.rollupSummary.length > ROLLING_SUMMARY_MAX){
+    c.rollupSummary = c.rollupSummary.slice(c.rollupSummary.length - ROLLING_SUMMARY_MAX);
+    const cut = c.rollupSummary.indexOf('\n');
+    if(cut > 0) c.rollupSummary = c.rollupSummary.slice(cut + 1);
+  }
+  c.rollupTurns = Number(c.rollupTurns || 0) + 1;
+}
 
 function getConv(id){
-  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, model:null, queue:[], busy:false, aborts:new Set(), live:null };
+  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, model:null, queue:[], busy:false, aborts:new Set(), live:null, xcore:{ tracks:[], activeTrackId:null, lastPos:0 }, rollupSummary:'', rollupTurns:0 };
+  ensureConvMeta(convData[id]);
+  ensureXcoreState(convData[id]);
   return convData[id];
 }
 
 function persistConv(id){
+  if(isRepoDirectMode()) return;
   const c = convData[id]; if(!c || !c.messages.length) return;
   if(c.title==='Nueva conversación'){
     const fu = c.messages.find(m=>m.role==='user');
     if(fu){ const t=fu.html.replace(/<[^>]+>/g,'').trim(); c.title = t.slice(0,40) || 'Conversación'; }
   }
+  ensureXcoreState(c);
+  ensureConvMeta(c);
   fetch('/api/conv/save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session, model:c.model })})
+    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session, model:c.model, xcore:c.xcore, rollupSummary:c.rollupSummary, rollupTurns:c.rollupTurns })})
     .then(()=>loadConvList()).catch(()=>{});
 }
 
@@ -103,11 +258,13 @@ function updateBubble(id, idx, html){
 function renderActive(){
   chat.innerHTML='';
   const c = getConv(activeId);
-  if(!c.messages.length){ addMsg('bot', WELCOME); return; }
+  if(!c.messages.length){ addMsg('bot', WELCOME); renderXcorePanel(); return; }
   c.messages.forEach((m,i)=> addMsg(m.role, m.html, i));
+  renderXcorePanel();
 }
 
 async function loadConvList(){
+  if(sidebarMode !== 'conv') return;
   try{
     const r = await fetch('/api/conv/list'); const j = await r.json();
     const box = document.getElementById('conv-list'); box.innerHTML='';
@@ -156,7 +313,8 @@ async function openConv(id){
     if(!convData[id]){
       const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
       if(!c || c.error) return;
-      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, model:c.model||null, queue:[], busy:false, aborts:new Set() };
+      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, model:c.model||null, queue:[], busy:false, aborts:new Set(), xcore:c.xcore||{ tracks:[], activeTrackId:null, lastPos:0 }, rollupSummary: typeof c.rollupSummary==='string' ? c.rollupSummary : '', rollupTurns: Number(c.rollupTurns||0) };
+      ensureConvMeta(convData[id]);
     }
     activeId = id;
     renderActive();
@@ -175,6 +333,7 @@ function reflectModel(){
   let opt = [...sel.options].find(o=>o.value===m);
   if(!opt){ opt=document.createElement('option'); opt.value=m; opt.textContent=m+' (personalizado)'; sel.insertBefore(opt, sel.lastChild); }
   sel.value = m;
+  renderXcorePanel();
 }
 
 function newConv(){
@@ -189,12 +348,237 @@ document.getElementById('btn-newconv').addEventListener('click', newConv);
 document.getElementById('btn-toggle').addEventListener('click', ()=>{
   document.getElementById('sidebar').classList.toggle('hidden');
 });
+function refreshModeChip(){
+  const chip = document.getElementById('mode-chip');
+  if(!chip) return;
+  if(isRepoDirectMode()){
+    chip.textContent = activeRepoRef ? ('GitHub · ' + activeRepoRef + ' · sin guardar') : 'Repo directo · sin guardar';
+    chip.classList.add('on');
+    chip.title = activeRepoRef
+      ? ('Cada envío usa el repositorio GitHub ' + activeRepoRef + ' sin guardar conversación.')
+      : 'Cada envío usa el repositorio activo sin guardar conversación.';
+  }else{
+    chip.textContent = 'Conversación';
+    chip.classList.remove('on');
+    chip.title = 'Historial persistente por conversación.';
+  }
+}
+function setSidebarMode(mode){
+  sidebarMode = mode === 'repo' ? 'repo' : 'conv';
+  const isRepo = sidebarMode === 'repo';
+  const convList = document.getElementById('conv-list');
+  const repoList = document.getElementById('repo-list');
+  const tabConv = document.getElementById('tab-conv');
+  const tabRepo = document.getElementById('tab-repo');
+  const search = document.getElementById('conv-search');
+  const btnNew = document.getElementById('btn-newconv');
+  if(convList) convList.style.display = isRepo ? 'none' : '';
+  if(repoList) repoList.style.display = isRepo ? '' : 'none';
+  if(btnNew) btnNew.style.display = isRepo ? 'none' : '';
+  if(tabConv) tabConv.classList.toggle('active', !isRepo);
+  if(tabRepo) tabRepo.classList.toggle('active', isRepo);
+  if(search) search.placeholder = isRepo ? '🔍 Buscar repositorios…' : '🔍 Buscar conversaciones…';
+  if(isRepo){
+    prevConvId = prevConvId || activeId;
+    if(!repoChatId) repoChatId = 'repo-' + Date.now();
+    activeId = repoChatId;
+    const rc = getConv(activeId);
+    rc.title = 'Repo directo';
+    if(!rc.messages.length){
+      rc.messages.push({ role:'bot', html:'Modo <b>Repo directo</b> activo. Tus mensajes se ejecutan sobre el repo seleccionado y <b>no se guarda conversación</b>.' });
+    }
+    renderActive();
+    reflectModel();
+    loadRepoList();
+  }else{
+    if(prevConvId) activeId = prevConvId;
+    prevConvId = '';
+    renderActive();
+    reflectModel();
+    loadConvList();
+  }
+  refreshStopMode();
+  refreshModeChip();
+}
+async function refreshReposData(){
+  try{
+    const r = await fetch('/api/repos/list');
+    const j = await r.json();
+    reposData = Array.isArray(j.items) ? j.items : [];
+    reposLoadError = String(j.error || '');
+    if(!activeRepoRef && reposData.length) activeRepoRef = String(reposData[0].repoRef || '');
+    if(j.cwd && !activeRepoPath) activeRepoPath = j.cwd;
+  }catch(e){ reposData = []; reposLoadError = 'No se pudo cargar la lista de repositorios.'; }
+}
+async function refreshRepoAuth(){
+  try{
+    const r = await fetch('/auth/me');
+    if(r.status === 401){
+      repoAuth = { enabled:true, ok:false, user:null, ghLogged:false, ghUser:'' };
+    } else {
+      const j = await r.json();
+      repoAuth = { enabled: !!j.enabled, ok: !!j.ok, user: j.user || null, ghLogged:false, ghUser:'' };
+    }
+  }catch(e){
+    repoAuth = { enabled:false, ok:false, user:null, ghLogged:false, ghUser:'' };
+  }
+  try{
+    const gr = await fetch('/api/gh/auth/status');
+    const gj = await gr.json();
+    repoAuth.ghLogged = !!gj.loggedIn;
+    repoAuth.ghUser = String(gj.user || '');
+  }catch(e){}
+  return repoAuth;
+}
+function renderRepoAuthCard(box){
+  const card = document.createElement('div');
+  card.className = 'repo-auth';
+  const name = repoAuth.user ? (repoAuth.user.name || repoAuth.user.login || '') : '';
+  const ghName = repoAuth.ghUser ? repoAuth.ghUser : 'gh local';
+  const login = repoAuth.ok
+    ? ('Conectado: <b>' + esc(name) + '</b>')
+    : (repoAuth.ghLogged ? ('Conectado por CLI: <b>' + esc(ghName) + '</b>') : 'Sin sesión de GitHub');
+  const note = repoAuth.enabled
+    ? 'Puedes usar OAuth o GitHub CLI para cargar repos remotos.'
+    : 'OAuth no está configurado. Usa GitHub CLI (botón abajo).';
+  const btnLogin = repoAuth.enabled && !repoAuth.ok ? '<button type="button" data-repo-login>Iniciar sesión web</button>' : '';
+  const btnGhLogin = (!repoAuth.ok && !repoAuth.ghLogged) ? '<button type="button" data-gh-login>Login con GitHub CLI</button>' : '';
+  const btnLogout = repoAuth.enabled && repoAuth.ok ? '<button type="button" data-repo-logout>Cerrar sesión</button>' : '';
+  card.innerHTML =
+    '<div class="repo-auth-title">GitHub</div>' +
+    '<div class="repo-auth-status">' + login + '</div>' +
+    '<div class="repo-auth-note">' + note + '</div>' +
+    '<div class="repo-auth-actions">' +
+      btnLogin +
+      btnGhLogin +
+      btnLogout +
+      '<button type="button" data-repo-refresh>Actualizar</button>' +
+    '</div>';
+  box.appendChild(card);
+}
+async function selectRepoItem(it, emitNote){
+  if(!it) return;
+  const repoRef = String(it.repoRef || '').trim();
+  const repoPath = String(it.path || '').trim();
+  if(repoRef){
+    activeRepoRef = repoRef;
+    activeRepoPath = '';
+    setCwd('GitHub · ' + repoRef);
+    if(emitNote){
+      const c = getConv(activeId);
+      c.messages.push({ role:'bot', html:'Repo GitHub activo: <code>' + esc(repoRef) + '</code>.' });
+      renderActive();
+      persistConv(activeId);
+    }
+    loadRepoList();
+    refreshModeChip();
+    return;
+  }
+  if(!repoPath) return;
+  try{
+    const r = await fetch('/api/cwd', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ path: repoPath }) });
+    const j = await r.json();
+    if(!j || !j.ok) return;
+    activeRepoPath = j.cwd;
+    activeRepoRef = '';
+    setCwd(j.cwd);
+    if(emitNote){
+      const c = getConv(activeId);
+      c.messages.push({ role:'bot', html:'Repo activo: <code>' + esc(j.cwd) + '</code>.' });
+      renderActive();
+      persistConv(activeId);
+    }
+    loadRepoList();
+    refreshModeChip();
+  }catch(e){}
+}
+async function loadRepoList(){
+  const box = document.getElementById('repo-list');
+  if(!box) return;
+  if(!reposData.length) await refreshReposData();
+  await refreshRepoAuth();
+  box.innerHTML = '';
+  renderRepoAuthCard(box);
+  const q = (document.getElementById('conv-search')?.value||'').trim().toLowerCase();
+  const items = (reposData||[]).filter((it)=>{
+    const hay = (String(it.name||'') + ' ' + String(it.repoRef||'') + ' ' + String(it.subtitle||'') + ' ' + String(it.path||'')).toLowerCase();
+    return !q || hay.includes(q);
+  });
+  if(reposLoadError){
+    const warn = document.createElement('div');
+    warn.className = 'conv-item';
+    warn.innerHTML = '<span class="t">' + esc(reposLoadError) + '</span>';
+    box.appendChild(warn);
+  }
+  if(!items.length){
+    const emp = document.createElement('div');
+    emp.className = 'conv-item';
+    emp.innerHTML = '<span class="t">No hay repos disponibles. Usa “Iniciar sesión” o “Actualizar”.</span>';
+    box.appendChild(emp);
+    return;
+  }
+  if(!activeRepoRef && !activeRepoPath){
+    const first = items[0];
+    if(first && first.repoRef){ activeRepoRef = String(first.repoRef); setCwd('GitHub · ' + activeRepoRef); }
+    else if(first && first.path) activeRepoPath = String(first.path);
+  }
+  items.forEach((it)=>{
+    const el = document.createElement('div');
+    const isActive = it.repoRef
+      ? (String(it.repoRef).toLowerCase() === String(activeRepoRef || '').toLowerCase())
+      : (pathKey(it.path) === pathKey(activeRepoPath || cwdEl.textContent || ''));
+    el.className = 'conv-item repo-item' + (isActive ? ' active' : '');
+    const sub = String(it.repoRef || it.path || '');
+    const desc = String(it.subtitle || (it.private ? 'Privado' : ''));
+    el.innerHTML = `<span class="t" title="${esc(String(it.name||''))}">📁 ${esc(String(it.name||''))}</span><span class="repo-path" title="${esc(sub)}">${esc(sub)}</span>${desc?`<span class="repo-path" title="${esc(desc)}">${esc(desc)}</span>`:''}`;
+    el.onclick = ()=> selectRepoItem(it, true);
+    box.appendChild(el);
+  });
+}
+document.getElementById('repo-list')?.addEventListener('click', async (e)=>{
+  const t = e.target;
+  if(!(t instanceof Element)) return;
+  if(t.closest('[data-repo-login]')){
+    window.location.href = '/auth/login';
+    return;
+  }
+  if(t.closest('[data-gh-login]')){
+    try{
+      const r = await fetch('/api/gh/auth/start', { method:'POST' });
+      const j = await r.json();
+      if(j && j.ok) showMemoryChip('Abriendo login de GitHub CLI… completa el navegador y luego pulsa Actualizar.');
+      else showMemoryChip('No se pudo abrir login CLI.');
+    }catch(_){ showMemoryChip('No se pudo abrir login CLI.'); }
+    return;
+  }
+  if(t.closest('[data-repo-logout]')){
+    try{ await fetch('/auth/logout', { method:'POST' }); }catch(_){}
+    await refreshRepoAuth();
+    await refreshReposData();
+    loadRepoList();
+    return;
+  }
+  if(t.closest('[data-repo-refresh]')){
+    reposLoadError = '';
+    await refreshRepoAuth();
+    await refreshReposData();
+    loadRepoList();
+  }
+});
+function renderSidebarList(){
+  if(sidebarMode === 'repo') loadRepoList();
+  else loadConvList();
+}
+document.getElementById('tab-conv')?.addEventListener('click', ()=> setSidebarMode('conv'));
+document.getElementById('tab-repo')?.addEventListener('click', ()=> setSidebarMode('repo'));
 renderActive();
-loadConvList();
+renderSidebarList();
+refreshModeChip();
 
 function setCwd(p){ if(p){ cwdEl.textContent = p; cwdEl.title = p; } }
 
 fetch('/api/state').then(r=>r.json()).then(s=>setCwd(s.cwd)).catch(()=>{});
+refreshReposData().then(()=>loadRepoList()).catch(()=>{});
 
 document.getElementById('btn-folder').addEventListener('click', async ()=>{
   cwdEl.textContent = 'Abriendo selector…';
@@ -202,7 +586,13 @@ document.getElementById('btn-folder').addEventListener('click', async ()=>{
     const r = await fetch('/api/pickfolder');
     const j = await r.json();
     setCwd(j.cwd);
-    if(j.path){ const h='Carpeta cambiada a <code>'+esc(j.path)+'</code>.'; const c=getConv(activeId); c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId); }
+    if(j.path){
+      if(sidebarMode === 'repo'){ activeRepoPath = j.path; activeRepoRef = ''; }
+      const h='Carpeta cambiada a <code>'+esc(j.path)+'</code>.';
+      const c=getConv(activeId); c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId);
+      if(sidebarMode === 'repo') loadRepoList();
+      refreshModeChip();
+    }
   }catch(e){ setCwd('~'); }
 });
 
@@ -234,8 +624,10 @@ if (modelSel) {
     // Guardar el modelo EN LA CONVERSACIÓN activa (no global).
     const c = getConv(activeId);
     c.model = id;
-    const h='Modelo de esta conversación: <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.';
+    const lbl = isRepoDirectMode() ? 'Modelo de este modo repo' : 'Modelo de esta conversación';
+    const h=lbl + ': <code>'+esc(modelSel.options[modelSel.selectedIndex].text)+'</code>.';
     c.messages.push({role:'bot',html:h}); renderActive(); persistConv(activeId);
+    renderXcorePanel();
   });
 }
 
@@ -253,7 +645,7 @@ function enqueue(msg, images, files){
   const imgHtml = (images&&images.length) ? images.map(im=>`<img src="${im}" style="max-width:160px;max-height:120px;border-radius:8px;margin:4px 4px 0 0;border:1px solid #33335a;">`).join('') : '';
   const fileHtml = (files&&files.length) ? '<div style="margin-top:4px;">'+files.map(f=>`<span style="display:inline-block;background:#1a2438;border:1px solid #33335a;border-radius:8px;padding:3px 8px;margin:2px 4px 0 0;font-size:12px;">📄 ${f.name}</span>`).join('')+'</div>' : '';
   const userHtml = renderMd(msg) + (imgHtml?('<div>'+imgHtml+'</div>'):'') + fileHtml;
-  c.messages.push({role:'user', html:userHtml, text:msg});
+  c.messages.push({role:'user', html:userHtml});
   if(id===activeId) addMsg('user', userHtml, c.messages.length-1);
   persistConv(id);
   maybeSuggestAzure(c, msg);
@@ -268,7 +660,18 @@ function looksLikeExecution(msg){
   return /\b(crea|cre[aá]|edita|modifica|arregla|corrige|ejecuta|corre|instala|despliega|refactor|agrega|a[ñn]ade|borra|elimina|archivo|carpeta|comando|script|c[oó]digo|bug|error|compila|build|test|prueba|git|deploy)\b/i.test(msg||'')
     || /@[\w./\\-]+/.test(msg||'');
 }
+function looksLikePortalTask(msg){
+  return /\b(cloudflare|azure|github|dns|dominio|domain|ssl|cname|nameserver|portal|dashboard|login|inicia sesi[oó]n|settings)\b/i.test(msg||'');
+}
+function preflightSuggestion(msg){
+  if(looksLikePortalTask(msg)) return 'Sugerencia: abriré el portal y ejecutaré el flujo por ti; al final te doy solo el resultado.';
+  if(looksLikeExecution(msg)) return 'Sugerencia: ejecutaré los cambios en modo automático y te reporto el resultado final.';
+  return 'Sugerencia: te daré una recomendación breve y luego ejecuto si aplica.';
+}
 function maybeSuggestAzure(c, msg){
+  const az = document.getElementById('azure-suggest');
+  if (az) az.remove();
+  return;
   if(azureSuggestDismissed || !hasAzure) return;
   const model = c.model || 'auto';
   if(model === 'azure' || model === 'azure-gpt-5-mini') return;
@@ -312,6 +715,7 @@ async function runOne(id, msg, images, files){
   if(id===activeId) addMsg('bot', c.messages[botIdx].html, botIdx);
   showWorking(true);
   let acc='';
+  const hintLine = '';
   c.live = { step:0, max:0, status:'', done:0, startedAt:Date.now(), task:(msg||'').slice(0,120) };
   const abort = new AbortController();
   c.aborts.add(abort);
@@ -320,27 +724,33 @@ async function runOne(id, msg, images, files){
   let statusLine = '';
   const renderWithStatus = ()=>{
     const base = acc.trim() ? renderMd(acc) : '';
+    const hint = hintLine ? `<div class="agent-hint">${esc(hintLine)}</div>` : '';
     const st = statusLine ? `<div class="agent-status"><span class="wheel"></span> ${esc(statusLine)}</div>` : (acc.trim()?'':'<span class="working"><span class="wheel"></span> Trabajando…</span>');
-    setHtml(base + st);
+    setHtml(base + hint + st);
   };
-  // Historial de respaldo para los motores sin sesion en el servidor. Se manda para
-  // TODOS los modelos: antes solo se llenaba para los de Azure, asi que cualquier otro
-  // motor (Vertex/Gemini) recibia history:[] y arrancaba cada turno sin memoria alguna.
-  // Ademas usamos el texto CRUDO del mensaje: rearmarlo desde el HTML de la burbuja
-  // perdia el contenido de las herramientas y dejaba al modelo a ciegas.
-  const history = [];
-  {
-    const prev = c.messages.slice(Math.max(0, botIdx-24), botIdx);
-    for(const m of prev){
-      const raw = (typeof m.text==='string' && m.text.trim()) ? m.text : m.html.replace(/<[^>]+>/g,'').trim();
-      if(raw) history.push({ role: m.role==='user'?'user':'assistant', content: raw });
-    }
-  }
+  const stateless = isRepoDirectMode();
+  const compactCtx = stateless ? { history: [], historySummary: '' } : buildCompactHistory(c, botIdx);
+  const history = compactCtx.history;
+  const historySummary = compactCtx.historySummary;
   try{
+    const xcore = xcoreContextForChat(c);
     const resp = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       signal: abort.signal,
-      body: JSON.stringify({ message: msg, images: images||[], files: files||[], sessionId: c.session || '', convId: id, model: c.model || '', history: history })
+      body: JSON.stringify({
+        message: msg,
+        images: images||[],
+        files: files||[],
+        sessionId: stateless ? '' : (c.session || ''),
+        convId: stateless ? '' : id,
+        model: c.model || '',
+        history: history,
+        historySummary: historySummary,
+        xcore: xcore,
+        stateless: stateless,
+        repoPath: stateless ? activeRepoPath : '',
+        repoRef: stateless ? activeRepoRef : ''
+      })
     });
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
@@ -362,25 +772,36 @@ async function runOne(id, msg, images, files){
           statusLine = (typeof data==='string'?data:''); renderWithStatus();
           if(c.live && statusLine){ const mm=/paso\s+(\d+)\s*\/\s*(\d+)/i.exec(statusLine); if(mm){ c.live.step=+mm[1]; c.live.max=+mm[2]; } c.live.status=statusLine; }
         }
-        else if(type==='session'){ if(data && data.id){ c.session = data.id; } }
+        else if(type==='session'){ if(!stateless && data && data.id){ c.session = data.id; } }
         else if(type==='memory'){ if(data && data.text) showMemoryChip(data.text); }
+        else if(type==='route'){
+          if(data && data.model){
+            statusLine = 'Modelo enrutado: ' + data.model;
+            renderWithStatus();
+            c.lastRoute = data;
+          }
+        }
         else if(type==='usage'){ if(data) updateUsage(data); }
         else if(type==='confirm'){ if(data && data.id) showDangerConfirm(data); }
         else if(type==='canContinue'){ pendingContinue = id; showContinueButton(id); }
+        else if(type==='xcoreTrack'){ if(data && data.path) registerXcoreGeneratedTrack(id, data); }
         else if(type==='error'){ acc += '\n⚠️ '+data; statusLine=''; renderWithStatus(); }
       }
     }
-    c.messages[botIdx].text = acc;
     if(!acc.trim()) setHtml('<em style="color:#8a8aa0">(sin respuesta)</em>');
-    else { setHtml(renderMd(acc)); if(id===activeId) speak(acc); }
-    persistConv(id);
+    else {
+      setHtml(renderMd(acc));
+      if(!stateless) updateRollingSummary(c, msg, acc);
+      if(id===activeId) speak(acc);
+    }
+    if(!stateless) persistConv(id);
   }catch(err){
     if(err.name==='AbortError'){
       setHtml(renderMd(acc) + '<div style="color:#8a8aa0;font-size:12px;margin-top:6px;">⏹ Detenido</div>');
     } else {
       setHtml('⚠️ Error de conexión: '+esc(err.message));
     }
-    persistConv(id);
+    if(!stateless) persistConv(id);
   }finally{
     c.aborts.delete(abort);
     c.live = null;
@@ -429,20 +850,55 @@ function showMemoryChip(text){
   chip._t = setTimeout(()=>{ chip.style.display='none'; }, 4000);
 }
 
-// Medidor de consumo: muestra créditos restantes del plan (cuota − gastado).
+// Medidor de consumo: muestra usado/total como en GitHub Billing.
 function renderQuota(q){
   const el = document.getElementById('usage-meter');
   if(!el || !q) return;
-  const planName = q.plan==='pro+'||q.plan==='proplus' ? 'Pro+' : (q.plan.charAt(0).toUpperCase()+q.plan.slice(1));
-  el.textContent = '◈ ' + q.remaining + ' / ' + q.total + ' · ' + planName;
-  el.title = 'Créditos restantes este mes: ' + q.remaining + ' de ' + q.total + ' (' + planName + '). Gastado: ' + q.spent + '. Reinicia el 1º de cada mes.';
+  const planName = q.plan==='pro+'||q.plan==='proplus' ? 'Pro+' : (q.plan==='max' ? 'Max' : (q.plan.charAt(0).toUpperCase()+q.plan.slice(1)));
+  const extraTxt = q.extra > 0 ? ' +' + q.extra : '';
+  const used = Math.round((q.spent || 0) * 100) / 100;
+  el.textContent = '◈ ' + used + ' / ' + q.total + extraTxt + ' · ' + planName;
+  el.title = 'Créditos usados: ' + used + ' de ' + q.total + ' (' + planName + (q.extra>0?' +'+q.extra+' saldo':'')+').\nRestantes: ' + q.remaining + '.\nHaz clic para sincronizar usado/total.';
+  el.style.cursor = 'pointer';
 }
 function updateUsage(u){
   if(u.quota) renderQuota(u.quota);
   else if(typeof u.credits === 'number'){ fetch('/api/quota').then(r=>r.json()).then(renderQuota).catch(()=>{}); }
+  if(u.google) renderGoogleQuota(u.google);
+}
+// Medidor de consumo Google/Vertex (independiente del de Copilot).
+function renderGoogleQuota(g){
+  const el = document.getElementById('usage-meter-google');
+  if(!el || !g) return;
+  const total = g.totalTokens || 0;
+  const fmtTok = total >= 1000 ? (Math.round(total/100)/10) + 'K' : String(total);
+  const cost = g.costUsd || 0;
+  const fmtCost = '$' + (cost < 0.01 && cost > 0 ? cost.toFixed(4) : cost.toFixed(2));
+  el.textContent = '⬡ ' + fmtCost + ' · ' + fmtTok + ' tok · Google';
+  el.title = 'Google/Vertex este mes: ' + fmtCost + ' USD (' + total + ' tokens: ' + (g.promptTokens||0) + ' entrada + ' + (g.outputTokens||0) + ' salida) en ' + (g.calls||0) + ' llamadas.';
 }
 // Cargar la cuota al iniciar.
 fetch('/api/quota').then(r=>r.json()).then(renderQuota).catch(()=>{});
+fetch('/api/quota/google').then(r=>r.json()).then(renderGoogleQuota).catch(()=>{});
+
+function parseQuotaInput(txt){
+  const t = String(txt||'').trim();
+  const m = /^([\d.,]+)\s*\/\s*([\d.,]+)(?:\s*(max|pro\+|proplus|pro|free))?$/i.exec(t);
+  if(!m) return null;
+  return { used:m[1], total:m[2], plan:(m[3]||'').toLowerCase() };
+}
+// Clic en el medidor → sincronizar usado/total (ej: 16069/20000 max)
+document.getElementById('usage-meter').addEventListener('click', async () => {
+  const val = await askText('Pega tu cuota real en formato usado/total [plan]. Ej: 16069/20000 max', '');
+  const payload = parseQuotaInput(val);
+  if(!payload) return;
+  const r = await fetch('/api/quota/sync', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  if(!r.ok) return;
+  const q = await r.json();
+  renderQuota(q);
+  const planTag = q.plan==='max' ? 'Max' : (q.plan==='pro+'||q.plan==='proplus' ? 'Pro+' : q.plan);
+  showMemoryChip('✅ Cuota sincronizada: ' + q.spent + '/' + q.total + ' · ' + planTag);
+});
 
 // ¿El usuario pregunta cómo va la tarea en curso? (no debe cancelar)
 function isProgressQuery(t){ return /\b(c[oó]mo\s+(vas|va|va\s+eso|va\s+todo)|qu[eé]\s+(vas\s+haciendo|est[aá]s\s+haciendo|llevas|haces)|cu[aá]nto\s+(falta|te\s+falta|queda)|vas\s+(bien|terminando)|sigues?\s+(ah[ií]|trabajando)|estado|progreso|avance|ya\s+(casi|terminaste|acabaste)|how('?s|\s+is)?\s+it\s+going|status|progress)\b/i.test(t||'');
@@ -617,6 +1073,40 @@ if(attachBtn){
     }
     fi.value='';
   };
+}
+
+if (xcoreAudioInput) {
+  xcoreAudioInput.onchange = async () => {
+    const c = getConv(activeId);
+    if (!isXcoreModel(c.model || 'auto')) { xcoreAudioInput.value=''; return; }
+    const files = Array.from(xcoreAudioInput.files || []);
+    if (!files.length) return;
+    ensureXcoreState(c);
+    for (const f of files) {
+      const id = 'trk-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+      const url = URL.createObjectURL(f);
+      c.xcore.tracks.push({ id, name: f.name, url });
+      c.xcore.activeTrackId = id;
+      if (xcoreAudio) xcoreAudio.src = url;
+    }
+    if (xcoreAudio) {
+      xcoreAudio.currentTime = 0;
+      xcoreAudio.play().catch(()=>{});
+    }
+    xcoreAudioInput.value = '';
+    persistConv(activeId);
+    renderXcorePanel();
+  };
+}
+if (xcoreAudio) {
+  xcoreAudio.addEventListener('timeupdate', () => {
+    const c = getConv(activeId);
+    if (!isXcoreModel(c.model || 'auto')) return;
+    ensureXcoreState(c);
+    c.xcore.lastPos = Number(xcoreAudio.currentTime || 0);
+  });
+  xcoreAudio.addEventListener('pause', () => { persistConv(activeId); });
+  xcoreAudio.addEventListener('ended', () => { persistConv(activeId); });
 }
 
 input.focus();
@@ -799,10 +1289,10 @@ function browserSpeak(clean){
 }
 
 /* ============ MEJORAS: buscar, exportar, temas, atajos ============ */
-// Buscar en conversaciones
+// Buscar en panel lateral (conversaciones o repos)
 (function(){
   const s = document.getElementById('conv-search');
-  if(s) s.addEventListener('input', ()=> loadConvList());
+  if(s) s.addEventListener('input', ()=> renderSidebarList());
 })();
 
 // Exportar la conversación activa a un archivo de texto
@@ -848,6 +1338,27 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
   });
 })();
 
+// Modo confianza: sin confirmaciones para el agente Azure
+(function(){
+  const btn = document.getElementById('btn-trust');
+  if(!btn) return;
+  let trust = false;
+  const paint = () => {
+    btn.classList.toggle('on', trust);
+    const label = document.getElementById('trust-label');
+    if(label) label.textContent = trust ? '🔓 Trust' : 'Trust';
+    btn.title = trust ? 'Modo confianza ACTIVO — clic para desactivar' : 'Modo confianza: ejecutar sin confirmaciones (clic para activar)';
+    btn.style.color = trust ? '#26e0ff' : '';
+  };
+  fetch('/api/trust').then(r=>r.json()).then(d=>{ trust=!!d.trust; paint(); }).catch(()=>{});
+  btn.addEventListener('click', ()=>{
+    trust = !trust;
+    fetch('/api/trust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trust})}).catch(()=>{});
+    paint();
+    showMemoryChip(trust ? '🔓 Sin confirmaciones activado' : '🔒 Confirmaciones restauradas');
+  });
+})();
+
 // Autodiagnóstico: prueba cada eslabón y muestra qué falla
 (function(){
   const btn = document.getElementById('btn-diagnose');
@@ -869,7 +1380,7 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
 })();
 document.addEventListener('keydown', (e)=>{
   const ctrl = e.ctrlKey || e.metaKey;
-  if(ctrl && e.key.toLowerCase()==='n'){ e.preventDefault(); newConv(); }        // nueva conversación
+  if(ctrl && e.key.toLowerCase()==='n'){ e.preventDefault(); if(sidebarMode==='conv') newConv(); }        // nueva conversación
   else if(ctrl && e.key.toLowerCase()==='k'){ e.preventDefault(); document.getElementById('conv-search')?.focus(); } // buscar
   else if(ctrl && e.key.toLowerCase()==='t'){ e.preventDefault(); document.getElementById('btn-theme')?.click(); }   // tema
   else if(ctrl && e.key.toLowerCase()==='e'){ e.preventDefault(); document.getElementById('btn-export')?.click(); }  // exportar

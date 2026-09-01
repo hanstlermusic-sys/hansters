@@ -1,9 +1,10 @@
-'use strict';
+﻿'use strict';
 // HanstlerS - servidor local que envuelve el GitHub Copilot CLI en una app de chat.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 
 // AHORRO DE TOKENS: salidas de herramientas grandes van a archivo (el modelo ve
@@ -12,16 +13,41 @@ if (!process.env.COPILOT_LARGE_OUTPUT_THRESHOLD_BYTES) {
   process.env.COPILOT_LARGE_OUTPUT_THRESHOLD_BYTES = '4096';
 }
 
-const PORT = process.env.HANSTLERS_PORT ? Number(process.env.HANSTLERS_PORT) : 8717;
+const PORT = Number(process.env.HANSTLERS_PORT || process.env.PORT || 8717);
+const HOST = (process.env.HANSTLERS_HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1')).trim() || '127.0.0.1';
 const COPILOT_CMD = process.env.HANSTLERS_CMD || 'copilot';
 const PUBLIC = path.join(__dirname, 'public');
 const https = require('https');
+const GITHUB_QUOTA_DEFAULT_URL = 'https://github.com/settings/billing/ai_usage?period=3&group=7&customer=112329552&chart_selection=2&view=models';
+const GITHUB_QUOTA_SYNC_FILE = path.join(os.homedir(), '.hanstlers', 'github-quota-sync.json');
+const FEATURES_FILE = path.join(os.homedir(), '.hanstlers', 'features.json');
+const GITHUB_CLIENT_ID = (process.env.GITHUB_CLIENT_ID || '').trim();
+const GITHUB_CLIENT_SECRET = (process.env.GITHUB_CLIENT_SECRET || '').trim();
+const SESSION_SECRET = (process.env.SESSION_SECRET || '').trim();
+const BASE_URL = (process.env.BASE_URL || '').replace(/\/$/, '');
+const GITHUB_ALLOWED_ORG = (process.env.GITHUB_ALLOWED_ORG || '').trim().toLowerCase();
+const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const ADMIN_USERS = (process.env.ADMIN_USERS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 // Config de Azure OpenAI (BYOK). Si existe, aparece como modelo en el selector.
 const AZURE_FILE = path.join(os.homedir(), '.hanstlers', 'azure.json');
 function loadAzure() {
   try { const c = JSON.parse(fs.readFileSync(AZURE_FILE, 'utf8')); if (c && c.endpoint && c.key && c.deployment) return c; } catch (e) {}
   return null;
+}
+function loadVertex() {
+  const projectId = (process.env.GCP_PROJECT_ID || '').trim();
+  const region = (process.env.GCP_REGION || process.env.ANTHROPIC_VERTEX_REGION || 'us-central1').trim();
+  if (!projectId || !region) return null;
+  return {
+    projectId,
+    region,
+    models: {
+      pro: (process.env.VERTEX_MODEL_PRO || 'gemini-2.5-pro').trim(),
+      flash: (process.env.VERTEX_MODEL_FLASH || 'gemini-2.5-flash').trim(),
+      opus: (process.env.VERTEX_MODEL_OPUS || 'claude-opus-5').trim()
+    }
+  };
 }
 
 // Config de Azure Speech (para dictado por voz).
@@ -31,8 +57,80 @@ function loadSpeech() {
   return null;
 }
 
+// Config de X-Core local (Ollama runtime expuesto por local_ai/app.py).
+const XCORE_FILE = path.join(os.homedir(), '.hanstlers', 'xcore.json');
+function loadXCore() {
+  try {
+    const c = JSON.parse(fs.readFileSync(XCORE_FILE, 'utf8'));
+    if (c && c.endpoint) {
+      return {
+        endpoint: String(c.endpoint).replace(/\/$/, ''),
+        model: c.model || 'x-core:latest'
+      };
+    }
+  } catch (e) {}
+  return { endpoint: 'http://127.0.0.1:8009', model: 'x-core:latest' };
+}
+
+
+const XCORE_DEFAULT = { endpoint: 'http://127.0.0.1:8009', model: 'x-core:latest' };
+let xcoreCfgCache = null;
+let xcoreCfgMtimeMs = 0;
+let xcoreLastReloadAt = 0;
+let xcoreLastReloadError = '';
+let xcoreDrain = false;
+let xcoreInFlight = 0;
+
+function reloadXCore(force) {
+  try {
+    let mtime = 0;
+    try { mtime = fs.statSync(XCORE_FILE).mtimeMs || 0; } catch (e) { mtime = 0; }
+    if (!force && xcoreCfgCache && mtime === xcoreCfgMtimeMs) return xcoreCfgCache;
+    const cfg = loadXCore();
+    xcoreCfgCache = cfg || XCORE_DEFAULT;
+    xcoreCfgMtimeMs = mtime;
+    xcoreLastReloadAt = Date.now();
+    xcoreLastReloadError = '';
+    return xcoreCfgCache;
+  } catch (e) {
+    xcoreLastReloadError = e.message || String(e);
+    if (!xcoreCfgCache) xcoreCfgCache = XCORE_DEFAULT;
+    return xcoreCfgCache;
+  }
+}
+function currentXCore() { return reloadXCore(false); }
+function withXCoreRequest(done) {
+  xcoreInFlight += 1;
+  let finished = false;
+  return (code) => {
+    if (finished) return;
+    finished = true;
+    xcoreInFlight = Math.max(0, xcoreInFlight - 1);
+    done(code);
+  };
+}
+reloadXCore(true);
+
+const XCORE_AUDIO_EXT_RE = /\.(wav|mp3|flac|m4a|ogg|aac|webm|aif|aiff)$/i;
+function xcoreMimeFor(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  const map = {
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mpeg',
+    '.flac': 'audio/flac',
+    '.m4a': 'audio/mp4',
+    '.ogg': 'audio/ogg',
+    '.aac': 'audio/aac',
+    '.webm': 'audio/webm',
+    '.aif': 'audio/aiff',
+    '.aiff': 'audio/aiff'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+
 // ===== WHISPER LOCAL (offline, sin nube): whisper.cpp =====
-// Binario empaquetado junto a la app; modelo en ~/.hanstlers/whisper (se descarga la 1ª vez).
+// Binario empaquetado junto a la app; modelo en ~/.hanstlers/whisper (se descarga la 1Âª vez).
 const WHISPER_DIR = path.join(os.homedir(), '.hanstlers', 'whisper');
 const WHISPER_MODEL_NAME = 'ggml-base.bin';
 const WHISPER_MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin';
@@ -58,15 +156,15 @@ function whisperModelPath() {
 }
 function whisperAvailable() { return !!whisperCliPath(); }
 
-// Limpia el texto de whisper: quita tokens de ruido y alucinaciones típicas en silencio.
+// Limpia el texto de whisper: quita tokens de ruido y alucinaciones tÃ­picas en silencio.
 function cleanTranscript(t) {
   if (!t) return '';
   let s = String(t).replace(/\r/g, '').split('\n').map(x => x.trim()).filter(Boolean).join(' ').trim();
   s = s.replace(/\[[^\]]*\]/g, ' ').replace(/\*[^*]*\*/g, ' ');
-  s = s.replace(/\((?:m[uú]sica|risas|aplausos|silencio|ruido|sonido[^)]*)\)/gi, ' ');
+  s = s.replace(/\((?:m[uÃº]sica|risas|aplausos|silencio|ruido|sonido[^)]*)\)/gi, ' ');
   const junk = [
-    /subt[ií]tulos?[^.]*amara\.org/gi,
-    /subt[ií]tulos?\s+realizados?\s+por[^.]*/gi,
+    /subt[iÃ­]tulos?[^.]*amara\.org/gi,
+    /subt[iÃ­]tulos?\s+realizados?\s+por[^.]*/gi,
     /gracias por ver[^.]*/gi,
     /www\.[^\s]+/gi
   ];
@@ -78,7 +176,7 @@ let whisperDownloading = false;
 function ensureWhisperModel(cb) {
   const existing = whisperModelPath();
   if (existing) return cb(null, existing);
-  if (whisperDownloading) return cb(new Error('El modelo de voz se está descargando, intenta en unos segundos.'));
+  if (whisperDownloading) return cb(new Error('El modelo de voz se estÃ¡ descargando, intenta en unos segundos.'));
   whisperDownloading = true;
   try { fs.mkdirSync(WHISPER_DIR, { recursive: true }); } catch (e) {}
   const dest = path.join(WHISPER_DIR, WHISPER_MODEL_NAME);
@@ -87,7 +185,7 @@ function ensureWhisperModel(cb) {
   const get = (url) => {
     https.get(url, (resp) => {
       if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) { resp.resume(); return get(resp.headers.location); }
-      if (resp.statusCode !== 200) { whisperDownloading = false; file.close(); try { fs.unlinkSync(tmp); } catch (e) {} return cb(new Error('Descarga del modelo falló: ' + resp.statusCode)); }
+      if (resp.statusCode !== 200) { whisperDownloading = false; file.close(); try { fs.unlinkSync(tmp); } catch (e) {} return cb(new Error('Descarga del modelo fallÃ³: ' + resp.statusCode)); }
       resp.pipe(file);
       file.on('finish', () => { file.close(() => { try { fs.renameSync(tmp, dest); } catch (e) {} whisperDownloading = false; cb(null, dest); }); });
     }).on('error', (e) => { whisperDownloading = false; try { fs.unlinkSync(tmp); } catch (_) {} cb(e); });
@@ -107,11 +205,11 @@ function transcribeLocal(wavBuffer, cb) {
       fs.writeFileSync(tmp, wavBuffer);
     } catch (e) { return cb(e); }
     const args = ['-m', model, '-f', tmp, '-l', 'es', '-nt', '-np', '-t', String(Math.max(2, Math.min(8, (os.cpus() || []).length || 4)))];
-    const child = spawn(cli, args, { cwd: path.dirname(cli) });
+    const child = spawn(cli, args, { cwd: path.dirname(cli), windowsHide: true });
     let out = '', errOut = '';
     let finished = false;
     const done = (e, txt) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (_) {} try { fs.unlinkSync(tmp); } catch (_) {} cb(e, txt); };
-    const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done(new Error('Transcripción local excedió el tiempo')); }, 120000);
+    const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done(new Error('TranscripciÃ³n local excediÃ³ el tiempo')); }, 120000);
     child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (errOut += d));
     child.on('close', () => {
@@ -143,7 +241,7 @@ function transcribeSpeech(audioBuffer, contentType, cb) {
       try {
         const j = JSON.parse(body);
         cb(null, (j.DisplayText || j.NBest && j.NBest[0] && j.NBest[0].Display || '').trim());
-      } catch (e) { cb(new Error('Respuesta inválida: ' + body.slice(0, 150))); }
+      } catch (e) { cb(new Error('Respuesta invÃ¡lida: ' + body.slice(0, 150))); }
     });
   });
   req.on('error', (e) => cb(e));
@@ -178,17 +276,20 @@ function synthSpeech(text, cb) {
   req.end();
 }
 
-function runAzure(message, history, send, onDone, onAbort, images) {
+function runAzure(message, history, historySummary, send, onDone, onAbort, images) {
   const cfg = loadAzure();
-  if (!cfg) { send('error', 'Azure no está configurado.'); return onDone(1); }
+  if (!cfg) { send('error', 'Azure no estÃ¡ configurado.'); return onDone(1); }
   const ep = cfg.endpoint.replace(/\/$/, '');
   const url = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
   const messages = [];
-  messages.push({ role: 'system', content: 'Eres HanstlerS, asistente personal de Cesar. Responde en español, conciso y directo.' });
+  messages.push({ role: 'system', content: 'Eres HanstlerS, asistente personal de Cesar. Responde en espaÃ±ol, conciso y directo.' });
+  if (historySummary) {
+    messages.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
+  }
   (history || []).forEach((m) => messages.push(m));
-  // Si hay imágenes, el mensaje del usuario va como contenido multimodal (texto + imágenes).
+  // Si hay imÃ¡genes, el mensaje del usuario va como contenido multimodal (texto + imÃ¡genes).
   if (images && images.length) {
-    const content = [{ type: 'text', text: message || '¿Qué ves en esta imagen?' }];
+    const content = [{ type: 'text', text: message || 'Â¿QuÃ© ves en esta imagen?' }];
     images.forEach((im) => content.push({ type: 'image_url', image_url: { url: im } }));
     messages.push({ role: 'user', content });
   } else {
@@ -226,21 +327,601 @@ function runAzure(message, history, send, onDone, onAbort, images) {
   req.end();
 }
 
+function resolveGcloudInvocation() {
+  const baseArgs = ['auth', 'application-default', 'print-access-token'];
+  const override = (process.env.GCLOUD_BIN || '').trim();
+  const cands = [];
+  if (override) cands.push(override);
+  if (process.platform === 'win32') {
+    cands.push(path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.cmd'));
+    cands.push(path.join(process.env['ProgramFiles'] || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.cmd'));
+    cands.push(path.join(process.env.LOCALAPPDATA || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.cmd'));
+    cands.push(path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.exe'));
+    cands.push(path.join(process.env['ProgramFiles'] || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.exe'));
+    cands.push(path.join(process.env.LOCALAPPDATA || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.exe'));
+    cands.push(path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.ps1'));
+    cands.push(path.join(process.env['ProgramFiles'] || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.ps1'));
+    cands.push(path.join(process.env.LOCALAPPDATA || '', 'Google', 'Cloud SDK', 'google-cloud-sdk', 'bin', 'gcloud.ps1'));
+  }
+  for (const cand of cands) {
+    if (!cand) continue;
+    try {
+      if (!fs.existsSync(cand)) continue;
+      if (/\.cmd$/i.test(cand)) {
+        const psPath = cand.replace(/'/g, "''");
+        return {
+          bin: 'powershell.exe',
+          args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "& '" + psPath + "' " + baseArgs.join(' ')]
+        };
+      }
+      if (/\.ps1$/i.test(cand)) {
+        return {
+          bin: 'powershell.exe',
+          args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', cand].concat(baseArgs)
+        };
+      }
+      return { bin: cand, args: baseArgs };
+    } catch (e) {}
+  }
+  if (process.platform === 'win32') {
+    return { bin: 'cmd.exe', args: ['/d', '/s', '/c', 'gcloud auth application-default print-access-token'] };
+  }
+  return { bin: 'gcloud', args: baseArgs };
+}
+
+function pickTokenFromOutput(raw) {
+  const lines = String(raw || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (/^[A-Za-z0-9._-]{20,}$/.test(line)) return line;
+  }
+  return '';
+}
+
+function getGcpAccessToken(cb) {
+  const inv = resolveGcloudInvocation();
+  let child;
+  try {
+    child = spawn(inv.bin, inv.args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    return cb(e);
+  }
+  let out = '';
+  let err = '';
+  let done = false;
+  const finish = (e, token) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    cb(e, token);
+  };
+  const timer = setTimeout(() => {
+    try { child.kill(); } catch (e) {}
+    finish(new Error('gcloud timeout'));
+  }, 15000);
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { err += d.toString(); });
+  child.on('error', (e) => finish(e));
+  child.on('close', (code) => {
+    if (code !== 0) return finish(new Error(('gcloud auth failed: ' + (err || ('exit ' + code))).trim()));
+    const token = pickTokenFromOutput(out);
+    if (!token) return finish(new Error('gcloud returned empty token'));
+    finish(null, token);
+  });
+}
+
+function summarizeVertexError(statusCode, raw) {
+  const code = Number(statusCode) || 0;
+  let msg = '';
+  try {
+    const j = JSON.parse(String(raw || '{}'));
+    msg = String((j && j.error && j.error.message) || '').trim();
+  } catch (e) {}
+  const low = (msg || String(raw || '')).toLowerCase();
+  if ((code === 429) || /quota exceeded|resource_exhausted|rate limit|too many requests/.test(low)) return 'Vertex no disponible: cuota/rate-limit agotado. Sube cuota de Vertex o espera el reset.';
+  if (code === 403 && /billing/.test(low)) return 'Vertex no disponible: habilita billing en el proyecto GCP.';
+  if (code === 403 && /permission denied|permission_denied|denied/.test(low)) return 'Vertex no disponible: faltan permisos IAM para ese proyecto/modelo.';
+  if (code === 401 || /unauthenticated|invalid_grant|login required/.test(low)) return 'Vertex no disponible: autentica ADC con gcloud.';
+  if (code) return 'Vertex no disponible (HTTP ' + code + ').';
+  return 'Vertex no disponible temporalmente.';
+}
+
+function isVertexOnlyMode(selectedModel) {
+  const forced = String(process.env.HANSTLERS_VERTEX_ONLY || '').trim().toLowerCase();
+  if (forced === '1' || forced === 'true' || forced === 'yes' || forced === 'on') return true;
+  return String(selectedModel || '').trim().toLowerCase() === 'vertex-claude-opus-5';
+}
+
+function toGeminiContents(history, message, images) {
+  const out = [];
+  (Array.isArray(history) ? history : []).forEach((m) => {
+    const role = String(m && m.role || '').toLowerCase() === 'user' ? 'user' : 'model';
+    const txt = String(m && (m.content || m.html) || '').trim();
+    if (!txt) return;
+    out.push({ role, parts: [{ text: txt.slice(0, 2000) }] });
+  });
+  const userParts = [{ text: String(message || '') }];
+  (Array.isArray(images) ? images : []).slice(0, 4).forEach((im) => {
+    const mm = /^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i.exec(String(im || ''));
+    if (!mm) return;
+    userParts.push({ inlineData: { mimeType: mm[1], data: mm[2] } });
+  });
+  out.push({ role: 'user', parts: userParts });
+  return out;
+}
+
+function toAnthropicMessages(history, message) {
+  const out = [];
+  (Array.isArray(history) ? history : []).forEach((m) => {
+    const role = String(m && m.role || '').toLowerCase() === 'user' ? 'user' : 'assistant';
+    const txt = String(m && (m.content || m.html) || '').trim();
+    if (!txt) return;
+    out.push({ role, content: [{ type: 'text', text: txt.slice(0, 2000) }] });
+  });
+  out.push({ role: 'user', content: [{ type: 'text', text: String(message || '') }] });
+  return out;
+}
+
+function runVertex(message, history, historySummary, selectedVertexModel, send, onDone, onAbort, images) {
+  const cfg = loadVertex();
+  if (!cfg) return onDone(1, 'Vertex no configurado (GCP_PROJECT_ID/GCP_REGION).');
+  const pick = pickVertexTarget(selectedVertexModel, message, !!(images && images.length));
+  if (!pick.model) return onDone(1, 'No se pudo resolver modelo Vertex.');
+  try {
+    getGcpAccessToken((tokErr, token) => {
+    if (tokErr) return onDone(1, 'Vertex auth: ' + tokErr.message);
+    const publisher = pick.publisher || 'google';
+    const method = publisher === 'anthropic' ? 'rawPredict' : 'generateContent';
+    const endpoint = `https://${cfg.region}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/locations/${encodeURIComponent(cfg.region)}/publishers/${encodeURIComponent(publisher)}/models/${encodeURIComponent(pick.model)}:${method}`;
+    const u = new URL(endpoint);
+    const finalMsg = historySummary ? (`Resumen acumulado:\n${historySummary}\n\nMensaje actual:\n${message}`) : message;
+    const payload = publisher === 'anthropic'
+      ? JSON.stringify({
+        anthropic_version: 'vertex-2023-10-16',
+        messages: toAnthropicMessages(history, finalMsg),
+        temperature: 0.2,
+        max_tokens: 2048
+      })
+      : JSON.stringify({
+        contents: toGeminiContents(history, finalMsg, images),
+        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
+      });
+    let reqAborted = false;
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'POST',
+      timeout: 45000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token,
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (d) => { raw += d.toString(); if (raw.length > 2 * 1024 * 1024) raw = raw.slice(-2 * 1024 * 1024); });
+      resp.on('end', () => {
+        if (reqAborted) return;
+        if (resp.statusCode >= 400) {
+          return onDone(1, summarizeVertexError(resp.statusCode, raw));
+        }
+        let j = null;
+        try { j = JSON.parse(raw || '{}'); } catch (e) { return onDone(1, 'Vertex devolvió una respuesta inválida.'); }
+        let txt = '';
+        let promptTok = 0;
+        let outTok = 0;
+        if (publisher === 'anthropic') {
+          txt = Array.isArray(j.content)
+            ? j.content.map((p) => String(p && p.text || '')).join('').trim()
+            : String(j.output_text || '').trim();
+          const usage = j.usage || {};
+          promptTok = Number(usage.input_tokens);
+          outTok = Number(usage.output_tokens);
+        } else {
+          const parts = (((j || {}).candidates || [])[0] || {}).content || {};
+          txt = Array.isArray(parts.parts) ? parts.parts.map((p) => String(p && p.text || '')).join('').trim() : '';
+          const usage = j.usageMetadata || {};
+          promptTok = Number(usage.promptTokenCount);
+          outTok = Number(usage.candidatesTokenCount);
+        }
+        if (!txt) {
+          return onDone(1, 'Vertex devolvió respuesta vacía.');
+        }
+        send('route', { model: 'vertex:' + (publisher === 'anthropic' ? ('anthropic/' + pick.model) : pick.model), reason: pick.reason });
+        send('chunk', txt);
+        if ((Number.isFinite(promptTok) && promptTok > 0) || (Number.isFinite(outTok) && outTok > 0)) {
+          addGoogleTokens(pick.model, promptTok, outTok);
+          send('usage', { quota: quotaInfo(), google: googleQuotaInfo() });
+        }
+        return onDone(0);
+      });
+    });
+    req.on('error', (e) => { if (!reqAborted) onDone(1, 'Vertex error: ' + e.message); });
+    req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) {} });
+    if (onAbort) onAbort(() => { reqAborted = true; try { req.destroy(); } catch (e) {} });
+      req.write(payload);
+      req.end();
+    });
+  } catch (e) {
+    onDone(1, 'Vertex auth: ' + e.message);
+  }
+}
+
+function runXCore(message, history, send, onDone, onAbort) {
+  if (xcoreDrain) {
+    send('error', 'X-Core esta en mantenimiento temporal. Espera unos segundos y vuelve a intentar.');
+    return onDone(1);
+  }
+  onDone = withXCoreRequest(onDone);
+  const cfg = currentXCore();
+  const url = new URL(cfg.endpoint + '/v1/knowledge/ask');
+  let query = String(message || '').slice(0, 1800);
+  const isAudioAnalysis = /(?:^|\s)(analiza|analizar|revisa|review).*(track|cancion|canci[oó]n|tema)|\.(wav|mp3|flac|aiff|m4a)\b/i.test(query);
+  const wantsReferenceAnalysis = /\b(analiza|analizar|revisa)\b[\s\S]{0,40}\b(referencia|reference)\b/i.test(query) || /\b(bpm|tempo|genero|género)\b[\s\S]{0,30}\b(referencia)\b/i.test(query);
+  const wantsStyleProfile = /\b(crea|crear|arma|build)\b[\s\S]{0,40}\b(perfil|style)\b/i.test(query) && /\.(wav|mp3|flac|aiff|m4a)\b/i.test(query);
+  const wantsLoraJob = /\b(lora|fine[- ]?tune|entrena modelo|entrenar modelo)\b/i.test(query);
+  const hasProjectContinuation = /\b(v\d+|version\s*\d+|versi[oó]n\s*\d+|haz\s*v\d+)\b/i.test(query);
+  const needsAudioBrief = Array.isArray(history)
+    ? history.slice(-4).some((m) => ['bot','assistant'].includes(String(m && m.role || '').toLowerCase()) && /brief de producci(o|ó)n/i.test(String(m && (m.content || m.html) || '')))
+    : false;
+  const typoAudioGeneration = /\b(has|as)\s+una?\s+(cancion|canci[oó]n|track|beat|instrumental|melodia|melod[ií]a|sonido|sound|fx|efecto)\b/i.test(query);
+  const shortAudioRequest = /^\s*(una?|un)\s+(cancion|canci[oó]n|track|beat|instrumental|melodia|melod[ií]a|sonido|sound|fx|efecto)\b/i.test(query);
+  const wantsAudioGeneration = /\b(haz|hacer|crea|crear|genera|generar|produce|producir|make|generate)\b[\s\S]{0,60}\b(cancion|canci[oó]n|track|beat|instrumental|melodia|melod[ií]a|sonido|sound|fx|efecto)\b/i.test(query) || typoAudioGeneration || shortAudioRequest || needsAudioBrief || hasProjectContinuation;
+  if (wantsStyleProfile) {
+    const nameMatch = /(?:perfil|style)\s*[:=]\s*([a-zA-Z0-9_-]{3,})/i.exec(query);
+    const profileName = nameMatch && nameMatch[1] ? nameMatch[1] : 'mi-estilo';
+    const re = /@([a-zA-Z]:\\[^\n\r\t"'`]+?\.(wav|mp3|flac|aiff|m4a))/gi;
+    const paths = [];
+    let mm = null;
+    while ((mm = re.exec(query)) !== null) { if (mm[1]) paths.push(mm[1]); }
+    if (!paths.length) {
+      send('chunk', 'Para crear perfil de estilo, adjunta al menos un audio con @ruta.wav.');
+      return onDone(0);
+    }
+    const pUrl = new URL(cfg.endpoint + '/v1/audio/style-profile');
+    const payload = JSON.stringify({ name: profileName, audio_paths: paths });
+    const pReq = http.request({
+      hostname: pUrl.hostname,
+      port: Number(pUrl.port || 80),
+      path: pUrl.pathname + pUrl.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (d) => (raw += d.toString()));
+      resp.on('end', () => {
+        if (resp.statusCode >= 400) { send('error', 'X-Core ' + resp.statusCode + ': ' + raw.slice(0, 220)); return onDone(1); }
+        try {
+          const j = JSON.parse(raw || '{}');
+          if (!j.ok) { send('chunk', `No pude crear perfil: ${j.error || 'error desconocido'}`); return onDone(0); }
+          send('chunk', `Perfil de estilo creado: ${j.name}\nReferencias: ${j.references}\nBPM: ${j.bpm || 'n/d'}\nGenero: ${j.genre_guess || 'n/d'}\nArchivo perfil: ${j.profile_path}`);
+          return onDone(0);
+        } catch (e) { send('error', 'X-Core respuesta invalida'); return onDone(1); }
+      });
+    });
+    pReq.on('error', (e) => { send('error', 'X-Core error: ' + e.message); onDone(1); });
+    if (onAbort) onAbort(() => { try { pReq.destroy(); } catch (e) {} });
+    pReq.write(payload);
+    pReq.end();
+    return;
+  }
+  if (wantsLoraJob) {
+    const nameMatch = /(?:perfil|style)\s*[:=]\s*([a-zA-Z0-9_-]{3,})/i.exec(query);
+    const profileName = nameMatch && nameMatch[1] ? nameMatch[1] : 'mi-estilo';
+    const runNow = /\b(ahora|inicia|run now|start now)\b/i.test(query);
+    const re = /@([a-zA-Z]:\\[^\n\r\t"'`]+?\.(wav|mp3|flac|aiff|m4a))/gi;
+    const paths = [];
+    let mm = null;
+    while ((mm = re.exec(query)) !== null) { if (mm[1]) paths.push(mm[1]); }
+    const fUrl = new URL(cfg.endpoint + '/v1/audio/fine-tune-lora');
+    const payload = JSON.stringify({ profile_name: profileName, audio_paths: paths, run_now: runNow });
+    const fReq = http.request({
+      hostname: fUrl.hostname,
+      port: Number(fUrl.port || 80),
+      path: fUrl.pathname + fUrl.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (d) => (raw += d.toString()));
+      resp.on('end', () => {
+        if (resp.statusCode >= 400) { send('error', 'X-Core ' + resp.statusCode + ': ' + raw.slice(0, 220)); return onDone(1); }
+        try {
+          const j = JSON.parse(raw || '{}');
+          if (!j.ok) { send('chunk', `No pude preparar LoRA: ${j.message || j.error || 'error desconocido'}`); return onDone(0); }
+          send('chunk', `Pipeline LoRA listo para ${j.profile_name}.\nDataset: ${j.dataset_dir}\nJob: ${j.job_dir}\nComando: ${j.command}\nEstado: ${j.started ? 'iniciado' : 'preparado'}`);
+          return onDone(0);
+        } catch (e) { send('error', 'X-Core respuesta invalida'); return onDone(1); }
+      });
+    });
+    fReq.on('error', (e) => { send('error', 'X-Core error: ' + e.message); onDone(1); });
+    if (onAbort) onAbort(() => { try { fReq.destroy(); } catch (e) {} });
+    fReq.write(payload);
+    fReq.end();
+    return;
+  }
+  if (wantsReferenceAnalysis) {
+    const m = /@([a-zA-Z]:\\[^\n\r\t"'`]+?\.(wav|mp3|flac|aiff|m4a))/i.exec(query);
+    if (!m || !m[1]) {
+      send('chunk', 'Para analizar referencia, envia la ruta del audio con @ (ejemplo: @C:\\Users\\czumb\\Downloads\\track.wav).');
+      return onDone(0);
+    }
+    const refUrl = new URL(cfg.endpoint + '/v1/audio/analyze-reference');
+    const refPayload = JSON.stringify({ audio_path: m[1] });
+    const refReq = http.request({
+      hostname: refUrl.hostname,
+      port: Number(refUrl.port || 80),
+      path: refUrl.pathname + refUrl.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(refPayload) }
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (d) => (raw += d.toString()));
+      resp.on('end', () => {
+        if (resp.statusCode >= 400) {
+          send('error', 'X-Core ' + resp.statusCode + ': ' + raw.slice(0, 220));
+          return onDone(1);
+        }
+        try {
+          const j = JSON.parse(raw || '{}');
+          if (!j.ok) {
+            send('chunk', `No pude analizar referencia: ${j.error || 'error desconocido'}`);
+            return onDone(0);
+          }
+          const dur = j.duration_sec ? `${Math.round(j.duration_sec)}s` : 'n/d';
+          const bpm = j.bpm ? `${j.bpm} BPM` : 'BPM n/d';
+          const genre = j.genre_guess || 'género n/d';
+          const key = j.key_guess || 'clave n/d';
+          const rms = (j.energy_rms_db !== null && j.energy_rms_db !== undefined) ? `${j.energy_rms_db} dB RMS` : 'RMS n/d';
+          const sec = j.section_count || 0;
+          send('chunk', `Referencia analizada:\nArchivo: ${j.path}\nDuracion: ${dur}\nTempo: ${bpm}\nGenero estimado: ${genre}\nClave estimada: ${key}\nEnergia: ${rms}\nSecciones detectadas: ${sec}\nLoudness: ${j.loudness_lufs !== null && j.loudness_lufs !== undefined ? `${j.loudness_lufs} LUFS` : `LUFS n/d`} | True peak: ${j.true_peak_db !== null && j.true_peak_db !== undefined ? `${j.true_peak_db} dB` : `n/d`}\nCanales: ${j.channels || 'n/d'} | Sample rate: ${j.sample_rate || 'n/d'} Hz`);
+          return onDone(0);
+        } catch (e) {
+          send('error', 'X-Core respuesta invalida');
+          return onDone(1);
+        }
+      });
+    });
+    refReq.on('error', (e) => { send('error', 'X-Core error: ' + e.message); onDone(1); });
+    if (onAbort) onAbort(() => { try { refReq.destroy(); } catch (e) {} });
+    refReq.write(refPayload);
+    refReq.end();
+    return;
+  }
+  if (wantsAudioGeneration) {
+    const genUrl = new URL(cfg.endpoint + '/v1/audio/generate');
+    const briefUserContext = Array.isArray(history)
+      ? history
+          .filter((m) => String(m && m.role || '').toLowerCase() === 'user')
+          .slice(-4)
+          .map((m) => String(m.content || '').slice(0, 280))
+          .join('\n')
+      : '';
+    const generationPrompt = (needsAudioBrief || hasProjectContinuation) && briefUserContext ? `${briefUserContext}\n${query}` : query;
+    const qualityMode = /\b(pro|alta calidad|high quality|suno)\b/i.test(generationPrompt) ? 'pro' : 'auto';
+    const prevProject = Array.isArray(history)
+      ? (() => {
+          const joined = history.map((m) => String(m && (m.content || m.html) || '')).join('\n');
+          const mm = /Proyecto:\s*([a-z0-9-]{3,})/i.exec(joined);
+          return mm ? mm[1] : '';
+        })()
+      : '';
+    const genPayload = JSON.stringify({ prompt: generationPrompt, stems: true, project_name: prevProject || undefined, quality_mode: qualityMode });
+    const genReq = http.request({
+      hostname: genUrl.hostname,
+      port: Number(genUrl.port || 80),
+      path: genUrl.pathname + genUrl.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(genPayload) }
+    }, (resp) => {
+      let raw = '';
+      resp.on('data', (d) => (raw += d.toString()));
+      resp.on('end', () => {
+        if (resp.statusCode >= 400) {
+          send('error', 'X-Core ' + resp.statusCode + ': ' + raw.slice(0, 220));
+          return onDone(1);
+        }
+        try {
+          const j = JSON.parse(raw || '{}');
+          if (j.needs_input) {
+            const qs = Array.isArray(j.questions) ? j.questions : [];
+            const list = qs.map((q, i) => `${i + 1}. ${q}`).join('\n');
+            const intro = String(j.details || '').trim();
+            const header = intro ? (`Brief de produccion:\n${intro}\n\n`) : 'Brief de produccion (necesario):\n';
+            send('chunk', `${header}${list || '1. Define genero, BPM, caracter y duracion.'}`);
+            return onDone(0);
+          }
+          const mode = j.mode === 'sfx' ? 'sonido' : 'cancion/base';
+          const bpm = j.bpm ? ` | BPM: ${j.bpm}` : '';
+          const out = String(j.output_path || '').trim();
+          const proj = j.project ? `\nProyecto: ${j.project}` : '';
+          const ver = j.version ? `\nVersion: ${j.version}` : '';
+          const stems = (j.stems && typeof j.stems === 'object') ? Object.keys(j.stems) : [];
+          const stemsTxt = stems.length ? `\nStems: ${stems.join(', ')}` : '';
+          if (out && fs.existsSync(out) && XCORE_AUDIO_EXT_RE.test(out)) {
+            send('xcoreTrack', { path: out, name: path.basename(out) });
+          }
+          send('chunk', `Listo. Genere ${mode}${bpm}.${proj}${ver}\nArchivo: ${out}${stemsTxt}\n${j.details || ''}`);
+          return onDone(0);
+        } catch (e) {
+          send('error', 'X-Core respuesta invalida');
+          return onDone(1);
+        }
+      });
+    });
+    genReq.on('error', (e) => { send('error', 'X-Core error: ' + e.message); onDone(1); });
+    if (onAbort) onAbort(() => { try { genReq.destroy(); } catch (e) {} });
+    genReq.write(genPayload);
+    genReq.end();
+    return;
+  }
+  const recent = Array.isArray(history)
+    ? history.filter((m) => String(m && m.role || '').toLowerCase() === 'user').slice(-2)
+    : [];
+  if (recent.length && !isAudioAnalysis) {
+    const mini = recent
+      .map((m) => `${m.role || 'user'}: ${String(m.content || '').slice(0, 280)}`)
+      .join('\n');
+    query = `Contexto reciente:\n${mini}\n\nPregunta actual:\n${query}`;
+  }
+  const payload = JSON.stringify({
+    query: query,
+    model: cfg.model || 'x-core:latest',
+    top_k: 6,
+    temperature: 0.15,
+    max_tokens: 260
+  });
+  const req = http.request({
+    hostname: url.hostname,
+    port: Number(url.port || 80),
+    path: url.pathname + url.search,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+  }, (resp) => {
+    let raw = '';
+    resp.on('data', (d) => (raw += d.toString()));
+    resp.on('end', () => {
+      if (resp.statusCode >= 400) {
+        send('error', 'X-Core ' + resp.statusCode + ': ' + raw.slice(0, 220));
+        return onDone(1);
+      }
+      try {
+        const j = JSON.parse(raw || '{}');
+        const content = String(j.answer || '').trim();
+        if (content) send('chunk', content);
+        return onDone(0);
+      } catch (e) {
+        send('error', 'X-Core respuesta invalida');
+        return onDone(1);
+      }
+    });
+  });
+  req.on('error', (e) => { send('error', 'X-Core error: ' + e.message); onDone(1); });
+  if (onAbort) onAbort(() => { try { req.destroy(); } catch (e) {} });
+  req.write(payload);
+  req.end();
+}
+
 // ===== MODO AGENTE sobre Azure: el modelo usa herramientas (archivos/comandos) =====
+// Modo confianza total: sin confirmaciones para acciones del agente.
+let trustMode = true;
+
 const AGENT_TOOLS = [
   { type: 'function', function: { name: 'list_dir', description: 'Lista archivos y carpetas de un directorio', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Ruta (por defecto la carpeta de trabajo)' } } } } },
   { type: 'function', function: { name: 'read_file', description: 'Lee el contenido de un archivo de texto', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'write_file', description: 'Crea o sobrescribe un archivo con contenido', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
-  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza la primera aparición de un texto por otro (más rápido y barato que reescribir todo). Usa esto para cambios pequeños.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea único)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' } }, required: ['path', 'find', 'replace'] } } },
-  { type: 'function', function: { name: 'search_in_files', description: 'Busca un texto o patrón en todos los archivos del proyecto y devuelve las coincidencias con archivo y número de línea', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Carpeta donde buscar (por defecto la de trabajo)' } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'delete_file', description: 'Borra un archivo o carpeta (acción destructiva; se pedirá confirmación al usuario)', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza la primera apariciÃ³n de un texto por otro (mÃ¡s rÃ¡pido y barato que reescribir todo). Usa esto para cambios pequeÃ±os.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea Ãºnico)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' } }, required: ['path', 'find', 'replace'] } } },
+  { type: 'function', function: { name: 'search_in_files', description: 'Busca un texto o patrÃ³n en todos los archivos del proyecto y devuelve las coincidencias con archivo y nÃºmero de lÃ­nea', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Carpeta donde buscar (por defecto la de trabajo)' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'delete_file', description: 'Borra un archivo o carpeta', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'move_file', description: 'Mueve o renombra un archivo o carpeta', parameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] } } },
-  { type: 'function', function: { name: 'run_command', description: 'Ejecuta un comando de PowerShell en la carpeta de trabajo y devuelve la salida', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } }
+  { type: 'function', function: { name: 'run_command', description: 'Ejecuta un comando de PowerShell en la carpeta de trabajo y devuelve la salida', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+  { type: 'function', function: { name: 'open_browser', description: 'Abre una URL en el navegador predeterminado del sistema', parameters: { type: 'object', properties: { url: { type: 'string', description: 'URL a abrir (debe empezar con http:// o https://)' } }, required: ['url'] } } },
+  { type: 'function', function: { name: 'git_commit', description: 'Hace git add -A y git commit con el mensaje dado en la carpeta de trabajo', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Mensaje del commit' } }, required: ['message'] } } },
+  { type: 'function', function: { name: 'npm_run', description: 'Ejecuta un script de npm (package.json) en la carpeta de trabajo. Ãštil para build, test, lint, start, etc.', parameters: { type: 'object', properties: { script: { type: 'string', description: 'Nombre del script (ej: build, test, lint)' }, args: { type: 'string', description: 'Argumentos opcionales adicionales' } }, required: ['script'] } } },
+  { type: 'function', function: { name: 'notify', description: 'Muestra una notificaciÃ³n toast en Windows con un tÃ­tulo y mensaje', parameters: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } } }
 ];
 
 function resolveInCwd(p) {
   if (!p) return state.cwd;
   return path.isAbsolute(p) ? p : path.join(state.cwd, p);
+}
+function isMutatingTool(name) {
+  return name === 'write_file' || name === 'apply_patch' || name === 'delete_file' || name === 'move_file';
+}
+function isProtectedMainPath(p) {
+  const b = path.basename(String(p || '')).toLowerCase();
+  return /^main([._-]|$)/.test(b);
+}
+function isExplicitMainEditRequest(text) {
+  return /\b(main(?:[_-]qt)?\.(py|js|ts|tsx|jsx)|archivo\s+main|editar\s+main|modificar\s+main)\b/i.test(String(text || ''));
+}
+function operatorTargetLabel(name, args) {
+  if (name === 'move_file') return String(args.from || '') + ' → ' + String(args.to || '');
+  if (name === 'run_command') return String(args.command || '').slice(0, 120);
+  return String(args.path || args.url || '').slice(0, 120);
+}
+function buildOperatorSuggestion(name, args) {
+  const tgt = operatorTargetLabel(name, args);
+  if (name === 'open_browser') return 'Sugerencia: abriré la página y continuaré el flujo automáticamente.';
+  if (name === 'run_command') return 'Sugerencia: ejecutaré el comando en modo no interactivo y validaré el resultado.';
+  if (isMutatingTool(name)) return 'Sugerencia: aplicaré el cambio con rollback automático y post-check.';
+  return 'Sugerencia: validaré el resultado al terminar.';
+}
+function snapshotPathForRollback(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return { path: filePath, exists: false };
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) return { path: filePath, exists: true, kind: 'non-file' };
+    return { path: filePath, exists: true, kind: 'file', content: fs.readFileSync(filePath, 'utf8') };
+  } catch (e) {
+    return { path: filePath, exists: false, error: e.message };
+  }
+}
+function rollbackSnapshot(snap, cb) {
+  try {
+    if (!snap || !snap.path) return cb(null);
+    if (!snap.exists) {
+      if (fs.existsSync(snap.path)) fs.rmSync(snap.path, { force: true, recursive: false });
+      return cb(null);
+    }
+    if (snap.kind === 'file') {
+      fs.mkdirSync(path.dirname(snap.path), { recursive: true });
+      fs.writeFileSync(snap.path, snap.content || '');
+    }
+    cb(null);
+  } catch (e) { cb(e); }
+}
+function verifyPostCheck(tool, args, result, summary) {
+  try {
+    if (tool === 'write_file') {
+      const f = resolveInCwd(args.path);
+      if (!fs.existsSync(f)) return { ok: false, detail: 'post-check: archivo no existe' };
+      const now = fs.readFileSync(f, 'utf8');
+      if (sha256Hex(now) !== sha256Hex(String(args.content || ''))) return { ok: false, detail: 'post-check: contenido no coincide' };
+      return { ok: true, detail: 'post-check ok' };
+    }
+    if (tool === 'apply_patch') {
+      const f = resolveInCwd(args.path);
+      if (!fs.existsSync(f)) return { ok: false, detail: 'post-check: archivo no existe' };
+      const now = fs.readFileSync(f, 'utf8');
+      const repl = String(args.replace || '');
+      if (repl && now.indexOf(repl) === -1) return { ok: false, detail: 'post-check: reemplazo no encontrado' };
+      return { ok: true, detail: 'post-check ok' };
+    }
+    if (tool === 'delete_file') {
+      const f = resolveInCwd(args.path);
+      if (fs.existsSync(f)) return { ok: false, detail: 'post-check: ruta sigue existiendo' };
+      return { ok: true, detail: 'post-check ok' };
+    }
+    if (tool === 'move_file') {
+      const from = resolveInCwd(args.from);
+      const to = resolveInCwd(args.to);
+      if (!fs.existsSync(to)) return { ok: false, detail: 'post-check: destino no existe' };
+      if (fs.existsSync(from)) return { ok: false, detail: 'post-check: origen sigue existiendo' };
+      return { ok: true, detail: 'post-check ok' };
+    }
+    if (tool === 'open_browser') {
+      return /^https?:\/\//i.test(String(args.url || ''))
+        ? { ok: true, detail: 'post-check ok' }
+        : { ok: false, detail: 'post-check: url inválida' };
+    }
+    if (tool === 'run_command' || tool === 'npm_run' || tool === 'git_commit') {
+      const s = String(summary || '');
+      if (/\bexit\s+0\b/i.test(s)) return { ok: true, detail: 'post-check ok' };
+      return { ok: false, detail: 'post-check: comando sin exit 0' };
+    }
+    if (tool === 'list_dir') {
+      return result ? { ok: true, detail: 'post-check ok' } : { ok: false, detail: 'post-check: sin salida' };
+    }
+    if (tool === 'read_file') {
+      return (result !== undefined && result !== null) ? { ok: true, detail: 'post-check ok' } : { ok: false, detail: 'post-check: lectura vacía' };
+    }
+    if (tool === 'search_in_files' || tool === 'notify') {
+      return { ok: true, detail: 'post-check ok' };
+    }
+  } catch (e) {
+    return { ok: false, detail: 'post-check error: ' + e.message };
+  }
+  return { ok: true, detail: '' };
 }
 
 function execAgentTool(name, args, cb) {
@@ -248,12 +929,12 @@ function execAgentTool(name, args, cb) {
     if (name === 'list_dir') {
       const dir = resolveInCwd(args.path);
       const items = fs.readdirSync(dir, { withFileTypes: true }).slice(0, 200).map(e => (e.isDirectory() ? '[dir] ' : '') + e.name);
-      return cb(items.join('\n') || '(vacío)', items.length + ' elementos');
+      return cb(items.join('\n') || '(vacÃ­o)', items.length + ' elementos');
     }
     if (name === 'read_file') {
       const f = resolveInCwd(args.path);
       const data = fs.readFileSync(f, 'utf8');
-      return cb(data.slice(0, 20000), data.split('\n').length + ' líneas');
+      return cb(data.slice(0, 20000), data.split('\n').length + ' lÃ­neas');
     }
     if (name === 'write_file') {
       const f = resolveInCwd(args.path);
@@ -266,18 +947,18 @@ function execAgentTool(name, args, cb) {
       if (!fs.existsSync(f)) return cb('Error: el archivo no existe: ' + f, 'no existe');
       const orig = fs.readFileSync(f, 'utf8');
       const find = String(args.find || '');
-      if (!find) return cb('Error: "find" vacío', 'error');
+      if (!find) return cb('Error: "find" vacÃ­o', 'error');
       const idx = orig.indexOf(find);
-      if (idx === -1) return cb('Error: no se encontró el texto a reemplazar. Lee el archivo de nuevo y copia el fragmento exacto.', 'no encontrado');
+      if (idx === -1) return cb('Error: no se encontrÃ³ el texto a reemplazar. Lee el archivo de nuevo y copia el fragmento exacto.', 'no encontrado');
       const updated = orig.slice(0, idx) + String(args.replace || '') + orig.slice(idx + find.length);
       fs.writeFileSync(f, updated);
       const before = orig.slice(0, idx).split('\n').length;
-      return cb('Parche aplicado en ' + f + ' (línea ~' + before + ')', 'editado línea ~' + before);
+      return cb('Parche aplicado en ' + f + ' (lÃ­nea ~' + before + ')', 'editado lÃ­nea ~' + before);
     }
     if (name === 'search_in_files') {
       const root = resolveInCwd(args.path);
       const q = String(args.query || '');
-      if (!q) return cb('Error: consulta vacía', 'error');
+      if (!q) return cb('Error: consulta vacÃ­a', 'error');
       const skip = new Set(['node_modules', '.git', 'dist', 'build', '.venv', '__pycache__', 'vendor']);
       const results = [];
       const ql = q.toLowerCase();
@@ -314,22 +995,63 @@ function execAgentTool(name, args, cb) {
       const to = resolveInCwd(args.to);
       fs.mkdirSync(path.dirname(to), { recursive: true });
       fs.renameSync(from, to);
-      return cb('Movido: ' + from + ' → ' + to, 'movido');
+      return cb('Movido: ' + from + ' â†’ ' + to, 'movido');
     }
     if (name === 'run_command') {
-      // Neutralizar patrones que cuelgan la consola en modo automático (no interactivo).
+      // Neutralizar patrones que cuelgan la consola en modo automÃ¡tico (no interactivo).
       let cmd = String(args.command || '');
       cmd = cmd.replace(/(^|\s)-NoExit\b/gi, ' ').replace(/(^|\s)\/k\b/gi, ' ');
-      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { cwd: state.cwd });
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { cwd: state.cwd, windowsHide: true });
       let out = '';
       let finished = false;
       const done = (txt, summary) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (e) {} cb(txt, summary); };
-      const timer = setTimeout(() => { try { child.kill(); } catch (e) {} done('(cancelado: el comando superó 60s. Evita comandos interactivos o que abran ventanas persistentes.)\n' + out.slice(0, 8000), 'cancelado (>60s)'); }, 60000);
+      const timer = setTimeout(() => { try { child.kill(); } catch (e) {} done('(cancelado: el comando superÃ³ 60s. Evita comandos interactivos o que abran ventanas persistentes.)\n' + out.slice(0, 8000), 'cancelado (>60s)'); }, 60000);
       try { child.stdin.end(); } catch (e) {}
       child.stdout.on('data', d => (out += d));
       child.stderr.on('data', d => (out += d));
       child.on('close', (code) => done('(exit ' + code + ')\n' + out.slice(0, 8000), 'exit ' + code));
       child.on('error', e => done('Error: ' + e.message, 'error'));
+      return;
+    }
+    if (name === 'open_browser') {
+      const url = String(args.url || '');
+      if (!/^https?:\/\//i.test(url)) return cb('Error: URL invÃ¡lida (debe empezar con http:// o https://)', 'error');
+      // Usar el shell de Windows para abrir el navegador predeterminado.
+      const child = spawn('cmd.exe', ['/d', '/s', '/c', 'start', '', url], { windowsHide: true });
+      child.on('close', () => cb('Abierto en el navegador: ' + url, 'abierto'));
+      child.on('error', e => cb('Error: ' + e.message, 'error'));
+      return;
+    }
+    if (name === 'git_commit') {
+      const msg = String(args.message || 'chore: update').replace(/"/g, "'");
+      const child = spawn('cmd.exe', ['/d', '/s', '/c', 'git add -A && git commit -m "' + msg + '"'], { cwd: state.cwd, windowsHide: true });
+      let out = ''; let finished = false;
+      const done = (txt, s) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (e) {} cb(txt, s); };
+      const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done('(timeout)', 'timeout'); }, 30000);
+      child.stdout.on('data', d => (out += d)); child.stderr.on('data', d => (out += d));
+      child.on('close', code => done('(exit ' + code + ')\n' + out.slice(0, 4000), 'exit ' + code));
+      child.on('error', e => done('Error: ' + e.message, 'error'));
+      return;
+    }
+    if (name === 'npm_run') {
+      const script = String(args.script || '').replace(/[^a-zA-Z0-9:_-]/g, '');
+      const extra = args.args ? ' ' + String(args.args).slice(0, 200) : '';
+      const child = spawn('cmd.exe', ['/d', '/s', '/c', 'npm run ' + script + extra], { cwd: state.cwd, windowsHide: true });
+      let out = ''; let finished = false;
+      const done = (txt, s) => { if (finished) return; finished = true; try { clearTimeout(timer); } catch (e) {} cb(txt, s); };
+      const timer = setTimeout(() => { try { child.kill(); } catch (_) {} done('(cancelado >120s)\n' + out.slice(0, 8000), 'timeout'); }, 120000);
+      child.stdout.on('data', d => (out += d)); child.stderr.on('data', d => (out += d));
+      child.on('close', code => done('(exit ' + code + ')\n' + out.slice(0, 8000), 'exit ' + code));
+      child.on('error', e => done('Error: ' + e.message, 'error'));
+      return;
+    }
+    if (name === 'notify') {
+      const title = String(args.title || 'HanstlerS').replace(/'/g, '').slice(0, 60);
+      const msg = String(args.message || '').replace(/'/g, '').slice(0, 200);
+      const ps = `Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(4000, '${title}', '${msg}', [System.Windows.Forms.ToolTipIcon]::None); Start-Sleep 5; $n.Visible = $false`;
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true });
+      child.on('close', () => cb('NotificaciÃ³n enviada: ' + title, 'notificado'));
+      child.on('error', e => cb('Error: ' + e.message, 'error'));
       return;
     }
     cb('Herramienta desconocida: ' + name);
@@ -352,9 +1074,99 @@ function azureChat(cfg, messages, tools, cb) {
   req.write(payload); req.end();
 }
 
+// VersiÃ³n streaming de azureChat: llama onChunk(delta) por cada token y onDone(err) al final.
+// Usar cuando NO se necesita leer tool_calls (solo texto libre).
+function azureChatStream(cfg, messages, onChunk, onDone) {
+  const ep = cfg.endpoint.replace(/\/$/, '');
+  const u = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
+  const body = { messages, stream: true };
+  const payload = JSON.stringify(body);
+  const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': cfg.key, 'Content-Length': Buffer.byteLength(payload) } },
+    (resp) => {
+      if (resp.statusCode >= 400) {
+        let e = ''; resp.on('data', d => (e += d));
+        resp.on('end', () => onDone(new Error('Azure ' + resp.statusCode + ': ' + e.slice(0, 200))));
+        return;
+      }
+      let buf = '';
+      resp.on('data', (d) => {
+        buf += d.toString();
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith('data:')) continue;
+          const data = t.slice(5).trim();
+          if (data === '[DONE]') continue;
+          try { const j = JSON.parse(data); const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content; if (delta) onChunk(delta); } catch (e) {}
+        }
+      });
+      resp.on('end', () => onDone(null));
+    });
+  req.on('error', e => onDone(e));
+  req.write(payload); req.end();
+}
+
+// VersiÃ³n streaming con herramientas: streamea texto EN VIVO y acumula tool_calls.
+// cb(err, message) al terminar â€” message tiene la misma forma que choices[0].message.
+function azureChatStreamTools(cfg, messages, tools, onChunk, cb) {
+  const ep = cfg.endpoint.replace(/\/$/, '');
+  const u = new URL(ep + '/openai/deployments/' + cfg.deployment + '/chat/completions?api-version=' + (cfg.apiVersion || '2024-10-21'));
+  const body = { messages, stream: true }; if (tools) body.tools = tools;
+  const payload = JSON.stringify(body);
+  // Acumuladores de delta
+  let textContent = '';
+  const toolCallMap = {}; // index -> {id, type, function:{name, arguments}}
+  const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': cfg.key, 'Content-Length': Buffer.byteLength(payload) } },
+    (resp) => {
+      if (resp.statusCode >= 400) {
+        let e = ''; resp.on('data', d => (e += d));
+        resp.on('end', () => cb(new Error('Azure ' + resp.statusCode + ': ' + e.slice(0, 200))));
+        return;
+      }
+      let buf = '';
+      resp.on('data', (d) => {
+        buf += d.toString();
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith('data:')) continue;
+          const data = t.slice(5).trim();
+          if (data === '[DONE]') continue;
+          try {
+            const j = JSON.parse(data);
+            const delta = j.choices && j.choices[0] && j.choices[0].delta;
+            if (!delta) continue;
+            // Texto: streamear en vivo
+            if (delta.content) { textContent += delta.content; onChunk(delta.content); }
+            // Tool calls: acumular deltas
+            if (delta.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                if (!toolCallMap[tc.index]) toolCallMap[tc.index] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+                const entry = toolCallMap[tc.index];
+                if (tc.id) entry.id += tc.id;
+                if (tc.function && tc.function.name) entry.function.name += tc.function.name;
+                if (tc.function && tc.function.arguments) entry.function.arguments += tc.function.arguments;
+              }
+            }
+          } catch (e) {}
+        }
+      });
+      resp.on('end', () => {
+        const tool_calls = Object.keys(toolCallMap).sort((a, b) => a - b).map(k => toolCallMap[k]);
+        const msg = { role: 'assistant', content: textContent || null };
+        if (tool_calls.length) msg.tool_calls = tool_calls;
+        cb(null, msg);
+      });
+    });
+  req.on('error', e => cb(e));
+  req.write(payload); req.end();
+}
+
 // Confirmaciones pendientes de comandos peligrosos: id -> resolve(boolean)
 const pendingConfirms = {};
-// Detecta si una acción es destructiva y merece confirmación del usuario.
+// Detecta si una acciÃ³n es destructiva y merece confirmaciÃ³n del usuario.
 function dangerReason(name, args) {
   if (name === 'delete_file') return 'Borrar ' + (args.path || '');
   if (name === 'run_command') {
@@ -366,86 +1178,17 @@ function dangerReason(name, args) {
   return null;
 }
 
-// ===== Contexto persistente del agente =====
-// El transcript COMPLETO (incluidos los mensajes role:'tool' con el contenido real de
-// lo que el agente leyo o ejecuto) vive AQUI, en el servidor, indexado por conversacion.
-// Antes el contexto se rearmaba en el cliente raspando el HTML de las burbujas, lo que
-// descartaba toda llamada a herramienta y su resultado: en el turno siguiente el modelo
-// sabia QUE habia leido un archivo pero no QUE decia, y volvia a leerlo una y otra vez.
-const AGENT_CTX_MAX_CHARS = 200000;
-
-// El transcript tambien va a DISCO. Sin esto vivia solo en memoria y bastaba con
-// cerrar la app para que el agente olvidara por completo el hilo de trabajo.
-// Carpeta aparte de 'conversations' a proposito: listConversations() lee todo *.json
-// de ahi y tomaria estos archivos por conversaciones.
-const AGENT_DIR = path.join(os.homedir(), '.hanstlers', 'agent');
-function agentFile(id) { return path.join(AGENT_DIR, String(id).replace(/[^a-z0-9_-]/gi, '') + '.json'); }
-function saveAgentTranscript(convId, msgs) {
-  if (!convId) return;
-  try {
-    fs.mkdirSync(AGENT_DIR, { recursive: true });
-    fs.writeFileSync(agentFile(convId), JSON.stringify(msgs));
-  } catch (e) {}
-}
-function loadAgentTranscript(convId) {
-  if (!convId) return null;
-  try {
-    const m = JSON.parse(fs.readFileSync(agentFile(convId), 'utf8'));
-    return (Array.isArray(m) && m.length) ? m : null;
-  } catch (e) { return null; }
-}
-function deleteAgentTranscript(convId) { try { fs.unlinkSync(agentFile(convId)); } catch (e) {} }
-
-function msgSize(m) { try { return JSON.stringify(m).length; } catch (e) { return 0; } }
-
-// Recorta el transcript por el principio conservando siempre el system prompt.
-// Nunca deja un mensaje role:'tool' huerfano al frente: la API devuelve 400 si un
-// mensaje 'tool' no va precedido del 'assistant' que lo solicito.
-function trimAgentMessages(msgs, maxChars) {
-  if (!Array.isArray(msgs) || msgs.length < 2) return Array.isArray(msgs) ? msgs : [];
-  const limit = maxChars || AGENT_CTX_MAX_CHARS;
-  const sys = msgs[0];
-  const rest = msgs.slice(1);
-  let total = msgSize(sys);
-  for (let i = 0; i < rest.length; i++) total += msgSize(rest[i]);
-  let cut = 0;
-  while (cut < rest.length && total > limit) { total -= msgSize(rest[cut]); cut++; }
-  while (cut < rest.length && rest[cut] && rest[cut].role === 'tool') cut++;
-  if (cut === 0) return msgs;
-  return [sys].concat(rest.slice(cut));
-}
-
-// Reanuda el transcript guardado de esta conversacion; si no hay, arranca uno nuevo
-// con el historial que mando el cliente.
-function buildAgentMessages(convId, history, systemMsg) {
-  state.convAgentMessages = state.convAgentMessages || {};
-  let prior = convId ? state.convAgentMessages[convId] : null;
-  // Respaldo en disco: cubre el caso de haber reiniciado la app a mitad de un trabajo.
-  if (!(Array.isArray(prior) && prior.length)) prior = loadAgentTranscript(convId);
-  if (Array.isArray(prior) && prior.length) {
-    const m = prior.slice();
-    m[0] = systemMsg; // refrescar el system prompt: la carpeta de trabajo pudo cambiar
-    return m;
-  }
-  const m = [systemMsg];
-  (history || []).forEach((h) => m.push(h));
-  return m;
-}
-
-// El modelo suele ANUNCIAR lo que hara y devolver el turno sin llamar a ninguna
-// herramienta ("Voy a revisar los archivos..."). El bucle lo tomaba por respuesta final
-// y cerraba el trabajo ahi: de ahi los "jobs muy cortos que nunca ejecutan nada".
-const ANNOUNCE_RE = /(voy a |vamos a |procedo a |procedere|ahora (voy|procedo|revis|le|cre|ejecut|busc)|dejame |permiteme |empezare|empiezo por|comenzare|primero (voy|le|revis)|a continuacion (voy|le)|revisare|leere|creare|escribire|ejecutare|buscare|manos a la obra|I'll |let me |I will |I'm going to |next,? I)/i;
-
-function runAzureAgent(message, history, send, onDone, onAbort, images, convId) {
+function runAzureAgent(message, history, historySummary, send, onDone, onAbort, images) {
   const cfg = loadAzure();
   if (!cfg) { send('error', 'Azure no configurado'); return onDone(1); }
   let aborted = false;
   if (onAbort) onAbort(() => { aborted = true; });
-  const systemMsg =
-    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. Estás en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '. Usa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tú mismo (no solo expliques). SÉ DECIDIDO Y AUTÓNOMO: si la intención está clara, ACTÚA de inmediato sin pedir permiso ni confirmación. NO preguntes "¿quieres que...?", "¿procedo?", "¿te gustaría?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acción es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leíste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parámetros. Responde en español, conciso. Cuando termines, resume lo que hiciste.' }
-  ;
-  const messages = buildAgentMessages(convId, history, systemMsg);
+  const messages = [
+    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. EstÃ¡s en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nUsa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tÃº mismo (no solo expliques). SÃ‰ DECIDIDO Y AUTÃ“NOMO: si la intenciÃ³n estÃ¡ clara, ACTÃšA de inmediato sin pedir permiso ni confirmaciÃ³n. NO preguntes "Â¿quieres que...?", "Â¿procedo?", "Â¿te gustarÃ­a?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acciÃ³n es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leÃ­ste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parÃ¡metros. Responde en espaÃ±ol, conciso. Cuando termines, resume lo que hiciste.' },
+    { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la pÃ¡gina tÃº con la herramienta de navegador y ejecuta el flujo tÃº mismo. No le pidas al usuario que navegue manualmente.' }
+  ];
+  if (historySummary) messages.push({ role: 'system', content: 'Resumen acumulado de la conversación previa:\n' + historySummary });
+  (history || []).forEach(m => messages.push(m));
   if (images && images.length) {
     const content = [{ type: 'text', text: message }];
     images.forEach((im) => content.push({ type: 'image_url', image_url: { url: im } }));
@@ -455,92 +1198,121 @@ function runAzureAgent(message, history, send, onDone, onAbort, images, convId) 
   }
 
   let steps = 0;
-  let nudges = 0;
-  let toolsUsed = 0;
   const MAX_STEPS = 40;
-  const MAX_NUDGES = 2;
-  const saveTranscript = () => {
-    if (!convId) return;
-    state.convAgentMessages = state.convAgentMessages || {};
-    const trimmed = trimAgentMessages(messages, AGENT_CTX_MAX_CHARS);
-    state.convAgentMessages[convId] = trimmed;
-    saveAgentTranscript(convId, trimmed);
-  };
-  const iconOf = (n) => ({ list_dir: '📂', read_file: '📄', write_file: '✍️', apply_patch: '🩹', search_in_files: '🔎', delete_file: '🗑️', move_file: '📦', run_command: '⚙️' }[n] || '🔧');
-  // Ejecuta una herramienta, pidiendo confirmación si es peligrosa.
+  const OP_DELAY_MS = 4000;
+  const iconOf = (n) => ({ list_dir: 'ðŸ“‚', read_file: 'ðŸ“„', write_file: 'âœï¸', apply_patch: 'ðŸ©¹', search_in_files: 'ðŸ”Ž', delete_file: 'ðŸ—‘ï¸', move_file: 'ðŸ“¦', run_command: 'âš™ï¸' }[n] || 'ðŸ”§');
+  // Ejecuta una herramienta, pidiendo confirmaciÃ³n si es peligrosa.
   function runToolGated(tc, args, whenDone) {
-    const reason = dangerReason(tc.function.name, args);
-    if (!reason) {
-      return execAgentTool(tc.function.name, args, (result, summary) => whenDone(result, summary));
+    const toolName = tc.function.name;
+    const opMode = !!currentFeatures().operatorMode;
+    const mainTouchedPath = toolName === 'move_file' ? (args.to || args.from || '') : (args.path || '');
+    if (isMutatingTool(toolName) && isProtectedMainPath(mainTouchedPath) && !isExplicitMainEditRequest(message)) {
+      return whenDone('Bloqueado: no edito archivos main* sin orden explícita del usuario.', 'bloqueado-main');
     }
-    // Pedir confirmación al usuario y esperar su decisión.
-    const cid = 'cf_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-    send('status', 'Esperando tu confirmación…');
-    send('confirm', { id: cid, reason: reason, tool: tc.function.name });
-    let settled = false;
-    const timer = setTimeout(() => { if (!settled) { settled = true; delete pendingConfirms[cid]; whenDone('Acción cancelada: el usuario no confirmó a tiempo.', 'sin confirmar'); } }, 120000);
-    pendingConfirms[cid] = (approved) => {
-      if (settled) return; settled = true; clearTimeout(timer); delete pendingConfirms[cid];
-      if (approved) {
-        send('chunk', ' ▶️ aprobado');
-        execAgentTool(tc.function.name, args, (result, summary) => whenDone(result, summary));
-      } else {
-        send('chunk', ' ✋ rechazado por el usuario');
-        whenDone('El usuario RECHAZÓ esta acción. No la ejecutes; busca otra forma o continúa con el resto de la tarea.', 'rechazado');
-      }
+    const execute = () => {
+      const mut = isMutatingTool(toolName);
+      const snaps = mut ? {
+        main: snapshotPathForRollback(resolveInCwd(args.path)),
+        from: toolName === 'move_file' ? snapshotPathForRollback(resolveInCwd(args.from)) : null,
+        to: toolName === 'move_file' ? snapshotPathForRollback(resolveInCwd(args.to)) : null
+      } : null;
+      execAgentTool(toolName, args, (result, summary) => {
+        const chk = verifyPostCheck(toolName, args, result, summary);
+        if (!mut) {
+          if (chk.ok) return whenDone(result, ((summary || '') + ' · post-check ok').trim());
+          return whenDone((String(result || '') + '\n⚠️ ' + chk.detail).trim(), ((summary || '') + ' · post-check falló').trim());
+        }
+        if (chk.ok) return whenDone(result, ((summary || '') + ' · post-check ok').trim());
+        if (toolName === 'move_file') {
+          try {
+            const from = resolveInCwd(args.from);
+            const to = resolveInCwd(args.to);
+            if (fs.existsSync(to)) {
+              fs.mkdirSync(path.dirname(from), { recursive: true });
+              fs.renameSync(to, from);
+            }
+          } catch (e) {}
+          if (snaps && snaps.to) rollbackSnapshot(snaps.to, () => {});
+          return whenDone((String(result || '') + '\n⚠️ ' + chk.detail + '. Se aplicó rollback automático.').trim(), 'rollback automático');
+        }
+        rollbackSnapshot(snaps && snaps.main, (rbErr) => {
+          if (rbErr) return whenDone((String(result || '') + '\n⚠️ ' + chk.detail + '. Falló rollback: ' + rbErr.message).trim(), 'post-check falló');
+          return whenDone((String(result || '') + '\n⚠️ ' + chk.detail + '. Se aplicó rollback automático.').trim(), 'rollback automático');
+        });
+      });
     };
+    if (opMode) {
+      const suggestion = buildOperatorSuggestion(toolName, args);
+      send('status', 'Operador: preparando acción…');
+      send('chunk', '\n💡 ' + suggestion);
+      send('chunk', '\n⏳ Ejecutaré en ' + Math.round(OP_DELAY_MS / 1000) + 's (pulsa Detener para cancelar).');
+    }
+    const startExecution = () => {
+      if (aborted) return whenDone('Cancelado por el usuario antes de ejecutar la acción.', 'cancelado');
+      // En modo confianza total, ejecutar todo sin pedir confirmación.
+      if (trustMode) return execute();
+      const reason = dangerReason(toolName, args);
+      if (!reason) return execute();
+      // Pedir confirmación al usuario y esperar su decisión.
+      const cid = 'cf_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      send('status', 'Esperando tu confirmación…');
+      send('confirm', { id: cid, reason: reason, tool: toolName });
+      let settled = false;
+      const timer = setTimeout(() => { if (!settled) { settled = true; delete pendingConfirms[cid]; whenDone('Acción cancelada: el usuario no confirmó a tiempo.', 'sin confirmar'); } }, 120000);
+      pendingConfirms[cid] = (approved) => {
+        if (settled) return; settled = true; clearTimeout(timer); delete pendingConfirms[cid];
+        if (approved) {
+          send('chunk', ' ▶️ aprobado');
+          execute();
+        } else {
+          send('chunk', ' ✋ rechazado por el usuario');
+          whenDone('El usuario RECHAZÓ esta acción. No la ejecutes; busca otra forma o continúa con el resto de la tarea.', 'rechazado');
+        }
+      };
+    };
+    if (opMode) return setTimeout(startExecution, OP_DELAY_MS);
+    return startExecution();
   }
   function loop() {
-    if (aborted) { saveTranscript(); return onDone(1); }
+    if (aborted) return onDone(1);
     if (steps++ > MAX_STEPS) {
-      send('status', 'Cerrando y resumiendo…');
-      messages.push({ role: 'user', content: 'Has alcanzado el límite de pasos. Detente ahora: NO uses más herramientas. Resume en español lo que lograste, lo que quedó pendiente y cómo continuar.' });
-      return azureChat(cfg, messages, null, (err, resp) => {
-        send('status', '');
-        if (!err) { const m = resp.choices && resp.choices[0] && resp.choices[0].message; if (m && m.content) send('chunk', '\n\n⏸️ ' + m.content); }
-        else send('chunk', '\n\n(límite de pasos alcanzado)');
-        send('canContinue', { reason: 'limite' });
-        saveTranscript();
-        onDone(0);
-      });
+      send('status', 'Cerrando y resumiendoâ€¦');
+      messages.push({ role: 'user', content: 'Has alcanzado el lÃ­mite de pasos. Detente ahora: NO uses mÃ¡s herramientas. Resume en espaÃ±ol lo que lograste, lo que quedÃ³ pendiente y cÃ³mo continuar.' });
+      send('chunk', '\n\nâ¸ï¸ ');
+      return azureChatStream(cfg, messages,
+        (delta) => send('chunk', delta),
+        (err) => {
+          send('status', '');
+          if (err) send('chunk', '(lÃ­mite de pasos alcanzado)');
+          send('canContinue', { reason: 'limite' });
+          onDone(0);
+        }
+      );
     }
-    // Indicador vivo mientras Azure "piensa" (evita sensación de colgado).
-    send('status', 'Pensando… (paso ' + steps + '/' + MAX_STEPS + ')');
-    azureChat(cfg, messages, AGENT_TOOLS, (err, resp) => {
-      if (aborted) { send('status', ''); saveTranscript(); return onDone(1); }
+    // Indicador vivo mientras Azure "piensa" (evita sensaciÃ³n de colgado).
+    send('status', 'Pensandoâ€¦ (paso ' + steps + '/' + MAX_STEPS + ')');
+    azureChatStreamTools(cfg, messages, AGENT_TOOLS, (delta) => send('chunk', delta), (err, msg) => {
+      if (aborted) { send('status', ''); return onDone(1); }
       if (err) { send('status', ''); send('error', 'Azure: ' + err.message); return onDone(1); }
-      const msg = resp.choices && resp.choices[0] && resp.choices[0].message;
-      if (!msg) { send('status', ''); send('error', 'Respuesta vacía de Azure'); return onDone(1); }
+      if (!msg) { send('status', ''); send('error', 'Respuesta vacÃ­a de Azure'); return onDone(1); }
       messages.push(msg);
-      // Mostrar el PLAN/razonamiento del modelo si lo escribió antes de actuar.
-      if (msg.content && msg.content.trim()) send('chunk', msg.content.trim() + '\n');
       if (msg.tool_calls && msg.tool_calls.length) {
         let pending = msg.tool_calls.length;
-        send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acción…' : ' acciones…'));
+        send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acciÃ³nâ€¦' : ' accionesâ€¦'));
         msg.tool_calls.forEach((tc) => {
           let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
           const label = (args.path || args.command || '').toString();
-          const shortLabel = label.length > 60 ? '…' + label.slice(-58) : label;
+          const shortLabel = label.length > 60 ? 'â€¦' + label.slice(-58) : label;
           send('chunk', '\n' + iconOf(tc.function.name) + ' ' + tc.function.name + '(' + shortLabel + ') …');
           runToolGated(tc, args, (result, summary) => {
             send('chunk', ' ✓' + (summary ? ' ' + summary : ''));
-            toolsUsed++;
             messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 12000) });
             if (--pending === 0) { send('chunk', '\n'); loop(); }
           });
         });
       } else {
-        const text = (msg.content || '').trim();
-        // Si solo ANUNCIO una accion (o devolvio un turno vacio) sin ejecutar nada, el
-        // trabajo NO ha terminado: empujalo a actuar en lugar de cerrar el job aqui.
-        if (nudges < MAX_NUDGES && (!text || ANNOUNCE_RE.test(text))) {
-          nudges++;
-          messages.push({ role: 'user', content: 'No ejecutaste ninguna herramienta en este turno: solo anunciaste lo que ibas a hacer. Si la tarea NO esta terminada, HAZLA AHORA llamando a las herramientas en este mismo turno (no vuelvas a anunciarla). Si ya esta completamente terminada, responde solo con el resumen final, sin anunciar acciones futuras.' });
-          send('status', 'Continuando...');
-          return loop();
-        }
+        // Respuesta final de texto: ya se streameÃ³ token a token vÃ­a onChunk arriba.
         send('status', '');
-        saveTranscript();
         onDone(0);
       }
     });
@@ -556,7 +1328,7 @@ function autostartExe() {
 }
 function getAutostart(cb) {
   if (process.platform !== 'win32') return cb(false, false);
-  const child = spawn('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME]);
+  const child = spawn('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME], { windowsHide: true });
   let out = '';
   child.stdout.on('data', d => (out += d));
   child.on('close', () => cb(out.indexOf(AUTOSTART_NAME) !== -1, true));
@@ -566,16 +1338,16 @@ function setAutostart(enabled, cb) {
   if (process.platform !== 'win32') return cb(false, false);
   let child;
   if (enabled) {
-    child = spawn('reg.exe', ['add', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME, '/t', 'REG_SZ', '/d', '"' + autostartExe() + '"', '/f']);
+    child = spawn('reg.exe', ['add', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME, '/t', 'REG_SZ', '/d', '"' + autostartExe() + '"', '/f'], { windowsHide: true });
   } else {
-    child = spawn('reg.exe', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME, '/f']);
+    child = spawn('reg.exe', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', AUTOSTART_NAME, '/f'], { windowsHide: true });
   }
   child.on('close', (code) => cb(code === 0, enabled));
   child.on('error', () => cb(false, enabled));
 }
 
 
-// node directamente y preservar saltos de línea (cmd.exe los rompe).
+// node directamente y preservar saltos de lÃ­nea (cmd.exe los rompe).
 let LOADER = undefined; // undefined = sin resolver; null = no encontrado
 function resolveLoader() {
   if (LOADER !== undefined) return LOADER;
@@ -612,8 +1384,482 @@ function resolveCopilotBinary() {
 let state = {
   cwd: process.env.HANSTLERS_CWD || process.env.USERPROFILE || os.homedir(),
   started: false,
-  model: process.env.HANSTLERS_MODEL || 'auto'
+  model: process.env.HANSTLERS_MODEL || 'auto',
+  projectCtx: null  // { cwd, text } â€” cachÃ© del contexto del proyecto
 };
+
+function defaultFeatures() {
+  return {
+    smartRouter: true,
+    proResponseMode: false,
+    agentBridgeMode: true,
+    routeExecutionToAzureAgent: true,
+    preferClaudeForStrategy: true,
+    preferXCoreForAudio: true,
+    autoRouteForLocalAgent: true,
+    operatorMode: false
+  };
+}
+function loadFeatures() {
+  const d = defaultFeatures();
+  try {
+    const raw = JSON.parse(fs.readFileSync(FEATURES_FILE, 'utf8'));
+    if (raw && typeof raw === 'object') return Object.assign(d, raw);
+  } catch (e) {}
+  return d;
+}
+function saveFeatures(cfg) {
+  try {
+    fs.mkdirSync(path.dirname(FEATURES_FILE), { recursive: true });
+    fs.writeFileSync(FEATURES_FILE, JSON.stringify(cfg));
+  } catch (e) {}
+}
+let FEATURES = loadFeatures();
+function currentFeatures() { return FEATURES || loadFeatures(); }
+function reloadFeatures() { FEATURES = loadFeatures(); return FEATURES; }
+function authEnabled() { return !!(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && SESSION_SECRET && BASE_URL); }
+const authSessions = new Map(); // sid -> { login, name, avatarUrl, isAdmin, at, githubToken }
+const oauthStates = new Map();  // state -> createdAt
+function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
+function signSid(sid) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(String(sid)).digest('hex');
+}
+function parseCookies(req) {
+  const raw = (req.headers.cookie || '').split(';');
+  const out = {};
+  raw.forEach((p) => {
+    const i = p.indexOf('=');
+    if (i <= 0) return;
+    const k = p.slice(0, i).trim();
+    const v = p.slice(i + 1).trim();
+    out[k] = decodeURIComponent(v);
+  });
+  return out;
+}
+function issueSessionCookie(res, sid) {
+  const sig = signSid(sid);
+  const secure = BASE_URL.toLowerCase().startsWith('https://');
+  const cookie = [
+    'hs_session=' + encodeURIComponent(sid + '.' + sig),
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    secure ? 'Secure' : '',
+    'Max-Age=2592000'
+  ].filter(Boolean).join('; ');
+  res.setHeader('Set-Cookie', cookie);
+}
+function clearSessionCookie(res) {
+  const secure = BASE_URL.toLowerCase().startsWith('https://');
+  const cookie = [
+    'hs_session=',
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    secure ? 'Secure' : '',
+    'Max-Age=0'
+  ].filter(Boolean).join('; ');
+  res.setHeader('Set-Cookie', cookie);
+}
+function readAuthUser(req) {
+  if (!authEnabled()) return { ok: true, user: null };
+  const c = parseCookies(req);
+  const tok = c.hs_session || '';
+  const p = tok.split('.');
+  if (p.length !== 2) return { ok: false, reason: 'no-session' };
+  const sid = p[0], sig = p[1];
+  const exp = signSid(sid);
+  if (sig !== exp) return { ok: false, reason: 'bad-signature' };
+  const u = authSessions.get(sid);
+  if (!u) return { ok: false, reason: 'session-expired' };
+  return { ok: true, user: u };
+}
+function githubRequest(pathName, token, cb) {
+  const req = https.request({
+    hostname: 'api.github.com',
+    path: pathName,
+    method: 'GET',
+    timeout: 20000,
+    headers: {
+      'User-Agent': 'HanstlerS/1.0',
+      'Accept': 'application/vnd.github+json',
+      'Authorization': 'Bearer ' + token
+    }
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => body += c.toString());
+    res.on('end', () => {
+      if (res.statusCode < 200 || res.statusCode >= 300) return cb(new Error('github api ' + res.statusCode));
+      try { cb(null, JSON.parse(body || '{}')); } catch (e) { cb(e); }
+    });
+  });
+  req.on('error', cb);
+  req.on('timeout', () => req.destroy(new Error('github api timeout')));
+  req.end();
+}
+function buildRepoApiPath(repoRef, tail) {
+  const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(String(repoRef || '').trim());
+  if (!m) return '';
+  const owner = encodeURIComponent(m[1]);
+  const repo = encodeURIComponent(m[2]);
+  const suffix = tail ? ('/' + String(tail).replace(/^\/+/, '')) : '';
+  return '/repos/' + owner + '/' + repo + suffix;
+}
+function decodeBase64Utf8(s) {
+  try { return Buffer.from(String(s || '').replace(/\s+/g, ''), 'base64').toString('utf8'); } catch (e) {}
+  return '';
+}
+let GH_BIN_CACHE = '';
+function resolveGhBinary() {
+  if (GH_BIN_CACHE) return GH_BIN_CACHE;
+  const cands = [
+    process.env.HANSTLERS_GH_BIN,
+    'gh',
+    path.join(process.env['ProgramFiles'] || '', 'GitHub CLI', 'gh.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || '', 'GitHub CLI', 'gh.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'GitHub CLI', 'gh.exe')
+  ].filter(Boolean);
+  for (const c of cands) {
+    try {
+      if (c === 'gh') { GH_BIN_CACHE = c; return GH_BIN_CACHE; }
+      if (fs.existsSync(c)) { GH_BIN_CACHE = c; return GH_BIN_CACHE; }
+    } catch (e) {}
+  }
+  GH_BIN_CACHE = 'gh';
+  return GH_BIN_CACHE;
+}
+function ghJson(args, cb) {
+  const ghBin = resolveGhBinary();
+  execFile(ghBin, args, { windowsHide: true, timeout: 25000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    if (err) return cb(new Error((stderr || err.message || 'gh failed (' + ghBin + ')').toString().trim()));
+    let obj = null;
+    try { obj = JSON.parse(String(stdout || '[]')); } catch (e) { return cb(new Error('gh json inválido')); }
+    cb(null, obj);
+  });
+}
+function ghAuthStatus(cb) {
+  const ghBin = resolveGhBinary();
+  execFile(ghBin, ['auth', 'status', '--hostname', 'github.com'], { windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+    const out = String((stdout || '') + '\n' + (stderr || ''));
+    const loggedIn = /Logged in to github\.com account /i.test(out);
+    const m = /Logged in to github\.com account\s+([^\s(]+)/i.exec(out);
+    const user = m ? m[1] : '';
+    if (err && !loggedIn) return cb(null, { ok: false, loggedIn: false, user: '', error: out.trim() || err.message || 'not logged in' });
+    return cb(null, { ok: true, loggedIn: !!loggedIn, user });
+  });
+}
+function startGhAuth(cb) {
+  const ghBin = resolveGhBinary();
+  try {
+    // Abre flujo web de login en una consola separada para no bloquear el servidor.
+    const cmd = '"' + ghBin.replace(/"/g, '""') + '" auth login --hostname github.com --web --git-protocol https';
+    const child = spawn('cmd.exe', ['/d', '/s', '/c', 'start', '', cmd], { windowsHide: true });
+    child.on('error', (e) => cb(e));
+    child.on('close', () => cb(null));
+  } catch (e) { cb(e); }
+}
+function fetchUserReposViaGh(cb) {
+  const mapOut = (arr) => (Array.isArray(arr) ? arr : []).slice(0, 10).map((r) => {
+    const full = String((r && (r.full_name || r.nameWithOwner)) || '');
+    return {
+      id: 'gh-' + full.toLowerCase().replace(/[^a-z0-9/_-]/g, '').replace('/', '-'),
+      name: full || String(r && r.name || ''),
+      repoRef: full,
+      subtitle: String(r && r.description || ''),
+      defaultBranch: String((r && (r.default_branch || (r.defaultBranchRef && r.defaultBranchRef.name))) || ''),
+      private: !!(r && (r.private || r.isPrivate))
+    };
+  }).filter((x) => x.repoRef);
+  ghJson(['repo', 'list', '@me', '--limit', '10', '--json', 'nameWithOwner,description,isPrivate,defaultBranchRef'], (err, items) => {
+    if (!err) return cb(null, mapOut(items));
+    ghJson(['api', 'user/repos?sort=updated&direction=desc&per_page=10'], (err2, items2) => {
+      if (err2) return cb(new Error((err.message || 'repo list failed') + ' | ' + (err2.message || 'api list failed')));
+      return cb(null, mapOut(items2));
+    });
+  });
+}
+const repoCtxCache = new Map(); // key -> { text, at }
+function fetchGithubRepoContext(user, repoRef, cb) {
+  const token = user && user.githubToken ? String(user.githubToken) : '';
+  const ref = String(repoRef || '').trim();
+  if (!ref) return cb(null, '');
+  const key = (String((user && user.login) || '@me').toLowerCase() + '|' + ref.toLowerCase());
+  const prev = repoCtxCache.get(key);
+  if (prev && prev.text && (Date.now() - Number(prev.at || 0) < 5 * 60 * 1000)) return cb(null, prev.text);
+  const buildText = (repo, tree, readme) => {
+    const branch = String(repo.default_branch || 'main');
+    let treeTxt = '';
+    if (Array.isArray(tree)) {
+      const rows = tree.slice(0, 40).map((it) => ((it && it.type === 'dir') ? '📁 ' : '📄 ') + String((it && it.name) || ''));
+      if (rows.length) treeTxt = '### Estructura raíz\n' + rows.join('\n');
+    }
+    let readmeTxt = '';
+    if (readme && typeof readme.content === 'string') {
+      const raw = decodeBase64Utf8(readme.content).trim();
+      if (raw) readmeTxt = '### README.md\n' + raw.slice(0, 1200);
+    }
+    const header = [
+      '### Repositorio GitHub',
+      'Nombre: ' + String(repo.full_name || ref),
+      'Branch: ' + branch,
+      'Visibilidad: ' + (repo.private ? 'private' : 'public'),
+      'Descripción: ' + String(repo.description || '').trim()
+    ].join('\n');
+    return [header, treeTxt, readmeTxt].filter(Boolean).join('\n\n');
+  };
+  const useGhFallback = () => {
+    const escRef = ref.replace(/[^A-Za-z0-9_.\\/-]/g, '');
+    ghJson(['api', 'repos/' + escRef], (eRepo, repo) => {
+      if (eRepo || !repo || !repo.full_name) return cb(eRepo || new Error('repo no disponible'));
+      const branch = String(repo.default_branch || 'main');
+      const treeApi = 'repos/' + escRef + '/contents?ref=' + encodeURIComponent(branch);
+      ghJson(['api', treeApi], (_eTree, tree) => {
+        ghJson(['api', 'repos/' + escRef + '/readme'], (_eReadme, readme) => {
+          const text = buildText(repo, tree, readme);
+          repoCtxCache.set(key, { text, at: Date.now() });
+          cb(null, text);
+        });
+      });
+    });
+  };
+  if (!token) return useGhFallback();
+  const repoPath = buildRepoApiPath(ref, '');
+  if (!repoPath) return useGhFallback();
+  githubRequest(repoPath, token, (eRepo, repo) => {
+    if (eRepo || !repo || !repo.full_name) return useGhFallback();
+    const branch = String(repo.default_branch || 'main');
+    const treePath = buildRepoApiPath(ref, 'contents') + '?ref=' + encodeURIComponent(branch);
+    const readmePath = buildRepoApiPath(ref, 'readme');
+    githubRequest(treePath, token, (_eTree, tree) => {
+      githubRequest(readmePath, token, (_eReadme, readme) => {
+        const text = buildText(repo, tree, readme);
+        repoCtxCache.set(key, { text, at: Date.now() });
+        cb(null, text);
+      });
+    });
+  });
+}
+function fetchUserReposForPanel(user, cb) {
+  const token = user && user.githubToken ? String(user.githubToken) : '';
+  if (!token) return fetchUserReposViaGh(cb);
+  const p = '/user/repos?sort=updated&direction=desc&per_page=10&affiliation=owner,collaborator,organization_member';
+  githubRequest(p, token, (err, items) => {
+    if (err) return fetchUserReposViaGh(cb);
+    const arr = Array.isArray(items) ? items : [];
+    const out = arr.slice(0, 10).map((r) => ({
+      id: 'gh-' + String(r && r.full_name || '').toLowerCase().replace(/[^a-z0-9/_-]/g, '').replace('/', '-'),
+      name: String(r && (r.full_name || r.name) || ''),
+      repoRef: String(r && r.full_name || ''),
+      subtitle: String(r && r.description || ''),
+      defaultBranch: String(r && r.default_branch || ''),
+      private: !!(r && r.private)
+    })).filter((x) => x.repoRef);
+    cb(null, out);
+  });
+}
+function exchangeGithubCode(code, cb) {
+  const data = JSON.stringify({
+    client_id: GITHUB_CLIENT_ID,
+    client_secret: GITHUB_CLIENT_SECRET,
+    code: code,
+    redirect_uri: BASE_URL + '/auth/callback'
+  });
+  const req = https.request({
+    hostname: 'github.com',
+    path: '/login/oauth/access_token',
+    method: 'POST',
+    timeout: 20000,
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'HanstlerS/1.0',
+      'Content-Length': Buffer.byteLength(data)
+    }
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => body += c.toString());
+    res.on('end', () => {
+      try {
+        const j = JSON.parse(body || '{}');
+        if (!j.access_token) return cb(new Error(j.error_description || j.error || 'oauth token failed'));
+        cb(null, j.access_token);
+      } catch (e) { cb(e); }
+    });
+  });
+  req.on('error', cb);
+  req.on('timeout', () => req.destroy(new Error('oauth timeout')));
+  req.write(data);
+  req.end();
+}
+function isAllowedUser(login) {
+  const l = String(login || '').toLowerCase();
+  if (!l) return false;
+  if (ALLOWED_USERS.length === 0) return true;
+  return ALLOWED_USERS.includes(l);
+}
+function isAdminUser(login) {
+  const l = String(login || '').toLowerCase();
+  if (!l) return false;
+  return ADMIN_USERS.includes(l);
+}
+function checkOrgMembership(token, cb) {
+  if (!GITHUB_ALLOWED_ORG) return cb(null, true);
+  githubRequest('/user/memberships/orgs/' + encodeURIComponent(GITHUB_ALLOWED_ORG), token, (err, m) => {
+    if (err) return cb(null, false);
+    const stateOk = m && m.state === 'active';
+    cb(null, !!stateOk);
+  });
+}
+
+function looksLikeExecutionTask(text) {
+  return /\b(abr\w*|open\w*|lanz\w*|inici\w*|arranc\w*|cre\w*|edit\w*|modific\w*|arregl\w*|corrig\w*|ejecut\w*|corr\w*|instal\w*|despleg\w*|refactor\w*|agreg\w*|a[ñn]ad\w*|archivo\w*|carpeta\w*|comando\w*|script\w*|c[oó]digo\w*|bug\w*|error\w*|compil\w*|build\w*|test\w*|prueb\w*|git\w*|deploy\w*|terminal\w*)\b/i.test(text || '')
+    || /@[\w./\\-]+/.test(text || '');
+}
+function isXtudioMentioned(text) {
+  return /\b(xtudio(?:-?1)?|xstudio(?:-?1)?|dj[-\s]?set[-\s]?studio|main_qt\.py)\b/i.test(String(text || ''));
+}
+function isXtudioLaunchIntent(message, history, historySummary) {
+  const msg = String(message || '').trim();
+  if (!msg) return false;
+  const launchVerb = /\b(abr\w*|lanz\w*|inici\w*|arranc\w*|ejecut\w*)\b/i;
+  return launchVerb.test(msg) && isXtudioMentioned(msg);
+}
+function launchXtudio1(cb) {
+  const py = 'C:\\Users\\czumb\\AppData\\Local\\Programs\\Python\\Python311\\python.exe';
+  const main = 'C:\\Users\\czumb\\Documents\\HanstlerS\\dj-set-studio\\main_qt.py';
+  const wd = 'C:\\Users\\czumb\\Documents\\HanstlerS\\dj-set-studio';
+  try {
+    const child = spawn(py, [main], { cwd: wd, windowsHide: true, detached: true, stdio: 'ignore' });
+    try { child.unref(); } catch (_) {}
+    return cb(null, child && child.pid ? child.pid : 0);
+  } catch (e) {
+    return cb(e);
+  }
+}
+function looksLikeStrategyTask(text) {
+  return /\b(estrategia|roadmap|assessment|analiza|compar[aá]|trade[- ]?off|arquitectura|plan|prioriza|benchmark|decisi[oó]n|enfoque)\b/i.test(text || '');
+}
+function looksLikeAudioTask(text) {
+  return /\b(x-core|xcore|audio|m[uú]sica|beat|track|voz|sonido|mezcla|master|sample)\b/i.test(text || '');
+}
+function looksLikeWebPortalTask(text) {
+  return /\b(cloudflare|github|azure|portal|dashboard|dns|dominio|domain|ssl|cname|nameserver|hosting|vercel|netlify|render|railway|login|inicia sesi[oó]n|settings)\b/i.test(text || '');
+}
+function isVertexModel(model) {
+  const m = String(model || '').trim().toLowerCase();
+  return m === 'vertex-auto' || m === 'vertex-gemini-pro' || m === 'vertex-gemini-flash' || m === 'vertex-claude-opus-5';
+}
+function pickVertexTarget(model, message, hasAttachments) {
+  const cfg = loadVertex();
+  const m = String(model || '').trim().toLowerCase();
+  if (!cfg) return { model: '', reason: 'vertex-not-configured' };
+  if (m === 'vertex-claude-opus-5') return { model: cfg.models.opus, publisher: 'anthropic', reason: 'vertex-manual-opus' };
+  if (m === 'vertex-gemini-pro') return { model: cfg.models.pro, publisher: 'google', reason: 'vertex-manual-pro' };
+  if (m === 'vertex-gemini-flash') return { model: cfg.models.flash, publisher: 'google', reason: 'vertex-manual-flash' };
+  if (looksLikeStrategyTask(message)) return { model: cfg.models.pro, publisher: 'google', reason: 'vertex-auto-strategy' };
+  if (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments) return { model: cfg.models.flash, publisher: 'google', reason: 'vertex-auto-execution-or-vision' };
+  return { model: cfg.models.flash, publisher: 'google', reason: 'vertex-auto-default' };
+}
+function chooseModelForRequest(requestedModel, message, hasAttachments, fromLocalAgent) {
+  const feats = currentFeatures();
+  const base = (requestedModel || state.model || 'auto').trim();
+  if (!feats.smartRouter) return { model: base || 'auto', reason: 'smart-router-disabled' };
+  if (base !== 'auto') {
+    const explicit = base.toLowerCase();
+    const wantsExecution = looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments;
+    const explicitVertex = explicit === 'vertex-auto' || explicit === 'vertex-gemini-pro' || explicit === 'vertex-gemini-flash' || explicit === 'vertex-claude-opus-5';
+    if (explicitVertex && wantsExecution) {
+      if (feats.routeExecutionToAzureAgent && loadAzure()) return { model: 'azure-agent', reason: 'explicit-vertex-execution-reroute' };
+      return { model: 'auto', reason: 'explicit-vertex-execution-fallback-auto' };
+    }
+    return { model: base || 'auto', reason: 'explicit-model' };
+  }
+  if (fromLocalAgent && feats.agentBridgeMode && feats.autoRouteForLocalAgent) {
+    if (feats.routeExecutionToAzureAgent && loadAzure() && (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments)) return { model: 'azure-agent', reason: 'local-agent-execution-or-web' };
+    return { model: 'claude-sonnet-5', reason: 'local-agent-default' };
+  }
+  if (feats.preferXCoreForAudio && looksLikeAudioTask(message)) return { model: 'x-core', reason: 'audio-task' };
+  if (feats.routeExecutionToAzureAgent && loadAzure() && (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments)) return { model: 'azure-agent', reason: 'execution-or-web-task' };
+  if (feats.preferClaudeForStrategy && looksLikeStrategyTask(message)) return { model: 'claude-sonnet-5', reason: 'strategy-task' };
+  return { model: 'auto', reason: 'auto-default' };
+}
+function wrapProResponsePrompt(message) {
+  const guard = '[Instrucción interna: respuesta profesional, clara, accionable, sin relleno, con recomendación principal cuando aplique y máxima exactitud técnica.]';
+  return guard + '\n\n' + message;
+}
+
+// Construye un bloque de contexto del proyecto: Ã¡rbol, git status, README y package.json.
+// Llama cb(text) al terminar; usa cachÃ© si el cwd no cambiÃ³.
+function buildProjectContext(cwd, cb) {
+  if (state.projectCtx && state.projectCtx.cwd === cwd) {
+    return cb(state.projectCtx.text);
+  }
+  const parts = [];
+  let pending = 4;
+  function tryDone() {
+    if (--pending !== 0) return;
+    const text = parts.filter(Boolean).join('\n\n');
+    state.projectCtx = { cwd, text };
+    cb(text);
+  }
+
+  // 1. Ãrbol de archivos (2 niveles, sin carpetas pesadas)
+  try {
+    const entries = [];
+    const skip = new Set(['node_modules', '.git', 'dist', 'dist-electron', 'build', '.next', '__pycache__', 'venv', '.venv', 'vendor', '.cache', 'coverage']);
+    const walk = (dir, depth) => {
+      let items; try { items = fs.readdirSync(dir); } catch (e) { return; }
+      for (const item of items.slice(0, 50)) {
+        if (skip.has(item)) continue;
+        const full = path.join(dir, item);
+        let stat; try { stat = fs.statSync(full); } catch (e) { continue; }
+        entries.push((stat.isDirectory() ? 'ðŸ“ ' : 'ðŸ“„ ') + path.relative(cwd, full).replace(/\\/g, '/') + (stat.isDirectory() ? '/' : ''));
+        if (stat.isDirectory() && depth < 2) walk(full, depth + 1);
+      }
+    };
+    walk(cwd, 1);
+    if (entries.length) parts.push('### Estructura del proyecto (' + path.basename(cwd) + ')\n' + entries.join('\n'));
+  } catch (e) {}
+  tryDone(); // 1
+
+  // 2. Git status (si hay repo)
+  let gitDone = false;
+  try {
+    if (fs.existsSync(path.join(cwd, '.git'))) {
+      const child = spawn('git', ['status', '--short', '--branch'], { cwd, windowsHide: true });
+      let out = '';
+      child.stdout.on('data', d => (out += d));
+      child.stderr.on('data', () => {});
+      const finish = () => { if (gitDone) return; gitDone = true; if (out.trim()) parts.push('### Git status\n' + out.trim().slice(0, 800)); tryDone(); };
+      child.on('close', finish);
+      child.on('error', finish);
+      setTimeout(() => { try { child.kill(); } catch (_) {} finish(); }, 5000);
+    } else { tryDone(); } // 2 sin git
+  } catch (e) { if (!gitDone) { gitDone = true; tryDone(); } } // 2 error
+
+  // 3. README.md (primeros 600 chars)
+  try {
+    const rp = ['README.md', 'readme.md', 'Readme.md'].map(n => path.join(cwd, n)).find(p => { try { return fs.existsSync(p); } catch (e) { return false; } });
+    if (rp) parts.push('### README.md\n' + fs.readFileSync(rp, 'utf8').trim().slice(0, 600));
+  } catch (e) {}
+  tryDone(); // 3
+
+  // 4. package.json (resumen)
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      const s = {};
+      if (pkg.name) s.name = pkg.name;
+      if (pkg.version) s.version = pkg.version;
+      if (pkg.description) s.description = pkg.description;
+      if (pkg.scripts) s.scripts = pkg.scripts;
+      if (pkg.main) s.main = pkg.main;
+      parts.push('### package.json\n' + JSON.stringify(s, null, 2));
+    }
+  } catch (e) {}
+  tryDone(); // 4
+}
 
 // Entorno para ejecutar node dentro de Electron: process.execPath es HanstlerS.exe,
 // y ELECTRON_RUN_AS_NODE=1 lo obliga a comportarse como Node puro.
@@ -621,12 +1867,12 @@ function nodeEnv() {
   return Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' });
 }
 
-// Detecta qué flags soporta la version instalada del CLI (una sola vez).
+// Detecta quÃ© flags soporta la version instalada del CLI (una sola vez).
 let SUPPORTED = null;
 let detectPending = null;
 function detectFlags(cb) {
   if (SUPPORTED) return cb(SUPPORTED);
-  // Si ya hay una detección en curso (p.ej. el pre-calentamiento), engancharse a ella.
+  // Si ya hay una detecciÃ³n en curso (p.ej. el pre-calentamiento), engancharse a ella.
   if (detectPending) { detectPending.push(cb); return; }
   detectPending = [cb];
   const loader = resolveLoader();
@@ -665,7 +1911,7 @@ function detectFlags(cb) {
   setTimeout(finish, 8000);
 }
 
-// Respaldo: obtener el id de la sesión más reciente del CLI desde disco.
+// Respaldo: obtener el id de la sesiÃ³n mÃ¡s reciente del CLI desde disco.
 function newestSessionId() {
   const bases = [
     path.join(os.homedir(), '.copilot', 'history'),
@@ -693,25 +1939,25 @@ function buildArgs(message, opts, withModel) {
   opts = opts || {};
   const a = ['-p', message, '--allow-all-tools'];
   const s = SUPPORTED || {};
-  // El modelo puede venir por conversación (opts.model); si no, usa el global.
+  // El modelo puede venir por conversaciÃ³n (opts.model); si no, usa el global.
   const model = opts.model || state.model;
   if (withModel && s.model && model && model !== 'auto') { a.push('--model', model); }
-  // Modo MÍNIMO: sin flags de optimización (para reintentar si algo los rechaza).
-  // El modelo ya se añadió arriba; aquí solo se conserva la sesión.
+  // Modo MÃNIMO: sin flags de optimizaciÃ³n (para reintentar si algo los rechaza).
+  // El modelo ya se aÃ±adiÃ³ arriba; aquÃ­ solo se conserva la sesiÃ³n.
   if (opts.minimal) {
     if (opts.sessionId) a.push('--resume=' + opts.sessionId);
     return a;
   }
-  // Solo flags COSMÉTICOS/seguros que no afectan la salida del modelo.
+  // Solo flags COSMÃ‰TICOS/seguros que no afectan la salida del modelo.
   // (NO usar --silent ni --effort: pueden suprimir o vaciar la respuesta en algunos planes.)
   if (s.noBanner) a.push('--no-banner');
   if (s.noAutoUpdate) a.push('--no-auto-update');
   if (s.noAskUser) a.push('--no-ask-user');
-  // Tope de créditos por respuesta (solo si el usuario lo pide explícitamente).
+  // Tope de crÃ©ditos por respuesta (solo si el usuario lo pide explÃ­citamente).
   if (s.maxAiCredits && process.env.HANSTLERS_MAX_CREDITS) a.push('--max-ai-credits=' + process.env.HANSTLERS_MAX_CREDITS);
-  // Ahorro de razonamiento SOLO si se activa explícitamente por variable de entorno.
+  // Ahorro de razonamiento SOLO si se activa explÃ­citamente por variable de entorno.
   if (s.effort && process.env.HANSTLERS_EFFORT) a.push('--effort=' + process.env.HANSTLERS_EFFORT);
-  // Mantener el hilo: reanudar por id exacto de sesión de esta conversación.
+  // Mantener el hilo: reanudar por id exacto de sesiÃ³n de esta conversaciÃ³n.
   if (opts.sessionId) a.push('--resume=' + opts.sessionId);
   return a;
 }
@@ -728,15 +1974,22 @@ function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
 }
 
-// Líneas de "ruido" que el CLI imprime y que el usuario no necesita ver.
+// LÃ­neas de "ruido" que el CLI imprime y que el usuario no necesita ver.
 const NOISE = [
   /^\s*Changes\s+[+\-]?\d+/i,
   /^\s*AI Credits\b/i,
   /^\s*Tokens\b/i,
   /^\s*Resume\b/i,
+  /^\s*Modo Respuesta Pro\b/i,
+  /^\s*-\s*Responde de forma clara, precisa y accionable\./i,
+  /^\s*-\s*Si hay varias opciones, da recomendación principal con justificación breve\./i,
+  /^\s*-\s*Si hay pasos, ordénalos y evita relleno\./i,
+  /^\s*-\s*Mantén exactitud técnica; no inventes datos\./i,
+  /^\s*Mensaje del usuario:\s*$/i,
+  /^\s*\[Instrucción interna:\s*respuesta profesional/i,
   /copilot --resume=/i,
   /^\s*\d+(\.\d+)?k?\s+(cached|written)/i,
-  /^\s*↑|^\s*↓/,
+  /^\s*â†‘|^\s*â†“/,
   /reasoning\)\s*$/i,
   /Total duration/i,
   /Total usage est/i
@@ -744,7 +1997,7 @@ const NOISE = [
 function isNoise(line) {
   return NOISE.some((re) => re.test(line));
 }
-// Crea un filtro con buffer por líneas: recibe texto crudo, devuelve texto limpio.
+// Crea un filtro con buffer por lÃ­neas: recibe texto crudo, devuelve texto limpio.
 function makeLineFilter(onClean) {
   let buf = '';
   return {
@@ -791,15 +2044,15 @@ function addMemory(text) {
   saveMemory(list);
   return item;
 }
-// Detecta datos a recordar, de forma automática:
-//  - órdenes explícitas: "recuerda que ...", "anota que ..."
+// Detecta datos a recordar, de forma automÃ¡tica:
+//  - Ã³rdenes explÃ­citas: "recuerda que ...", "anota que ..."
 //  - hechos declarativos duraderos sobre el usuario/proyectos
 function detectMemory(message) {
   const notes = [];
-  const explicit = /(?:^|\b)(?:recuerda|recu[eé]rdame|acu[eé]rdate|acu[eé]rdame|anota|guarda|ten en cuenta)(?:\s+que)?\s*[:,]?\s+([\s\S]{3,})/i.exec(message);
-  if (explicit) notes.push(explicit[1].trim().replace(/^["“]|["”]$/g, ''));
-  // Hechos declarativos (frases cortas), solo si el usuario no está preguntando.
-  if (!/[?¿]/.test(message) && message.length < 200) {
+  const explicit = /(?:^|\b)(?:recuerda|recu[eÃ©]rdame|acu[eÃ©]rdate|acu[eÃ©]rdame|anota|guarda|ten en cuenta)(?:\s+que)?\s*[:,]?\s+([\s\S]{3,})/i.exec(message);
+  if (explicit) notes.push(explicit[1].trim().replace(/^["â€œ]|["â€]$/g, ''));
+  // Hechos declarativos (frases cortas), solo si el usuario no estÃ¡ preguntando.
+  if (!/[?Â¿]/.test(message) && message.length < 200) {
     const decl = /(?:^|\b)((?:mi|mis|me llamo|soy|trabajo en|uso|prefiero|mi nombre es)\b[\s\S]{3,120})/i.exec(message);
     if (decl && !explicit) notes.push(decl[1].trim());
   }
@@ -812,38 +2065,392 @@ function memoryContextBlock() {
   return 'Datos que debes recordar sobre el usuario y sus proyectos (memoria persistente):\n' + facts + '\n\n';
 }
 
-// ===== Cuota mensual (créditos del plan − gastado) =====
+// ===== Cuota mensual (crÃ©ditos del plan âˆ’ gastado) =====
 const USAGE_FILE = path.join(os.homedir(), '.hanstlers', 'usage.json');
 const PLAN_CREDITS = { free: 0, pro: 1500, 'pro+': 7000, proplus: 7000, max: 20000 };
 function monthKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
 function loadUsage() {
   let u = {};
   try { u = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch (e) {}
-  // Reinicio automático el día 1 de cada mes (UTC).
-  if (u.month !== monthKey()) { u = { month: monthKey(), spent: 0, plan: u.plan || (process.env.HANSTLERS_PLAN || 'pro+') }; saveUsage(u); }
-  if (typeof u.spent !== 'number') u.spent = 0;
-  if (!u.plan) u.plan = process.env.HANSTLERS_PLAN || 'pro+';
-  // Migración: el default histórico era 'pro'; ahora la cuenta es Pro+ (7000).
-  // Solo actualiza si el usuario no fijó un plan distinto manualmente.
-  if (u.plan === 'pro' && !u.planLocked) { u.plan = 'pro+'; saveUsage(u); }
+  // Reinicio automÃ¡tico el dÃ­a 1 de cada mes (UTC).
+  if (u.month !== monthKey()) { u = { month: monthKey(), spent: 0, plan: u.plan || (process.env.HANSTLERS_PLAN || 'max') }; saveUsage(u); }
+  if (typeof u.spent !== 'number' || !Number.isFinite(u.spent) || u.spent < 0) u.spent = 0;
+  if (!u.plan) u.plan = process.env.HANSTLERS_PLAN || 'max';
+  // MigraciÃ³n: el default histÃ³rico era 'pro'; ahora la cuenta es Pro+ (7000).
+  // Solo actualiza si el usuario no fijÃ³ un plan distinto manualmente.
+  if ((u.plan === 'pro' || u.plan === 'pro+') && !u.planLocked) { u.plan = 'max'; saveUsage(u); }
+  const plan = (u.plan || 'max').toLowerCase();
+  const base = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 20000;
+  const extra = typeof u.extraCredits === 'number' ? u.extraCredits : 0;
+  const hardCap = Math.max(50000, (base + extra) * 5);
+  if (u.spent > hardCap) {
+    u.lastBadSpent = u.spent;
+    u.spent = 0;
+    u.lastCliCreditsSeen = null;
+    u.repairedAt = Date.now();
+    saveUsage(u);
+  }
   return u;
 }
 function saveUsage(u) {
   try { fs.mkdirSync(path.dirname(USAGE_FILE), { recursive: true }); fs.writeFileSync(USAGE_FILE, JSON.stringify(u)); } catch (e) {}
 }
 function addSpent(credits) {
-  if (!(credits > 0)) return loadUsage();
+  if (!Number.isFinite(credits) || !(credits > 0)) return loadUsage();
+  // Evita saltos absurdos por parseos rotos del CLI (ej. 20000 por turno).
+  if (credits > 500) return loadUsage();
   const u = loadUsage();
   u.spent = Math.round((u.spent + credits) * 100) / 100;
   saveUsage(u);
   return u;
 }
+function parseNumLoose(s) {
+  if (!s) return NaN;
+  const t = String(s).trim();
+  const hasDot = t.indexOf('.') >= 0;
+  const hasComma = t.indexOf(',') >= 0;
+  // Si tiene ambos separadores, tomamos el último como decimal y el otro como miles.
+  if (hasDot && hasComma) {
+    const lastDot = t.lastIndexOf('.');
+    const lastComma = t.lastIndexOf(',');
+    const decSep = lastDot > lastComma ? '.' : ',';
+    const thouSep = decSep === '.' ? ',' : '.';
+    const compact = t.split(thouSep).join('').replace(decSep, '.').replace(/[^\d.]/g, '');
+    return parseFloat(compact);
+  }
+  // Un solo separador: si parece miles (grupos de 3), lo quitamos.
+  const sep = hasComma ? ',' : (hasDot ? '.' : '');
+  if (sep) {
+    const parts = t.split(sep);
+    const maybeThousands = parts.length > 1 && parts.slice(1).every((p) => /^\d{3}$/.test(p));
+    if (maybeThousands) return parseFloat(parts.join(''));
+    return parseFloat(t.replace(',', '.').replace(/[^\d.]/g, ''));
+  }
+  return parseFloat(t.replace(/[^\d.]/g, ''));
+}
+function syncCliQuota(raw) {
+  if (!raw) return;
+  const m = /AI Credits[^\d]{0,40}([\d.,]+)\s*\/\s*([\d.,]+)/i.exec(raw);
+  if (!m) return;
+  const used = parseNumLoose(m[1]);
+  const total = parseNumLoose(m[2]);
+  if (!Number.isFinite(used) || !Number.isFinite(total) || used < 0 || total <= 0) return;
+  const u = loadUsage();
+  const roundedUsed = Math.round(used * 100) / 100;
+  const currentPlan = (u.plan || 'max').toLowerCase();
+  const currentBase = PLAN_CREDITS[currentPlan] !== undefined ? PLAN_CREDITS[currentPlan] : 20000;
+  const currentExtra = typeof u.extraCredits === 'number' ? u.extraCredits : 0;
+  const currentTotal = currentBase + currentExtra;
+  // Si ya tenemos una cuota mayor (ej. Max 20000), ignorar lecturas menores del CLI.
+  if (total < currentTotal) return;
+  u.spent = roundedUsed;
+  if (total === 20000) u.plan = 'max';
+  else if (total === 7000) u.plan = 'pro+';
+  else if (total === 1500) u.plan = 'pro';
+  else if (total > 0) {
+    const base = PLAN_CREDITS[(u.plan || 'max').toLowerCase()] || 20000;
+    u.extraCredits = Math.max(0, Math.round((total - base) * 100) / 100);
+  }
+  u.lastCliCreditsSeen = roundedUsed;
+  u.lastCliCreditsTotal = Math.round(total * 100) / 100;
+  u.syncedAt = Date.now();
+  saveUsage(u);
+}
+function syncQuotaManual(payload) {
+  const b = payload || {};
+  const used = parseNumLoose(b.used);
+  const total = parseNumLoose(b.total);
+  const planRaw = String(b.plan || '').toLowerCase().trim();
+  if (!Number.isFinite(used) || used < 0 || !Number.isFinite(total) || total <= 0) return null;
+  const u = loadUsage();
+  const roundedUsed = Math.round(used * 100) / 100;
+  const roundedTotal = Math.round(total * 100) / 100;
+  u.spent = roundedUsed;
+  if (planRaw === 'max' || roundedTotal === 20000) u.plan = 'max';
+  else if (planRaw === 'pro+' || planRaw === 'proplus' || roundedTotal === 7000) u.plan = 'pro+';
+  else if (planRaw === 'pro' || roundedTotal === 1500) u.plan = 'pro';
+  else if (planRaw === 'free' || roundedTotal === 0) u.plan = 'free';
+  const base = PLAN_CREDITS[(u.plan || 'max').toLowerCase()] !== undefined ? PLAN_CREDITS[(u.plan || 'max').toLowerCase()] : 20000;
+  u.extraCredits = Math.max(0, Math.round((roundedTotal - base) * 100) / 100);
+  u.planLocked = true;
+  u.lastCliCreditsSeen = roundedUsed;
+  u.lastCliCreditsTotal = roundedTotal;
+  u.syncedAt = Date.now();
+  u.syncedFrom = 'manual';
+  saveUsage(u);
+  return quotaInfo();
+}
 function quotaInfo() {
   const u = loadUsage();
-  const plan = (u.plan || 'pro+').toLowerCase();
-  const total = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 7000;
+  const plan = (u.plan || 'max').toLowerCase();
+  const base = PLAN_CREDITS[plan] !== undefined ? PLAN_CREDITS[plan] : 20000;
+  const extra = typeof u.extraCredits === 'number' ? u.extraCredits : 0;
+  const total = base + extra;
   const remaining = Math.max(0, Math.round((total - u.spent) * 100) / 100);
-  return { plan, total, spent: u.spent, remaining, month: u.month };
+  return { plan, base, extra, total, spent: u.spent, remaining, month: u.month };
+}
+
+// ===== Contador independiente de consumo Google/Vertex (no comparte cuota con Copilot) =====
+const GOOGLE_USAGE_FILE = path.join(os.homedir(), '.hanstlers', 'google-usage.json');
+// Precios oficiales Vertex AI / Gemini API (USD por 1M tokens, tier estandar).
+const GOOGLE_PRICING = [
+  { match: /gemini-2\.5-flash/i, in: 0.30, out: 2.50 },
+  { match: /gemini-2\.5-pro/i, in: 1.25, out: 10.00 },
+  { match: /gemini-1\.5-flash/i, in: 0.075, out: 0.30 },
+  { match: /gemini-1\.5-pro/i, in: 1.25, out: 5.00 },
+  { match: /gemini.*flash/i, in: 0.75, out: 3.75 },   // fallback futuras versiones flash
+  { match: /gemini.*pro/i, in: 2.00, out: 8.00 }       // fallback futuras versiones pro
+];
+function priceForModel(model) {
+  const m = String(model || '');
+  const hit = GOOGLE_PRICING.find((p) => p.match.test(m));
+  return hit || { in: 0.75, out: 3.75 };
+}
+function loadGoogleUsage() {
+  let g = {};
+  try { g = JSON.parse(fs.readFileSync(GOOGLE_USAGE_FILE, 'utf8')); } catch (e) {}
+  if (g.month !== monthKey()) g = { month: monthKey(), promptTokens: 0, outputTokens: 0, costUsd: 0, calls: 0 };
+  if (!Number.isFinite(g.promptTokens)) g.promptTokens = 0;
+  if (!Number.isFinite(g.outputTokens)) g.outputTokens = 0;
+  if (!Number.isFinite(g.costUsd)) g.costUsd = 0;
+  if (!Number.isFinite(g.calls)) g.calls = 0;
+  return g;
+}
+function saveGoogleUsage(g) {
+  try { fs.mkdirSync(path.dirname(GOOGLE_USAGE_FILE), { recursive: true }); fs.writeFileSync(GOOGLE_USAGE_FILE, JSON.stringify(g)); } catch (e) {}
+}
+function addGoogleTokens(model, promptTokens, outputTokens) {
+  const g = loadGoogleUsage();
+  const price = priceForModel(model);
+  const inTok = Number.isFinite(promptTokens) && promptTokens > 0 ? promptTokens : 0;
+  const outTok = Number.isFinite(outputTokens) && outputTokens > 0 ? outputTokens : 0;
+  g.promptTokens += inTok;
+  g.outputTokens += outTok;
+  g.costUsd = Math.round((g.costUsd + (inTok / 1e6) * price.in + (outTok / 1e6) * price.out) * 1e6) / 1e6;
+  g.calls += 1;
+  saveGoogleUsage(g);
+  return g;
+}
+function googleQuotaInfo() {
+  const g = loadGoogleUsage();
+  const totalTokens = g.promptTokens + g.outputTokens;
+  return { promptTokens: g.promptTokens, outputTokens: g.outputTokens, totalTokens, costUsd: g.costUsd, calls: g.calls, month: g.month };
+}
+
+// ===== Auto-sync silencioso desde GitHub Billing (headless) =====
+const githubQuotaSyncState = {
+  running: false,
+  lastRunAt: 0,
+  lastOkAt: 0,
+  lastError: '',
+  lastSource: '',
+  lastUsed: null,
+  lastTotal: null
+};
+function loadGithubQuotaSyncCfg() {
+  const base = {
+    enabled: true,
+    intervalMin: 30,
+    url: GITHUB_QUOTA_DEFAULT_URL,
+    useGhCli: true,
+    cookie: process.env.HANSTLERS_GITHUB_COOKIE || '',
+    chromePath: process.env.HANSTLERS_CHROME_PATH || '',
+    profileDir: process.env.HANSTLERS_CHROME_PROFILE_DIR || ''
+  };
+  try {
+    const raw = JSON.parse(fs.readFileSync(GITHUB_QUOTA_SYNC_FILE, 'utf8'));
+    if (raw && typeof raw === 'object') {
+      if (typeof raw.enabled === 'boolean') base.enabled = raw.enabled;
+      if (Number.isFinite(Number(raw.intervalMin))) base.intervalMin = Math.max(5, Math.min(240, Number(raw.intervalMin)));
+      if (raw.url) base.url = String(raw.url);
+      if (typeof raw.useGhCli === 'boolean') base.useGhCli = raw.useGhCli;
+      if (raw.cookie) base.cookie = String(raw.cookie);
+      if (raw.chromePath) base.chromePath = String(raw.chromePath);
+      if (raw.profileDir) base.profileDir = String(raw.profileDir);
+    }
+  } catch (e) {}
+  return base;
+}
+function saveGithubQuotaSyncCfg(cfg) {
+  try {
+    fs.mkdirSync(path.dirname(GITHUB_QUOTA_SYNC_FILE), { recursive: true });
+    fs.writeFileSync(GITHUB_QUOTA_SYNC_FILE, JSON.stringify(cfg));
+  } catch (e) {}
+}
+function findChromePath(preferred) {
+  const cands = [];
+  if (preferred) cands.push(preferred);
+  cands.push(path.join(process.env['ProgramFiles'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'));
+  cands.push(path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'));
+  cands.push(path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'));
+  cands.push(path.join(process.env['ProgramFiles'] || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+  cands.push(path.join(process.env['ProgramFiles(x86)'] || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+  cands.push(path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+  for (const p of cands) {
+    if (!p) continue;
+    try { if (fs.existsSync(p)) return p; } catch (e) {}
+  }
+  return '';
+}
+function extractQuotaFromHtml(html) {
+  if (!html) return null;
+  const clean = String(html).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+  const m = /Included credits[\s\S]{0,800}?([0-9][0-9.,]*)\s*\/\s*([0-9][0-9.,]*)\s*AI credits/i.exec(clean);
+  if (!m) return null;
+  const used = parseNumLoose(m[1]);
+  const total = parseNumLoose(m[2]);
+  if (!Number.isFinite(used) || !Number.isFinite(total) || used < 0 || total <= 0) return null;
+  return { used, total };
+}
+function fetchGithubQuotaViaCookie(cfg, cb) {
+  if (!cfg.cookie) return cb(new Error('cookie missing'));
+  let u;
+  try { u = new URL(cfg.url || GITHUB_QUOTA_DEFAULT_URL); } catch (e) { return cb(e); }
+  const req = https.request({
+    hostname: u.hostname,
+    path: (u.pathname || '/') + (u.search || ''),
+    method: 'GET',
+    timeout: 30000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 HanstlerS/1.0',
+      'Cookie': cfg.cookie
+    }
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => {
+      body += c.toString();
+      if (body.length > 3 * 1024 * 1024) body = body.slice(-3 * 1024 * 1024);
+    });
+    res.on('end', () => {
+      if (res.statusCode !== 200) return cb(new Error('http ' + res.statusCode));
+      const q = extractQuotaFromHtml(body);
+      if (!q) return cb(new Error('quota not found in html'));
+      cb(null, q, 'cookie');
+    });
+  });
+  req.on('error', (e) => cb(e));
+  req.on('timeout', () => { req.destroy(new Error('timeout')); });
+  req.end();
+}
+function fetchGithubQuotaViaHeadless(cfg, cb) {
+  const browser = findChromePath(cfg.chromePath);
+  if (!browser) return cb(new Error('chrome not found'));
+  const targetUrl = cfg.url || GITHUB_QUOTA_DEFAULT_URL;
+  const args = ['--headless=new', '--disable-gpu', '--disable-extensions', '--dump-dom', targetUrl];
+  const profileRoot = cfg.profileDir || path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'User Data');
+  if (profileRoot) {
+    args.push('--user-data-dir=' + profileRoot);
+    args.push('--profile-directory=Default');
+  }
+  const child = spawn(browser, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  let err = '';
+  let done = false;
+  const finish = (e, q) => {
+    if (done) return;
+    done = true;
+    clearTimeout(t);
+    cb(e, q, 'headless');
+  };
+  const t = setTimeout(() => { try { child.kill(); } catch (e) {} finish(new Error('headless timeout')); }, 35000);
+  child.stdout.on('data', (d) => {
+    out += d.toString();
+    if (out.length > 3 * 1024 * 1024) out = out.slice(-3 * 1024 * 1024);
+  });
+  child.stderr.on('data', (d) => {
+    err += d.toString();
+    if (err.length > 2000) err = err.slice(-2000);
+  });
+  child.on('error', (e) => finish(e));
+  child.on('close', () => {
+    const q = extractQuotaFromHtml(out);
+    if (!q) return finish(new Error('headless parse failed' + (err ? ': ' + err : '')));
+    finish(null, q);
+  });
+}
+function fetchGithubQuotaViaGhCli(cb) {
+  const args = ['api', '/copilot_internal/user'];
+  let out = '';
+  let err = '';
+  const child = spawn('gh', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let done = false;
+  const finish = (e, q) => {
+    if (done) return;
+    done = true;
+    clearTimeout(t);
+    cb(e, q, 'gh-cli');
+  };
+  const t = setTimeout(() => { try { child.kill(); } catch (e) {} finish(new Error('gh api timeout')); }, 30000);
+  child.stdout.on('data', (d) => { out += d.toString(); });
+  child.stderr.on('data', (d) => { err += d.toString(); if (err.length > 2000) err = err.slice(-2000); });
+  child.on('error', (e) => finish(e));
+  child.on('close', (code) => {
+    if (code !== 0) return finish(new Error(('gh api failed: ' + (err || ('exit ' + code))).trim()));
+    let obj = null;
+    try { obj = JSON.parse(out || '{}'); } catch (e) { return finish(new Error('gh api json parse failed')); }
+    const snap = obj && obj.quota_snapshots && obj.quota_snapshots.premium_interactions;
+    if (!snap) return finish(new Error('gh api missing premium_interactions'));
+    const used = Number(snap.credits_used);
+    const total = Number(snap.entitlement);
+    if (!Number.isFinite(used) || used < 0 || !Number.isFinite(total) || total <= 0) {
+      return finish(new Error('gh api invalid quota values'));
+    }
+    finish(null, { used, total });
+  });
+}
+function autoSyncGithubQuota(reason, done) {
+  if (githubQuotaSyncState.running) return done && done(null, { skipped: true, reason: 'already-running' });
+  const cfg = loadGithubQuotaSyncCfg();
+  if (!cfg.enabled) return done && done(null, { skipped: true, reason: 'disabled' });
+  githubQuotaSyncState.running = true;
+  githubQuotaSyncState.lastRunAt = Date.now();
+  const finish = (err, result) => {
+    githubQuotaSyncState.running = false;
+    if (err) {
+      githubQuotaSyncState.lastError = err.message || String(err);
+      return done && done(err);
+    }
+    githubQuotaSyncState.lastError = '';
+    githubQuotaSyncState.lastOkAt = Date.now();
+    githubQuotaSyncState.lastSource = result.source || '';
+    githubQuotaSyncState.lastUsed = result.used;
+    githubQuotaSyncState.lastTotal = result.total;
+    done && done(null, result);
+  };
+  const applyQuota = (q, src) => {
+    const synced = syncQuotaManual({ used: q.used, total: q.total, plan: q.total >= 20000 ? 'max' : '' });
+    if (!synced) return finish(new Error('sync invalid values'));
+    finish(null, { source: src, used: synced.spent, total: synced.total, quota: synced, reason: reason || 'auto' });
+  };
+  const tryHeadless = () => {
+    fetchGithubQuotaViaHeadless(cfg, (e2, q2, src2) => {
+      if (e2 || !q2) return finish(e2 || new Error('sync failed'));
+      applyQuota(q2, src2);
+    });
+  };
+  const tryCookie = () => {
+    fetchGithubQuotaViaCookie(cfg, (e1, q1, src1) => {
+      if (!e1 && q1) return applyQuota(q1, src1);
+      tryHeadless();
+    });
+  };
+  if (cfg.useGhCli !== false) {
+    fetchGithubQuotaViaGhCli((e0, q0, src0) => {
+      if (!e0 && q0) return applyQuota(q0, src0);
+      tryCookie();
+    });
+    return;
+  }
+  tryCookie();
+}
+let githubQuotaSyncTimer = null;
+function scheduleGithubQuotaSync() {
+  if (githubQuotaSyncTimer) clearInterval(githubQuotaSyncTimer);
+  const cfg = loadGithubQuotaSyncCfg();
+  const everyMs = Math.max(5, Math.min(240, Number(cfg.intervalMin) || 30)) * 60 * 1000;
+  if (!cfg.enabled) return;
+  setTimeout(() => { autoSyncGithubQuota('startup', () => {}); }, 15000);
+  githubQuotaSyncTimer = setInterval(() => { autoSyncGithubQuota('interval', () => {}); }, everyMs);
 }
 
 function readBody(req) {
@@ -856,10 +2463,41 @@ function readBody(req) {
   });
 }
 
+const HISTORY_MAX_ITEMS = Math.max(2, Math.min(12, Number(process.env.HANSTLERS_HISTORY_MAX_ITEMS || 6)));
+const HISTORY_MAX_CHARS = Math.max(800, Math.min(12000, Number(process.env.HANSTLERS_HISTORY_MAX_CHARS || 3200)));
+const HISTORY_SUMMARY_MAX_CHARS = Math.max(200, Math.min(8000, Number(process.env.HANSTLERS_HISTORY_SUMMARY_MAX_CHARS || 2200)));
+function trimText(s, max) {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  return t.length > max ? (t.slice(0, Math.max(0, max - 1)) + '…') : t;
+}
+function normalizeHistoryItem(m) {
+  if (!m || typeof m !== 'object') return null;
+  const role = String(m.role || '').toLowerCase() === 'user' ? 'user' : 'assistant';
+  const content = trimText(m.content || m.html || '', 600);
+  if (!content) return null;
+  return { role, content };
+}
+function compactHistoryInput(rawHistory, rawSummary) {
+  const norm = (Array.isArray(rawHistory) ? rawHistory : []).map(normalizeHistoryItem).filter(Boolean);
+  const lastItems = norm.slice(Math.max(0, norm.length - HISTORY_MAX_ITEMS));
+  const out = [];
+  let chars = 0;
+  for (let i = lastItems.length - 1; i >= 0; i--) {
+    const item = lastItems[i];
+    const size = item.content.length;
+    if (out.length > 0 && (chars + size > HISTORY_MAX_CHARS)) break;
+    out.unshift(item);
+    chars += size;
+  }
+  const summary = trimText(rawSummary || '', HISTORY_SUMMARY_MAX_CHARS);
+  return { history: out, summary };
+}
+
 function handleChat(req, res, body) {
   let message = (body.message || '').trim();
   const images = Array.isArray(body.images) ? body.images : [];
-  // Guardar imágenes pegadas/arrastradas y referenciarlas con @ruta para el CLI.
+  // Guardar imÃ¡genes pegadas/arrastradas y referenciarlas con @ruta para el CLI.
   const savedPaths = [];
   try {
     const dir = path.join(os.tmpdir(), 'hanstlers-img');
@@ -875,7 +2513,7 @@ function handleChat(req, res, body) {
   } catch (e) {}
   if (savedPaths.length) {
     const refs = savedPaths.map((p) => '@' + p).join(' ');
-    message = message ? (message + '\n\n' + refs) : ('Describe estas imágenes: ' + refs);
+    message = message ? (message + '\n\n' + refs) : ('Describe estas imÃ¡genes: ' + refs);
   }
   // Documentos de texto adjuntos: {name, text}. Se inyectan como contexto.
   const files = Array.isArray(body.files) ? body.files : [];
@@ -890,7 +2528,24 @@ function handleChat(req, res, body) {
   }
   if (!message) { res.writeHead(400); return res.end('empty'); }
 
-  // Auto-capturar memoria: órdenes explícitas + hechos declarativos.
+  const compactCtxForIntent = compactHistoryInput(body.history, body.historySummary);
+  if (isXtudioLaunchIntent(body.message || message, compactCtxForIntent.history, compactCtxForIntent.summary)) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    const send = (event, data) => { try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {} };
+    send('route', { model: 'local-launcher', reason: 'xtudio-direct-launch' });
+    return launchXtudio1((err, pid) => {
+      if (err) send('error', 'No se pudo lanzar Xtudio-1: ' + err.message);
+      else send('chunk', 'Xtudio-1 lanzado correctamente' + (pid ? (' (PID ' + pid + ')') : '') + '.');
+      send('done', { code: err ? 1 : 0 });
+      try { res.end(); } catch (_) {}
+    });
+  }
+
+  // Auto-capturar memoria: Ã³rdenes explÃ­citas + hechos declarativos.
   let memNote = '';
   const facts = detectMemory((body.message || '').trim());
   if (facts.length) {
@@ -903,22 +2558,64 @@ function handleChat(req, res, body) {
   const sessionId = (body.sessionId || '').trim();
   const convId = (body.convId || '').trim();
   const model = (body.model || '').trim();
+  const statelessMode = !!body.stateless;
+  const repoPath = String(body.repoPath || '').trim();
+  const repoRef = String(body.repoRef || '').trim();
+  let reqCwd = state.cwd;
+  if (repoPath) {
+    try {
+      const p = path.resolve(repoPath);
+      const st = fs.statSync(p);
+      if (st && st.isDirectory()) reqCwd = p;
+    } catch (e) {}
+  }
+  const fromLocalAgent = !!req.headers['x-hanstlers-local-agent'];
+  const requestedModel = model || state.model;
+  const routePick = chooseModelForRequest(requestedModel, body.message || message, (images.length > 0 || files.length > 0), fromLocalAgent);
+  const reqModel = routePick.model || model || state.model;
+  const isXCoreReq = (reqModel === 'x-core' || reqModel === 'x-core:latest');
 
   // AHORRO DE TOKENS: inyectar la memoria SOLO cuando aporta valor:
-  //  - primer mensaje de la conversación (aún no hay sesión que la contenga), o
+  //  - primer mensaje de la conversaciÃ³n (aÃºn no hay sesiÃ³n que la contenga), o
   //  - el usuario pregunta/alude a la memoria ("recuerdas", "acuerdas", "sabes que"...).
-  const asksMemory = /\b(recuerdas?|te acuerdas|acuerdas|sab[eí]as?|dijimos|hab[ií]amos|mencion[eé]|coment[eé])\b/i.test(body.message || '');
-  const firstTurn = !sessionId;
-  const mem = (firstTurn || asksMemory) ? memoryContextBlock() : '';
-  const finalMessage = mem ? (mem + 'Mensaje del usuario:\n' + message) : message;
+  const asksMemory = /\b(recuerdas?|te acuerdas|acuerdas|sab[eÃ­]as?|dijimos|hab[iÃ­]amos|mencion[eÃ©]|coment[eÃ©])\b/i.test(body.message || '');
+  const firstTurn = statelessMode ? true : !sessionId;
+  // En Vertex evita inyectar memoria automÃ¡tica en primer turno para no arrastrar contexto viejo.
+  const autoMemoryOnFirstTurn = !isVertexModel(reqModel);
+  const mem = (isXCoreReq ? '' : (((firstTurn && autoMemoryOnFirstTurn) || asksMemory) ? memoryContextBlock() : ''));
 
-  // Imágenes para visión (Azure): pasamos las data URLs válidas tal cual.
+  // ImÃ¡genes para visiÃ³n (Azure): pasamos las data URLs vÃ¡lidas tal cual.
   const visionImages = images.filter((im) => /^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(im || '')).slice(0, 6);
 
-  detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, model, memNote, Array.isArray(body.history) ? body.history : [], visionImages));
+  const compactCtx = compactCtxForIntent;
+  const convHistoryArr = compactCtx.history;
+  const convHistorySummary = compactCtx.summary;
+  const launch = (projCtx) => {
+    let finalMessage = message;
+    const blocks = [];
+    if (projCtx && !isXCoreReq) blocks.push('--- CONTEXTO DEL PROYECTO ---\n' + projCtx + '\n--- FIN CONTEXTO ---');
+    if (mem) blocks.push(mem.trimEnd());
+    if (blocks.length) finalMessage = blocks.join('\n\n') + '\n\nMensaje del usuario:\n' + message;
+    const feats = currentFeatures();
+    const isAzureFamily = reqModel === 'azure' || reqModel === 'azure-gpt-5-mini' || reqModel === 'azure-agent';
+    if (feats.proResponseMode && !isXCoreReq && !isAzureFamily && !looksLikeExecutionTask(message)) {
+      finalMessage = wrapProResponsePrompt(finalMessage);
+    }
+    detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, reqModel, memNote, convHistoryArr, convHistorySummary, visionImages, routePick, reqCwd, statelessMode));
+  };
+  // Inyectar contexto del proyecto solo en el primer turno de cada conversaciÃ³n.
+  if (firstTurn && !isXCoreReq) {
+    if (repoRef) {
+      fetchGithubRepoContext(req.authUser, repoRef, (_err, projCtx) => launch(projCtx || ''));
+    } else {
+      buildProjectContext(reqCwd, (projCtx) => launch(projCtx));
+    }
+  } else {
+    launch('');
+  }
 }
 
-function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory, visionImages) {
+function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory, convHistorySummary, visionImages, routePick, runCwd, statelessMode) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -928,19 +2625,80 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
   const send = (event, data) => { if (ended) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {} };
   res.on('close', () => { ended = true; });
 
-  // Avisar al cliente que se guardó un dato en memoria (para mostrar chip discreto).
+  // Avisar al cliente que se guardÃ³ un dato en memoria (para mostrar chip discreto).
   if (memNote) send('memory', { text: memNote });
+  if (routePick && routePick.reason && routePick.model) send('route', routePick);
 
   const effModel = model || state.model;
+  const useCwd = (runCwd && String(runCwd).trim()) ? String(runCwd).trim() : state.cwd;
+  state.convSessions = state.convSessions || {};
+  let effSession = statelessMode ? '' : (sessionId || (convId ? state.convSessions[convId] : '') || '');
+
+  // RUTA X-CORE LOCAL.
+  if (effModel === 'x-core' || effModel === 'x-core:latest') {
+    let aborted = false;
+    runXCore(
+      message,
+      Array.isArray(convHistory) ? convHistory : [],
+      send,
+      (code) => { if (!aborted) send('done', { code }); res.end(); },
+      (killer) => { req.on('close', () => { aborted = true; killer(); }); }
+    );
+    return;
+  }
+
+  // RUTA VERTEX (Google): auto + selección manual de modelo.
+  if (isVertexModel(effModel)) {
+    let aborted = false;
+    runVertex(
+      message,
+      Array.isArray(convHistory) ? convHistory : [],
+      convHistorySummary || '',
+      effModel,
+      send,
+      (code, reason) => {
+        if (aborted) return;
+        if (code === 0) {
+          send('done', { code: 0 });
+          try { res.end(); } catch (e) {}
+          return;
+        }
+        if (isVertexOnlyMode(effModel)) {
+          send('error', reason || 'Vertex falló y el modo solo-Vertex está activo.');
+          send('done', { code: 1 });
+          try { res.end(); } catch (e) {}
+          return;
+        }
+        send('status', (reason ? (reason + ' ') : '') + 'Usando respaldo…');
+        send('route', { model: 'claude-sonnet-5', reason: 'vertex-fallback' });
+        return attempt(!state.autoOnly, { sessionId: effSession, model: 'claude-sonnet-5' }, false);
+      },
+      (killer) => { req.on('close', () => { aborted = true; killer(); }); },
+      visionImages || []
+    );
+    return;
+  }
 
   // RUTA AZURE (BYOK): si el modelo elegido es Azure, llamar directo a tu recurso.
   if (effModel === 'azure' || effModel === 'azure-gpt-5-mini') {
     let aborted = false;
+    let azureTokens = 0;
+    const sendAzure = (event, data) => {
+      if (event === 'chunk' && typeof data === 'string') azureTokens += Math.ceil(data.length / 4);
+      send(event, data);
+    };
     runAzure(
       message,
       Array.isArray(convHistory) ? convHistory : [],
-      send,
-      (code) => { if (!aborted) { send('done', { code }); } res.end(); },
+      convHistorySummary || '',
+      sendAzure,
+      (code) => {
+        if (!aborted) {
+          if (azureTokens > 0) { const est = Math.round(azureTokens / 100) / 10; addSpent(est); send('usage', { quota: quotaInfo() }); }
+          send('done', { code });
+        }
+        res.end();
+      },
       (killer) => { req.on('close', () => { aborted = true; killer(); }); },
       visionImages || []
     );
@@ -950,38 +2708,43 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
   // RUTA AZURE AGENTE: modelo con herramientas (lee/escribe archivos, ejecuta comandos).
   if (effModel === 'azure-agent') {
     let agentDone = false;
+    let azureAgentTokens = 0;
+    const sendAgent = (event, data) => {
+      if (event === 'chunk' && typeof data === 'string') azureAgentTokens += Math.ceil(data.length / 4);
+      send(event, data);
+    };
     runAzureAgent(
       message,
       Array.isArray(convHistory) ? convHistory : [],
-      send,
-      (code) => { if (agentDone) return; agentDone = true; send('done', { code }); try { res.end(); } catch (e) {} },
+      convHistorySummary || '',
+      sendAgent,
+      (code) => {
+        if (agentDone) return; agentDone = true;
+        if (azureAgentTokens > 0) { const est = Math.round(azureAgentTokens / 100) / 10; addSpent(est); send('usage', { quota: quotaInfo() }); }
+        send('done', { code }); try { res.end(); } catch (e) {}
+      },
       (killer) => { req.on('close', () => killer()); },
-      visionImages || [],
-      convId
+      visionImages || []
     );
     return;
   }
-
-
-  state.convSessions = state.convSessions || {};
-  let effSession = sessionId || (convId ? state.convSessions[convId] : '') || '';
 
   function launchRaw(withModel, opts) {
     const a = buildArgs(message, opts, withModel);
     // PREFERIDO: ejecutar el binario nativo copilot.exe DIRECTO y OCULTO (sin ventana negra).
     const bin = resolveCopilotBinary();
     if (bin) {
-      return spawn(bin, a, { cwd: state.cwd, env: process.env, windowsHide: true });
+      return spawn(bin, a, { cwd: useCwd, env: process.env, windowsHide: true });
     }
     const loader = resolveLoader();
     if (loader) {
-      // Respaldo: Electron ejecuta el loader como Node (ELECTRON_RUN_AS_NODE) — oculto.
-      return spawn(process.execPath, [loader].concat(a), { cwd: state.cwd, env: nodeEnv(), windowsHide: true });
+      // Respaldo: Electron ejecuta el loader como Node (ELECTRON_RUN_AS_NODE) â€” oculto.
+      return spawn(process.execPath, [loader].concat(a), { cwd: useCwd, env: nodeEnv(), windowsHide: true });
     }
     if (process.platform === 'win32') {
-      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: state.cwd, env: process.env, windowsHide: true });
+      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: useCwd, env: process.env, windowsHide: true });
     }
-    return spawn(COPILOT_CMD, a, { cwd: state.cwd, env: process.env, windowsHide: true });
+    return spawn(COPILOT_CMD, a, { cwd: useCwd, env: process.env, windowsHide: true });
   }
 
   function attempt(withModel, opts, isRetry) {
@@ -997,6 +2760,7 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
     let gotOutput = false;
     let sessionEmitted = false;
     const rememberSession = (id) => {
+      if (statelessMode) return;
       if (id && convId) { state.convSessions = state.convSessions || {}; state.convSessions[convId] = id; }
     };
     const emitSession = (text) => {
@@ -1015,13 +2779,13 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
         state.autoOnly = true;
         return attempt(false, opts, true);
       }
-      // Si --resume falló (sesión inexistente), reintenta sin reanudar (conservando el modelo).
+      // Si --resume fallÃ³ (sesiÃ³n inexistente), reintenta sin reanudar (conservando el modelo).
       if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
         return attempt(withModel, { model: opts.model }, true);
       }
       filter.flush();
       emitSession(raw);
-      // Respaldo: si no se detectó en la salida, buscar la sesión más reciente en disco.
+      // Respaldo: si no se detectÃ³ en la salida, buscar la sesiÃ³n mÃ¡s reciente en disco.
       if (!sessionEmitted) {
         const id = newestSessionId();
         if (id) { rememberSession(id); send('session', { id }); }
@@ -1030,15 +2794,15 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       if (!gotOutput) {
         const rawClean = (raw || '').trim();
         if (rawClean) send('chunk', rawClean);
-        else send('chunk', '⚠️ No hubo respuesta del modelo. Verifica que tu sesión de Copilot esté activa (abre "Iniciar sesión en Copilot") y que tu plan permita este modelo. Si acabas de comprar créditos, cierra y vuelve a abrir HanstlerS.');
+        else send('chunk', 'âš ï¸ No hubo respuesta del modelo. Verifica que tu sesiÃ³n de Copilot estÃ© activa (abre "Iniciar sesiÃ³n en Copilot") y que tu plan permita este modelo. Si acabas de comprar crÃ©ditos, cierra y vuelve a abrir HanstlerS.');
       }
-      // Medidor: extraer créditos AI de la salida del CLI y calcular lo que resta.
+      // Medidor: extraer crÃ©ditos AI de la salida del CLI y calcular lo que resta.
       const usage = {};
       const cr = /AI Credits\s+([\d.]+)/i.exec(raw);
       if (cr) usage.credits = parseFloat(cr[1]);
       const tk = /Tokens[\s\S]{0,40}?([\d.]+k?)\b/i.exec(raw);
       if (tk) usage.tokens = tk[1];
-      if (usage.credits > 0) addSpent(usage.credits);
+      syncCliQuota(raw);
       usage.quota = quotaInfo();
       send('usage', usage);
       send('done', { code });
@@ -1060,13 +2824,17 @@ function listConversations() {
   ensureConvDir();
   let files = [];
   try { files = fs.readdirSync(CONV_DIR).filter((f) => f.endsWith('.json')); } catch (e) {}
-  const items = [];
+  const byId = new Map();
   for (const f of files) {
     try {
       const c = JSON.parse(fs.readFileSync(path.join(CONV_DIR, f), 'utf8'));
-      items.push({ id: c.id, title: c.title || 'Conversación', updatedAt: c.updatedAt || 0 });
+      if (!c || !c.id) continue;
+      const item = { id: c.id, title: c.title || 'ConversaciÃ³n', updatedAt: c.updatedAt || 0 };
+      const prev = byId.get(c.id);
+      if (!prev || Number(item.updatedAt || 0) > Number(prev.updatedAt || 0)) byId.set(c.id, item);
     } catch (e) {}
   }
+  const items = Array.from(byId.values());
   items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   return items;
 }
@@ -1077,27 +2845,36 @@ function saveConversation(conv) {
   try { fs.writeFileSync(convFile(conv.id), JSON.stringify(conv)); } catch (e) {}
 }
 function getConversation(id) {
-  try { return JSON.parse(fs.readFileSync(convFile(id), 'utf8')); } catch (e) { return null; }
+  try { return JSON.parse(fs.readFileSync(convFile(id), 'utf8')); } catch (e) {}
+  // Fallback: localizar por id aunque el archivo tenga sufijos (ej. .backup o _chat).
+  try {
+    const files = fs.readdirSync(CONV_DIR).filter((f) => f.endsWith('.json'));
+    for (const f of files) {
+      try {
+        const c = JSON.parse(fs.readFileSync(path.join(CONV_DIR, f), 'utf8'));
+        if (c && c.id === id) return c;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return null;
 }
 function deleteConversation(id) {
-  deleteAgentTranscript(id);
-  try { delete (state.convAgentMessages || {})[id]; } catch (e) {}
   try { fs.unlinkSync(convFile(id)); return true; } catch (e) { return false; }
 }
 
-// ===== AUTODIAGNÓSTICO: prueba cada eslabón en la PC del usuario =====
+// ===== AUTODIAGNÃ“STICO: prueba cada eslabÃ³n en la PC del usuario =====
 function runDiagnostics(cb) {
   const result = { checks: [], ok: false };
   const add = (name, ok, detail) => result.checks.push({ name, ok, detail: (detail || '').toString().slice(0, 300) });
 
-  // 1) Runtime (¿estamos en Electron?)
+  // 1) Runtime (Â¿estamos en Electron?)
   const inElectron = !!process.versions.electron;
   add('Entorno', true, inElectron ? ('Electron ' + process.versions.electron) : ('Node ' + process.version));
 
   // 2) CLI de Copilot (binario directo o loader)
   const bin = resolveCopilotBinary();
   const loader = resolveLoader();
-  add('CLI de Copilot instalado', !!(bin || loader), bin || loader || 'No se encontró Copilot. Instala con: npm install -g @github/copilot');
+  add('CLI de Copilot instalado', !!(bin || loader), bin || loader || 'No se encontrÃ³ Copilot. Instala con: npm install -g @github/copilot');
   if (!bin && !loader) { return cb(result); }
 
   // 3) Ejecutar el CLI (oculto) y probar respuesta real
@@ -1113,16 +2890,16 @@ function runDiagnostics(cb) {
     const authFail = /No authentication information found|run the '\/login'|gh auth login/i.test(raw);
     const policyBlock = /Access denied by policy|disabled by your organization/i.test(raw);
     const gotText = /\bOK\b/i.test(out) || (out.trim().length > 0 && !authFail && !policyBlock);
-    add('Ejecuta como Node', true, 'El binario ejecutó el CLI correctamente');
-    if (policyBlock) add('Política de organización', false, 'BLOQUEADO por política. Revisa Settings de Copilot / organización.');
-    else add('Política de organización', true, 'Sin bloqueo de política');
-    if (authFail) add('Sesión de Copilot', false, 'NO hay sesión. Abre PowerShell, ejecuta: copilot  y luego /login');
-    else add('Sesión de Copilot', true, 'Sesión activa');
-    add('Respuesta del modelo', gotText, gotText ? ('Respondió: ' + out.trim().slice(0, 80)) : ('Vacío. ' + (raw.trim().slice(0, 200) || 'sin salida')));
+    add('Ejecuta como Node', true, 'El binario ejecutÃ³ el CLI correctamente');
+    if (policyBlock) add('PolÃ­tica de organizaciÃ³n', false, 'BLOQUEADO por polÃ­tica. Revisa Settings de Copilot / organizaciÃ³n.');
+    else add('PolÃ­tica de organizaciÃ³n', true, 'Sin bloqueo de polÃ­tica');
+    if (authFail) add('SesiÃ³n de Copilot', false, 'NO hay sesiÃ³n. Abre PowerShell, ejecuta: copilot  y luego /login');
+    else add('SesiÃ³n de Copilot', true, 'SesiÃ³n activa');
+    add('Respuesta del modelo', gotText, gotText ? ('RespondiÃ³: ' + out.trim().slice(0, 80)) : ('VacÃ­o. ' + (raw.trim().slice(0, 200) || 'sin salida')));
     result.ok = !!loader && !policyBlock && !authFail && gotText;
     cb(result);
   };
-  const t = setTimeout(() => { try { child.kill(); } catch (e) {} add('Tiempo', false, 'El CLI tardó demasiado (timeout 45s)'); finish(); }, 45000);
+  const t = setTimeout(() => { try { child.kill(); } catch (e) {} add('Tiempo', false, 'El CLI tardÃ³ demasiado (timeout 45s)'); finish(); }, 45000);
   child.stdout.on('data', d => (out += stripAnsi(d.toString())));
   child.stderr.on('data', d => (err += stripAnsi(d.toString())));
   child.on('close', finish);
@@ -1136,24 +2913,253 @@ function pickFolder(res) {
     '$f.Description = "Elige la carpeta de tu proyecto";',
     'if ($f.ShowDialog() -eq "OK") { Write-Output $f.SelectedPath }'
   ].join(' ');
-  execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', ps], (err, stdout) => {
+  execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', ps], { windowsHide: true }, (err, stdout) => {
     const p = (stdout || '').trim();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    if (p) { state.cwd = p; state.started = false; }
+    if (p) { state.cwd = p; state.started = false; state.projectCtx = null; }
     res.end(JSON.stringify({ path: p || null, cwd: state.cwd }));
   });
 }
 
+function listQuickFolders() {
+  const home = os.homedir();
+  const candidates = [
+    { id: 'xtudio-1-main', name: 'Xtudio-1 (principal)', path: path.join(home, 'xtudio-1') },
+    { id: 'xtudio-1-docs', name: 'Xtudio-1 (Documentos)', path: path.join(home, 'OneDrive', 'Favoritos', 'Documentos', 'Xtudio-1') },
+    { id: 'xtudio-site', name: 'Xtudio sitio web', path: path.join(home, 'Documents', 'HanstlerS', 'xtudio-site') },
+    { id: 'xtudio-website', name: 'Xtudio website', path: path.join(home, 'xtudio-website') },
+    { id: 'xtudio-backend', name: 'Xtudio backend', path: path.join(home, 'Documents', 'HanstlerS', 'xtudio-backend') },
+    { id: 'xtudio-marketing', name: 'Xtudio marketing', path: path.join(home, 'Documents', 'HanstlerS', 'xtudio-marketing') },
+    { id: 'hanstlers-core', name: 'HanstlerS core', path: path.join(home, 'Documents', 'HanstlerS', 'HanstlerS') },
+    { id: 'dj-set-studio', name: 'DJ Set Studio', path: path.join(home, 'Documents', 'HanstlerS', 'dj-set-studio') }
+  ];
+  const out = [];
+  const seen = {};
+  candidates.forEach((c) => {
+    try {
+      const p = path.resolve(String(c.path || ''));
+      if (!p || seen[p.toLowerCase()]) return;
+      const st = fs.statSync(p);
+      if (!st || !st.isDirectory()) return;
+      seen[p.toLowerCase()] = true;
+      out.push({ id: c.id, name: c.name, path: p });
+    } catch (e) {}
+  });
+  return out;
+}
+function samePathKey(p) {
+  return String(p || '').replace(/[\\/]+$/, '').toLowerCase();
+}
+function pushRepoCandidate(list, seen, id, name, p) {
+  try {
+    const rp = path.resolve(String(p || ''));
+    if (!rp) return;
+    const key = samePathKey(rp);
+    if (!key || seen[key]) return;
+    const st = fs.statSync(rp);
+    if (!st || !st.isDirectory()) return;
+    seen[key] = true;
+    list.push({ id, name, path: rp });
+  } catch (e) {}
+}
+function listReposForPanel() {
+  const out = [];
+  const seen = {};
+  const cwd = path.resolve(String(state.cwd || os.homedir()));
+  pushRepoCandidate(out, seen, 'repo-cwd', 'Actual · ' + path.basename(cwd), cwd);
+  listQuickFolders().forEach((it) => pushRepoCandidate(out, seen, it.id, it.name, it.path));
+  const hsRoot = path.join(os.homedir(), 'Documents', 'HanstlerS');
+  let roots = [];
+  try { roots = fs.readdirSync(hsRoot); } catch (e) { roots = []; }
+  roots.slice(0, 80).forEach((name) => {
+    const full = path.join(hsRoot, name);
+    let include = false;
+    try {
+      const st = fs.statSync(full);
+      if (!st || !st.isDirectory()) return;
+      include = fs.existsSync(path.join(full, '.git')) || fs.existsSync(path.join(full, 'package.json')) || /xtudio|hanstler|xone|studio|web|site|backend|api|dj/i.test(name);
+    } catch (e) { include = false; }
+    if (!include) return;
+    pushRepoCandidate(out, seen, 'repo-hs-' + name.toLowerCase().replace(/[^a-z0-9_-]/g, ''), name, full);
+  });
+  out.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'es', { sensitivity: 'base' }));
+  return out;
+}
+
+function isPublicAuthPath(urlPath) {
+  return urlPath === '/auth/login' || urlPath.startsWith('/auth/callback') || urlPath === '/auth/logout' || urlPath === '/healthz';
+}
+function wantsHtml(req) {
+  const a = String(req.headers.accept || '');
+  return a.includes('text/html') || a.includes('*/*');
+}
+function requireAuthOrDeny(req, res) {
+  if (!authEnabled()) return { ok: true, user: null };
+  const r = readAuthUser(req);
+  if (r.ok && r.user) return { ok: true, user: r.user };
+  if (isPublicAuthPath((req.url || '').split('?')[0])) return { ok: true, user: null };
+  if (wantsHtml(req)) {
+    res.writeHead(302, { Location: '/auth/login' });
+    res.end();
+    return { ok: false };
+  }
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+  return { ok: false };
+}
+function requireAdminOrDeny(req, res) {
+  if (!authEnabled()) return true;
+  if (req.authUser && req.authUser.isAdmin) return true;
+  res.writeHead(403, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: false, error: 'forbidden' }));
+  return false;
+}
+
 const server = http.createServer(async (req, res) => {
  try {
+  const reqPath = (req.url || '').split('?')[0];
+  if (req.method === 'GET' && reqPath === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  if (req.method === 'GET' && reqPath === '/auth/login') {
+    if (!authEnabled()) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'oauth not configured' }));
+    }
+    const st = crypto.randomBytes(16).toString('hex');
+    oauthStates.set(st, Date.now());
+    const redirectUri = BASE_URL + '/auth/callback';
+    const gh = 'https://github.com/login/oauth/authorize?client_id=' + encodeURIComponent(GITHUB_CLIENT_ID)
+      + '&redirect_uri=' + encodeURIComponent(redirectUri)
+      + '&scope=' + encodeURIComponent('read:user read:org repo')
+      + '&state=' + encodeURIComponent(st);
+    res.writeHead(302, { Location: gh });
+    return res.end();
+  }
+  if (req.method === 'GET' && reqPath === '/auth/callback') {
+    if (!authEnabled()) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'oauth not configured' }));
+    }
+    const u = new URL(req.url, BASE_URL || 'http://localhost');
+    const code = (u.searchParams.get('code') || '').trim();
+    const st = (u.searchParams.get('state') || '').trim();
+    const ts = oauthStates.get(st) || 0;
+    oauthStates.delete(st);
+    if (!code || !st || !ts || (Date.now() - ts > 15 * 60 * 1000)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'invalid oauth state' }));
+    }
+    return exchangeGithubCode(code, (err, token) => {
+      if (err) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'oauth exchange failed: ' + err.message }));
+      }
+      githubRequest('/user', token, (uErr, ghUser) => {
+        if (uErr || !ghUser || !ghUser.login) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'github user fetch failed' }));
+        }
+        checkOrgMembership(token, (_mErr, inOrg) => {
+          const login = String(ghUser.login || '').toLowerCase();
+          if (!isAllowedUser(login) || !inOrg) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: false, error: 'user not allowed' }));
+          }
+          const sid = crypto.randomBytes(24).toString('hex');
+          authSessions.set(sid, {
+            login: login,
+            name: ghUser.name || ghUser.login,
+            avatarUrl: ghUser.avatar_url || '',
+            isAdmin: isAdminUser(login),
+            at: Date.now(),
+            githubToken: token
+          });
+          issueSessionCookie(res, sid);
+          res.writeHead(302, { Location: '/' });
+          return res.end();
+        });
+      });
+    });
+  }
+  if (req.method === 'POST' && reqPath === '/auth/logout') {
+    const c = parseCookies(req);
+    const tok = String(c.hs_session || '');
+    const sid = tok.split('.')[0] || '';
+    if (sid) authSessions.delete(sid);
+    clearSessionCookie(res);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  if (req.method === 'GET' && reqPath === '/auth/me') {
+    const r = readAuthUser(req);
+    if (!authEnabled()) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, enabled: false, user: null }));
+    }
+    if (!r.ok || !r.user) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, enabled: true, user: null }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, enabled: true, user: r.user }));
+  }
+  if (req.method === 'GET' && reqPath === '/api/gh/auth/status') {
+    return ghAuthStatus((_err, st) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(st || { ok: false, loggedIn: false, user: '' }));
+    });
+  }
+  if (req.method === 'POST' && reqPath === '/api/gh/auth/start') {
+    return startGhAuth((err) => {
+      res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(err ? { ok: false, error: err.message } : { ok: true }));
+    });
+  }
+  const gate = requireAuthOrDeny(req, res);
+  if (!gate.ok) return;
+  req.authUser = gate.user || null;
   if (req.method === 'POST' && req.url === '/api/chat') return handleChat(req, res, await readBody(req));
   if (req.method === 'POST' && req.url === '/api/agent/confirm') {
     const b = await readBody(req);
     const fn = b && b.id && pendingConfirms[b.id];
     if (fn) { fn(!!b.approved); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true })); }
-    res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'confirmación no encontrada o expirada' }));
+    res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'confirmaciÃ³n no encontrada o expirada' }));
   }
   if (req.method === 'GET' && req.url === '/api/pickfolder') return pickFolder(res);
+  if (req.method === 'GET' && req.url === '/api/folders/quick') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ items: listQuickFolders(), cwd: state.cwd }));
+  }
+  if (req.method === 'GET' && req.url === '/api/repos/list') {
+    return fetchUserReposForPanel(req.authUser, (err, items) => {
+      if (err) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ items: [], cwd: state.cwd, source: 'github', error: 'No se pudieron cargar repos de GitHub ahora.', detail: String(err.message || '') }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ items: items || [], cwd: state.cwd, source: 'github' }));
+    });
+  }
+  if (req.method === 'POST' && req.url === '/api/cwd') {
+    const b = await readBody(req);
+    const p = path.resolve(String((b && b.path) || ''));
+    let ok = false;
+    try {
+      const st = fs.statSync(p);
+      ok = !!(st && st.isDirectory());
+    } catch (e) { ok = false; }
+    if (!ok) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'invalid path', cwd: state.cwd }));
+    }
+    state.cwd = p;
+    state.started = false;
+    state.projectCtx = null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, cwd: state.cwd }));
+  }
   if (req.method === 'GET' && req.url === '/api/diagnose') {
     return runDiagnostics((result) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(result)); });
   }
@@ -1176,7 +3182,7 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       const audio = Buffer.concat(chunks);
       const ct = req.headers['content-type'] || 'audio/wav';
-      // Motor: cabecera x-engine ('local'|'azure') o auto (local si está, si no Azure).
+      // Motor: cabecera x-engine ('local'|'azure') o auto (local si estÃ¡, si no Azure).
       const engine = (req.headers['x-engine'] || '').toString().toLowerCase();
       const useLocal = engine === 'local' || (engine !== 'azure' && whisperAvailable());
       const reply = (err, text) => {
@@ -1200,11 +3206,171 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  if (req.method === 'GET' && req.url.startsWith('/api/xcore/stream')) {
+    const u = new URL(req.url, 'http://localhost');
+    const audioPath = decodeURIComponent((u.searchParams.get('path') || '').trim());
+    if (!audioPath || !path.isAbsolute(audioPath) || !XCORE_AUDIO_EXT_RE.test(audioPath)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'ruta de audio invalida' }));
+    }
+    fs.stat(audioPath, (err, st) => {
+      if (err || !st || !st.isFile()) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'audio no encontrado' }));
+      }
+      const mime = xcoreMimeFor(audioPath);
+      const range = req.headers.range;
+      if (range) {
+        const m = /bytes=(\d*)-(\d*)/.exec(String(range));
+        const start = m && m[1] ? Number(m[1]) : 0;
+        const end = m && m[2] ? Number(m[2]) : (st.size - 1);
+        const safeStart = Number.isFinite(start) ? Math.max(0, start) : 0;
+        const safeEnd = Number.isFinite(end) ? Math.min(st.size - 1, end) : (st.size - 1);
+        if (safeStart > safeEnd || safeStart >= st.size) {
+          res.writeHead(416);
+          return res.end();
+        }
+        res.writeHead(206, {
+          'Content-Type': mime,
+          'Content-Length': (safeEnd - safeStart + 1),
+          'Accept-Ranges': 'bytes',
+          'Content-Range': 'bytes ' + safeStart + '-' + safeEnd + '/' + st.size
+        });
+        return fs.createReadStream(audioPath, { start: safeStart, end: safeEnd }).pipe(res);
+      }
+      res.writeHead(200, {
+        'Content-Type': mime,
+        'Content-Length': st.size,
+        'Accept-Ranges': 'bytes'
+      });
+      fs.createReadStream(audioPath).pipe(res);
+    });
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/api/xcore/status') {
+    const cfg = currentXCore();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      ok: true,
+      config: cfg,
+      draining: xcoreDrain,
+      inFlight: xcoreInFlight,
+      file: XCORE_FILE,
+      lastReloadAt: xcoreLastReloadAt,
+      lastReloadError: xcoreLastReloadError
+    }));
+  }
+  if (req.method === 'POST' && req.url === '/api/xcore/reload') {
+    const cfg = reloadXCore(true);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, config: cfg, lastReloadAt: xcoreLastReloadAt, lastReloadError: xcoreLastReloadError }));
+  }
+  if (req.method === 'POST' && req.url === '/api/xcore/drain') {
+    const b = await readBody(req);
+    const enabled = !!(b && (b.enabled === true || b.enabled === 'true' || b.enabled === 1 || b.enabled === '1'));
+    const waitMsRaw = Number((b && b.waitMs) || 0);
+    const waitMs = Number.isFinite(waitMsRaw) ? Math.max(0, Math.min(120000, waitMsRaw)) : 0;
+    xcoreDrain = enabled;
+    if (enabled && waitMs > 0) {
+      const start = Date.now();
+      while (xcoreInFlight > 0 && (Date.now() - start) < waitMs) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      ok: true,
+      draining: xcoreDrain,
+      inFlight: xcoreInFlight,
+      drained: xcoreInFlight === 0,
+      waitedMs: enabled ? waitMs : 0
+    }));
+  }
   if (req.method === 'GET' && req.url === '/api/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ cwd: state.cwd, model: state.model, quota: quotaInfo() }));
+    return res.end(JSON.stringify({ cwd: state.cwd, model: state.model, quota: quotaInfo(), features: currentFeatures() }));
+  }
+  if (req.method === 'GET' && req.url === '/api/features') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(currentFeatures()));
+  }
+  if (req.method === 'POST' && req.url === '/api/features') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const b = await readBody(req);
+    const f = Object.assign({}, currentFeatures());
+    const keys = Object.keys(defaultFeatures());
+    keys.forEach((k) => {
+      if (typeof b[k] === 'boolean') f[k] = b[k];
+    });
+    saveFeatures(f);
+    reloadFeatures();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, features: currentFeatures() }));
   }
   if (req.method === 'GET' && req.url === '/api/quota') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(quotaInfo()));
+  }
+  if (req.method === 'GET' && req.url === '/api/quota/google') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(googleQuotaInfo()));
+  }
+  if (req.method === 'GET' && req.url === '/api/quota/sync/status') {
+    const cfg = loadGithubQuotaSyncCfg();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      ok: true,
+      config: { enabled: !!cfg.enabled, intervalMin: cfg.intervalMin, useGhCli: cfg.useGhCli !== false, url: cfg.url, hasCookie: !!cfg.cookie, hasChromePath: !!findChromePath(cfg.chromePath) },
+      state: githubQuotaSyncState,
+      quota: quotaInfo()
+    }));
+  }
+  if (req.method === 'POST' && req.url === '/api/quota/sync/run') {
+    if (!requireAdminOrDeny(req, res)) return;
+    return autoSyncGithubQuota('manual-run', (err, result) => {
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: err.message, state: githubQuotaSyncState }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, result, state: githubQuotaSyncState, quota: quotaInfo() }));
+    });
+  }
+  if (req.method === 'POST' && req.url === '/api/quota/sync/config') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const b = await readBody(req);
+    const cfg = loadGithubQuotaSyncCfg();
+    if (typeof b.enabled === 'boolean') cfg.enabled = b.enabled;
+    if (Number.isFinite(Number(b.intervalMin))) cfg.intervalMin = Math.max(5, Math.min(240, Number(b.intervalMin)));
+    if (typeof b.useGhCli === 'boolean') cfg.useGhCli = b.useGhCli;
+    if (typeof b.url === 'string' && b.url.trim()) cfg.url = b.url.trim();
+    if (typeof b.cookie === 'string') cfg.cookie = b.cookie.trim();
+    if (typeof b.chromePath === 'string') cfg.chromePath = b.chromePath.trim();
+    if (typeof b.profileDir === 'string') cfg.profileDir = b.profileDir.trim();
+    saveGithubQuotaSyncCfg(cfg);
+    scheduleGithubQuotaSync();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, config: { enabled: !!cfg.enabled, intervalMin: cfg.intervalMin, useGhCli: cfg.useGhCli !== false, url: cfg.url, hasCookie: !!cfg.cookie } }));
+  }
+  if (req.method === 'POST' && req.url === '/api/quota/sync') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const b = await readBody(req);
+    const q = syncQuotaManual(b);
+    if (!q) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'invalid used/total' }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(q));
+  }
+  if (req.method === 'POST' && req.url === '/api/saldo') {
+    const b = await readBody(req);
+    const add = parseFloat(b && b.add);
+    if (add > 0) {
+      const u = loadUsage();
+      u.extraCredits = Math.round(((u.extraCredits || 0) + add) * 100) / 100;
+      saveUsage(u);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(quotaInfo()));
   }
@@ -1216,27 +3382,37 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'GET' && req.url === '/api/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    const vtx = loadVertex();
+    const vPro = vtx && vtx.models && vtx.models.pro ? String(vtx.models.pro) : '';
+    const vFlash = vtx && vtx.models && vtx.models.flash ? String(vtx.models.flash) : '';
+    const vOpus = vtx && vtx.models && vtx.models.opus ? String(vtx.models.opus) : '';
     const models = [
-      { id: 'auto', name: 'Automático (recomendado)' }
+      { id: 'auto', name: 'Automatico (recomendado)' },
+      { id: 'x-core', name: 'X-Core local (HanstlerS)' },
+      { id: 'vertex-auto', name: 'Vertex Auto (Google: ' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') },
+      { id: 'vertex-gemini-pro', name: 'Vertex Gemini Pro (' + (vPro || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') },
+      { id: 'vertex-gemini-flash', name: 'Vertex Gemini Flash (' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') },
+      { id: 'vertex-claude-opus-5', name: 'Vertex Claude Opus 5 (Anthropic: ' + (vOpus || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') }
     ];
-    if (loadAzure()) models.push({ id: 'azure', name: '⚡ Azure gpt-5-mini (tu cuota, barato)' });
-    if (loadAzure()) models.push({ id: 'azure-agent', name: '🤖 Azure Agente (ejecuta archivos/comandos)' });
+    if (loadAzure()) models.push({ id: 'azure', name: 'Azure gpt-5-mini (tu cuota, barato)' });
+    if (loadAzure()) models.push({ id: 'azure-agent', name: 'Azure Agente (ejecuta archivos/comandos)' });
     models.push(
+      { id: 'claude-opus-5', name: 'Claude Opus 5 (maximo)' },
       { id: 'claude-sonnet-5', name: 'Claude Sonnet 5 (potente)' },
       { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6' },
       { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
-      { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5 (rápido)' },
+      { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5 (rapido)' },
       { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' },
       { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
       { id: 'gpt-5.4', name: 'GPT-5.4' },
-      { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex (código)' },
-      { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini (rápido)' },
-      { id: 'gpt-5-mini', name: 'GPT-5 mini (rápido)' },
+      { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex (codigo)' },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini (rapido)' },
+      { id: 'gpt-5-mini', name: 'GPT-5 mini (rapido)' },
       { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-      { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (rápido)' },
+      { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (rapido)' },
       { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code' },
-      { id: 'mai-code-1-flash', name: 'MAI-Code-1-Flash (rápido)' },
-      { id: '__custom__', name: 'Otro… (escribir ID)' }
+      { id: 'mai-code-1-flash', name: 'MAI-Code-1-Flash (rapido)' },
+      { id: '__custom__', name: 'Otro... (escribir ID)' }
     );
     return res.end(JSON.stringify({ current: state.model, models }));
   }
@@ -1291,6 +3467,16 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true }));
   }
+  if (req.method === 'GET' && req.url === '/api/trust') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ trust: trustMode }));
+  }
+  if (req.method === 'POST' && req.url === '/api/trust') {
+    const b = await readBody(req);
+    trustMode = !!(b && b.trust);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ trust: trustMode }));
+  }
   if (req.method === 'GET' && req.url === '/api/shutdown') {
     res.writeHead(200); res.end('bye');
     // En modo Electron no matamos el proceso (Electron gestiona el ciclo de vida).
@@ -1314,11 +3500,13 @@ process.on('unhandledRejection', (reason) => {
   try { console.error('unhandledRejection:', reason && reason.stack || reason); } catch (_) {}
 });
 function startListen() {
-  server.listen(PORT, '127.0.0.1', () => {
-    console.log(`HanstlerS escuchando en http://127.0.0.1:${PORT}`);
-    // Pre-calentar la detección de flags en segundo plano para que el
+  server.listen(PORT, HOST, () => {
+    console.log(`HanstlerS escuchando en http://${HOST}:${PORT}`);
+    // Pre-calentar la detecciÃ³n de flags en segundo plano para que el
     // PRIMER mensaje del usuario no pague el costo de `copilot --help`.
     setTimeout(() => { try { detectFlags(() => {}); } catch (e) {} }, 50);
+    // SincronizaciÃ³n silenciosa de cuota GitHub (si estÃ¡ habilitada).
+    scheduleGithubQuotaSync();
   });
 }
 
