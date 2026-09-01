@@ -12,7 +12,7 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.6.2'
+$script:AskCliVersion = '0.7.0'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
