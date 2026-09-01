@@ -35,18 +35,27 @@ function loadAzure() {
   try { const c = JSON.parse(fs.readFileSync(AZURE_FILE, 'utf8')); if (c && c.endpoint && c.key && c.deployment) return c; } catch (e) {}
   return null;
 }
+const VERTEX_FILE = path.join(os.homedir(), '.hanstlers', 'vertex.json');
 function loadVertex() {
-  const projectId = (process.env.GCP_PROJECT_ID || '').trim();
-  const region = (process.env.GCP_REGION || process.env.ANTHROPIC_VERTEX_REGION || 'us-central1').trim();
-  if (!projectId || !region) return null;
+  let fileCfg = {};
+  try { fileCfg = JSON.parse(fs.readFileSync(VERTEX_FILE, 'utf8')) || {}; } catch (e) {}
+  const projectId = String(process.env.GCP_PROJECT_ID || fileCfg.projectId || '').trim();
+  const region = String(process.env.GCP_REGION || process.env.ANTHROPIC_VERTEX_REGION || fileCfg.region || 'us-central1').trim();
+  let apiKey = String(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || fileCfg.apiKey || '').trim();
+  if (/^pega_aqui_/i.test(apiKey) || /tu_google_api_key/i.test(apiKey)) apiKey = '';
+  const hasProjectCfg = !!(projectId && region);
+  const hasApiKey = !!apiKey;
+  if (!hasProjectCfg && !hasApiKey) return null;
   return {
     projectId,
     region,
+    apiKey,
     models: {
-      pro: (process.env.VERTEX_MODEL_PRO || 'gemini-2.5-pro').trim(),
-      flash: (process.env.VERTEX_MODEL_FLASH || 'gemini-2.5-flash').trim(),
-      opus: (process.env.VERTEX_MODEL_OPUS || 'claude-opus-5').trim()
-    }
+      pro: String(process.env.VERTEX_MODEL_PRO || fileCfg.modelPro || 'gemini-2.5-pro').trim(),
+      flash: String(process.env.VERTEX_MODEL_FLASH || fileCfg.modelFlash || 'gemini-2.5-flash').trim(),
+      opus: String(process.env.VERTEX_MODEL_OPUS || fileCfg.modelOpus || 'claude-opus-5').trim()
+    },
+    authMode: hasProjectCfg ? 'adc' : 'api-key'
   };
 }
 
@@ -463,83 +472,95 @@ function toAnthropicMessages(history, message) {
 
 function runVertex(message, history, historySummary, selectedVertexModel, send, onDone, onAbort, images) {
   const cfg = loadVertex();
-  if (!cfg) return onDone(1, 'Vertex no configurado (GCP_PROJECT_ID/GCP_REGION).');
+  if (!cfg) return onDone(1, 'Vertex no configurado (GCP_PROJECT_ID/GCP_REGION o GOOGLE_API_KEY).');
   const pick = pickVertexTarget(selectedVertexModel, message, !!(images && images.length));
   if (!pick.model) return onDone(1, 'No se pudo resolver modelo Vertex.');
-  try {
-    getGcpAccessToken((tokErr, token) => {
-    if (tokErr) return onDone(1, 'Vertex auth: ' + tokErr.message);
-    const publisher = pick.publisher || 'google';
-    const method = publisher === 'anthropic' ? 'rawPredict' : 'generateContent';
-    const endpoint = `https://${cfg.region}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/locations/${encodeURIComponent(cfg.region)}/publishers/${encodeURIComponent(publisher)}/models/${encodeURIComponent(pick.model)}:${method}`;
+  if (pick.publisher === 'anthropic' && cfg.authMode !== 'adc') {
+    return onDone(1, 'Claude Opus en Vertex requiere GCP_PROJECT_ID/GCP_REGION y auth de gcloud (ADC).');
+  }
+  const finalMsg = historySummary ? (`Resumen acumulado:\n${historySummary}\n\nMensaje actual:\n${message}`) : message;
+  const payload = pick.publisher === 'anthropic'
+    ? JSON.stringify({
+      anthropic_version: 'vertex-2023-10-16',
+      messages: toAnthropicMessages(history, finalMsg),
+      temperature: 0.2,
+      max_tokens: 2048
+    })
+    : JSON.stringify({
+      contents: toGeminiContents(history, finalMsg, images),
+      generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
+    });
+  const parseAndEmit = (publisher, raw) => {
+    let j = null;
+    try { j = JSON.parse(raw || '{}'); } catch (e) { return { ok: false, err: 'Vertex devolvió una respuesta inválida.' }; }
+    let txt = '';
+    let promptTok = 0;
+    let outTok = 0;
+    if (publisher === 'anthropic') {
+      txt = Array.isArray(j.content)
+        ? j.content.map((p) => String(p && p.text || '')).join('').trim()
+        : String(j.output_text || '').trim();
+      const usage = j.usage || {};
+      promptTok = Number(usage.input_tokens);
+      outTok = Number(usage.output_tokens);
+    } else {
+      const parts = (((j || {}).candidates || [])[0] || {}).content || {};
+      txt = Array.isArray(parts.parts) ? parts.parts.map((p) => String(p && p.text || '')).join('').trim() : '';
+      const usage = j.usageMetadata || {};
+      promptTok = Number(usage.promptTokenCount);
+      outTok = Number(usage.candidatesTokenCount);
+    }
+    if (!txt) return { ok: false, err: 'Vertex devolvió respuesta vacía.' };
+    send('route', { model: 'vertex:' + (publisher === 'anthropic' ? ('anthropic/' + pick.model) : pick.model), reason: pick.reason });
+    send('chunk', txt);
+    if ((Number.isFinite(promptTok) && promptTok > 0) || (Number.isFinite(outTok) && outTok > 0)) {
+      addGoogleTokens(pick.model, promptTok, outTok);
+      send('usage', { quota: quotaInfo(), google: googleQuotaInfo() });
+    }
+    return { ok: true };
+  };
+  const sendVertexRequest = (authHeader, endpoint) => {
     const u = new URL(endpoint);
-    const finalMsg = historySummary ? (`Resumen acumulado:\n${historySummary}\n\nMensaje actual:\n${message}`) : message;
-    const payload = publisher === 'anthropic'
-      ? JSON.stringify({
-        anthropic_version: 'vertex-2023-10-16',
-        messages: toAnthropicMessages(history, finalMsg),
-        temperature: 0.2,
-        max_tokens: 2048
-      })
-      : JSON.stringify({
-        contents: toGeminiContents(history, finalMsg, images),
-        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
-      });
     let reqAborted = false;
     const req = https.request({
       hostname: u.hostname,
       path: u.pathname + u.search,
       method: 'POST',
       timeout: 45000,
-      headers: {
+      headers: Object.assign({
         'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + token,
         'Content-Length': Buffer.byteLength(payload)
-      }
+      }, authHeader || {})
     }, (resp) => {
       let raw = '';
       resp.on('data', (d) => { raw += d.toString(); if (raw.length > 2 * 1024 * 1024) raw = raw.slice(-2 * 1024 * 1024); });
       resp.on('end', () => {
         if (reqAborted) return;
-        if (resp.statusCode >= 400) {
-          return onDone(1, summarizeVertexError(resp.statusCode, raw));
-        }
-        let j = null;
-        try { j = JSON.parse(raw || '{}'); } catch (e) { return onDone(1, 'Vertex devolvió una respuesta inválida.'); }
-        let txt = '';
-        let promptTok = 0;
-        let outTok = 0;
-        if (publisher === 'anthropic') {
-          txt = Array.isArray(j.content)
-            ? j.content.map((p) => String(p && p.text || '')).join('').trim()
-            : String(j.output_text || '').trim();
-          const usage = j.usage || {};
-          promptTok = Number(usage.input_tokens);
-          outTok = Number(usage.output_tokens);
-        } else {
-          const parts = (((j || {}).candidates || [])[0] || {}).content || {};
-          txt = Array.isArray(parts.parts) ? parts.parts.map((p) => String(p && p.text || '')).join('').trim() : '';
-          const usage = j.usageMetadata || {};
-          promptTok = Number(usage.promptTokenCount);
-          outTok = Number(usage.candidatesTokenCount);
-        }
-        if (!txt) {
-          return onDone(1, 'Vertex devolvió respuesta vacía.');
-        }
-        send('route', { model: 'vertex:' + (publisher === 'anthropic' ? ('anthropic/' + pick.model) : pick.model), reason: pick.reason });
-        send('chunk', txt);
-        if ((Number.isFinite(promptTok) && promptTok > 0) || (Number.isFinite(outTok) && outTok > 0)) {
-          addGoogleTokens(pick.model, promptTok, outTok);
-          send('usage', { quota: quotaInfo(), google: googleQuotaInfo() });
-        }
+        if (resp.statusCode >= 400) return onDone(1, summarizeVertexError(resp.statusCode, raw));
+        const parsed = parseAndEmit(pick.publisher || 'google', raw);
+        if (!parsed.ok) return onDone(1, parsed.err);
         return onDone(0);
       });
     });
     req.on('error', (e) => { if (!reqAborted) onDone(1, 'Vertex error: ' + e.message); });
     req.on('timeout', () => { try { req.destroy(new Error('timeout')); } catch (e) {} });
     if (onAbort) onAbort(() => { reqAborted = true; try { req.destroy(); } catch (e) {} });
-      req.write(payload);
-      req.end();
+    req.write(payload);
+    req.end();
+  };
+
+  if (cfg.authMode === 'api-key') {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(pick.model)}:generateContent?key=${encodeURIComponent(cfg.apiKey)}`;
+    return sendVertexRequest({}, endpoint);
+  }
+
+  try {
+    getGcpAccessToken((tokErr, token) => {
+      if (tokErr) return onDone(1, 'Vertex auth: ' + tokErr.message);
+      const publisher = pick.publisher || 'google';
+      const method = publisher === 'anthropic' ? 'rawPredict' : 'generateContent';
+      const endpoint = `https://${cfg.region}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/locations/${encodeURIComponent(cfg.region)}/publishers/${encodeURIComponent(publisher)}/models/${encodeURIComponent(pick.model)}:${method}`;
+      return sendVertexRequest({ 'Authorization': 'Bearer ' + token }, endpoint);
     });
   } catch (e) {
     onDone(1, 'Vertex auth: ' + e.message);
@@ -1626,6 +1647,31 @@ function ghAuthStatus(cb) {
     const user = m ? m[1] : '';
     if (err && !loggedIn) return cb(null, { ok: false, loggedIn: false, user: '', error: out.trim() || err.message || 'not logged in' });
     return cb(null, { ok: true, loggedIn: !!loggedIn, user });
+  });
+}
+function ghListAccounts(cb) {
+  const ghBin = resolveGhBinary();
+  execFile(ghBin, ['auth', 'status', '--hostname', 'github.com'], { windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 }, (_err, stdout, stderr) => {
+    const out = String((stdout || '') + '\n' + (stderr || ''));
+    const accounts = [];
+    const blocks = out.split(/Logged in to github\.com account\s+/i).slice(1);
+    for (const b of blocks) {
+      const login = (/^([^\s(]+)/.exec(b) || [])[1] || '';
+      if (!login) continue;
+      const active = /Active account:\s*true/i.test(b);
+      accounts.push({ login, active });
+    }
+    cb(null, accounts);
+  });
+}
+function ghSwitchAccount(login, cb) {
+  const user = String(login || '').trim();
+  if (!user) return cb(new Error('cuenta requerida'));
+  const ghBin = resolveGhBinary();
+  execFile(ghBin, ['auth', 'switch', '--hostname', 'github.com', '--user', user], { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+    const out = String((stdout || '') + '\n' + (stderr || '')).trim();
+    if (err && !/Switched active account/i.test(out)) return cb(new Error(out || err.message || 'no se pudo cambiar de cuenta'));
+    cb(null, { user, output: out });
   });
 }
 function startGhAuth(cb) {
@@ -3194,6 +3240,19 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify(st || { ok: false, loggedIn: false, user: '' }));
     });
   }
+  if (req.method === 'GET' && reqPath === '/api/gh/auth/accounts') {
+    return ghListAccounts((_err, accounts) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, accounts: accounts || [] }));
+    });
+  }
+  if (req.method === 'POST' && reqPath === '/api/gh/auth/switch') {
+    const body = await readBody(req);
+    return ghSwitchAccount(body && body.user, (err, r) => {
+      res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(err ? { ok: false, error: err.message } : { ok: true, user: r.user }));
+    });
+  }
   if (req.method === 'POST' && reqPath === '/api/gh/auth/start') {
     return startGhAuth((err) => {
       res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
@@ -3463,6 +3522,73 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(quotaInfo()));
   }
+  if (req.method === 'GET' && req.url === '/api/vertex/status') {
+    const v = loadVertex();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      ok: true,
+      configured: !!v,
+      authMode: v ? v.authMode : '',
+      region: v ? v.region : '',
+      projectId: v ? v.projectId : '',
+      models: v ? v.models : null
+    }));
+  }
+  if (req.method === 'POST' && req.url === '/api/vertex/config') {
+    const b = await readBody(req) || {};
+    let cur = {};
+    try { cur = JSON.parse(fs.readFileSync(VERTEX_FILE, 'utf8')) || {}; } catch (e) {}
+    const apiKey = String(b.apiKey || '').trim();
+    const projectId = String(b.projectId || '').trim();
+    const region = String(b.region || cur.region || 'us-central1').trim();
+    if (!apiKey && !projectId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'Da una API key de Google AI Studio o un projectId de GCP.' }));
+    }
+    const next = Object.assign({}, cur, {
+      region,
+      modelPro: cur.modelPro || 'gemini-2.5-pro',
+      modelFlash: cur.modelFlash || 'gemini-2.5-flash'
+    });
+    if (apiKey) next.apiKey = apiKey; else delete next.apiKey;
+    if (projectId) next.projectId = projectId;
+    const finish = (verify) => {
+      try {
+        fs.mkdirSync(path.dirname(VERTEX_FILE), { recursive: true });
+        fs.writeFileSync(VERTEX_FILE, JSON.stringify(next, null, 2), 'utf8');
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'No se pudo guardar vertex.json: ' + e.message }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, configured: !!loadVertex(), verify: verify || null }));
+    };
+    if (!apiKey) return finish(null);
+    // Verifica la API key contra la API pública de Gemini antes de darla por buena.
+    const r2 = https.request({
+      hostname: 'generativelanguage.googleapis.com',
+      path: '/v1beta/models?key=' + encodeURIComponent(apiKey),
+      method: 'GET',
+      timeout: 15000
+    }, (rs) => {
+      let buf = '';
+      rs.on('data', (d) => { buf += d; });
+      rs.on('end', () => {
+        const okKey = rs.statusCode >= 200 && rs.statusCode < 300;
+        if (!okKey) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: summarizeVertexError(rs.statusCode, buf) || ('API key rechazada (HTTP ' + rs.statusCode + ')') }));
+        }
+        return finish({ ok: true });
+      });
+    });
+    r2.on('timeout', () => r2.destroy(new Error('timeout')));
+    r2.on('error', (e) => {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'No se pudo validar la API key: ' + e.message }));
+    });
+    return r2.end();
+  }
   if (req.method === 'GET' && req.url === '/api/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const vtx = loadVertex();
@@ -3472,10 +3598,10 @@ const server = http.createServer(async (req, res) => {
     const models = [
       { id: 'auto', name: 'Automatico (recomendado)' },
       { id: 'x-core', name: 'X-Core local (HanstlerS)' },
-      { id: 'vertex-auto', name: 'Vertex Auto (Google: ' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') },
-      { id: 'vertex-gemini-pro', name: 'Vertex Gemini Pro (' + (vPro || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') },
-      { id: 'vertex-gemini-flash', name: 'Vertex Gemini Flash (' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') },
-      { id: 'vertex-claude-opus-5', name: 'Vertex Claude Opus 5 (Anthropic: ' + (vOpus || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP]') }
+      { id: 'vertex-auto', name: 'Vertex Auto (Google: ' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
+      { id: 'vertex-gemini-pro', name: 'Vertex Gemini Pro (' + (vPro || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
+      { id: 'vertex-gemini-flash', name: 'Vertex Gemini Flash (' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
+      { id: 'vertex-claude-opus-5', name: 'Vertex Claude Opus 5 (Anthropic: ' + (vOpus || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') }
     ];
     if (loadAzure()) models.push({ id: 'azure', name: 'Azure gpt-5-mini (tu cuota, barato)' });
     if (loadAzure()) models.push({ id: 'azure-agent', name: 'Azure Agente (ejecuta archivos/comandos)' });

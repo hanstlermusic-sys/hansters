@@ -21,7 +21,8 @@ function askText(message, def){
     const ov=document.createElement('div');
     ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:flex;align-items:center;justify-content:center;';
     ov.innerHTML='<div style="background:#141422;border:1px solid var(--neon,#b026ff);border-radius:12px;padding:18px;width:min(90%,420px);box-shadow:0 8px 30px rgba(0,0,0,.6);">'
-      +'<div style="color:#e8e8f0;font-size:14px;margin-bottom:10px;">'+esc(message)+'</div>'
+      +'<div style="color:#e8e8f0;font-size:14px;margin-bottom:10px;white-space:pre-line;line-height:1.5;">'
+        +esc(message).replace(/(https?:\/\/[^\s)]+)/g,'<a href="$1" target="_blank" rel="noopener" style="color:#26e0ff;">$1</a>')+'</div>'
       +'<input type="text" class="ask-in" style="width:100%;box-sizing:border-box;background:#0e0e18;border:1px solid #33335a;color:#e8e8f0;border-radius:8px;padding:8px 10px;font-size:14px;outline:none;">'
       +'<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">'
       +'<button class="ask-no" style="background:#26263a;color:#e8e8f0;border:none;border-radius:8px;padding:7px 14px;cursor:pointer;">Cancelar</button>'
@@ -428,6 +429,11 @@ async function refreshRepoAuth(){
     repoAuth.ghLogged = !!gj.loggedIn;
     repoAuth.ghUser = String(gj.user || '');
   }catch(e){}
+  try{
+    const ar = await fetch('/api/gh/auth/accounts');
+    const aj = await ar.json();
+    repoAuth.ghAccounts = Array.isArray(aj && aj.accounts) ? aj.accounts : [];
+  }catch(e){ repoAuth.ghAccounts = []; }
   return repoAuth;
 }
 function renderRepoAuthCard(box){
@@ -435,8 +441,9 @@ function renderRepoAuthCard(box){
   card.className = 'repo-auth';
   const name = repoAuth.user ? (repoAuth.user.name || repoAuth.user.login || '') : '';
   const ghName = repoAuth.ghUser ? repoAuth.ghUser : 'gh local';
+  const shownName = name || ghName;
   const login = repoAuth.ok
-    ? ('Conectado: <b>' + esc(name) + '</b>')
+    ? ('Conectado: <b>' + esc(shownName) + '</b>')
     : (repoAuth.ghLogged ? ('Conectado por CLI: <b>' + esc(ghName) + '</b>') : 'Sin sesión de GitHub');
   const note = repoAuth.enabled
     ? 'Puedes usar OAuth o GitHub CLI para cargar repos remotos.'
@@ -444,10 +451,27 @@ function renderRepoAuthCard(box){
   const btnLogin = repoAuth.enabled && !repoAuth.ok ? '<button type="button" data-repo-login>Iniciar sesión web</button>' : '';
   const btnGhLogin = (!repoAuth.ok && !repoAuth.ghLogged) ? '<button type="button" data-gh-login>Login con GitHub CLI</button>' : '';
   const btnLogout = repoAuth.enabled && repoAuth.ok ? '<button type="button" data-repo-logout>Cerrar sesión</button>' : '';
+  const accounts = Array.isArray(repoAuth.ghAccounts) ? repoAuth.ghAccounts : [];
+  const switchBtns = accounts.map((a)=>{
+    const login2 = String(a.login||'');
+    const isAct = !!a.active;
+    return '<button type="button" class="gh-acct' + (isAct?' active':'') + '" data-gh-switch="' + esc(login2) + '"' + (isAct?' disabled':'') + '>'
+      + '<span class="gh-acct-dot">' + (isAct?'✅':'🔄') + '</span>'
+      + '<span class="gh-acct-name">' + esc(login2) + '</span>'
+      + '<span class="gh-acct-tag">' + (isAct?'activa':'cambiar') + '</span>'
+      + '</button>';
+  }).join('');
+  const switchRow = accounts.length > 1
+    ? '<div class="repo-auth-sep"></div>'
+      + '<div class="repo-auth-sub">Cambiar de cuenta</div>'
+      + '<div class="gh-acct-list">' + switchBtns + '</div>'
+    : '';
   card.innerHTML =
     '<div class="repo-auth-title">GitHub</div>' +
     '<div class="repo-auth-status">' + login + '</div>' +
     '<div class="repo-auth-note">' + note + '</div>' +
+    switchRow +
+    '<div class="repo-auth-sep"></div>' +
     '<div class="repo-auth-actions">' +
       btnLogin +
       btnGhLogin +
@@ -551,6 +575,25 @@ document.getElementById('repo-list')?.addEventListener('click', async (e)=>{
     }catch(_){ showMemoryChip('No se pudo abrir login CLI.'); }
     return;
   }
+  const swBtn = t.closest('[data-gh-switch]');
+  if(swBtn){
+    const user = swBtn.getAttribute('data-gh-switch') || '';
+    swBtn.disabled = true;
+    try{
+      const r = await fetch('/api/gh/auth/switch', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ user })
+      });
+      const j = await r.json();
+      if(j && j.ok) showMemoryChip('Cuenta de GitHub activa: ' + user);
+      else showMemoryChip('No se pudo cambiar: ' + ((j && j.error) || 'error'));
+    }catch(_){ showMemoryChip('No se pudo cambiar de cuenta.'); }
+    reposLoadError = '';
+    await refreshRepoAuth();
+    await refreshReposData();
+    loadRepoList();
+    return;
+  }
   if(t.closest('[data-repo-logout]')){
     try{ await fetch('/auth/logout', { method:'POST' }); }catch(_){}
     await refreshRepoAuth();
@@ -620,6 +663,42 @@ if (modelSel) {
       let opt=[...modelSel.options].find(o=>o.value===typed);
       if(!opt){ opt=document.createElement('option'); opt.value=typed; opt.textContent=typed+' (personalizado)'; modelSel.insertBefore(opt, modelSel.lastChild); }
       opt.selected=true; id=typed;
+    }
+    // Vertex necesita API key de Google (o ADC). Si falta, la pedimos aquí mismo.
+    if(/^vertex-/.test(id)){
+      let vst = null;
+      try{ vst = await (await fetch('/api/vertex/status')).json(); }catch(_){ }
+      if(!vst || !vst.configured){
+        const key = (await askText('Vertex/Gemini no está configurado.\nSaca tu API key gratis en: https://aistudio.google.com/apikey\n(Create API key → copia la clave que empieza con AIza…)\n\nPégala aquí:','')||'').trim();
+        if(!key){
+          showMemoryChip('Vertex sigue sin configurar.');
+          if(lastModel){ modelSel.value = lastModel; return; }
+        } else {
+          try{
+            const r = await fetch('/api/vertex/config', {
+              method:'POST', headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({ apiKey: key })
+            });
+            const j = await r.json();
+            if(j && j.ok){
+              showMemoryChip('Vertex configurado ✅');
+              try{
+                const d = await (await fetch('/api/models')).json();
+                const sel = modelSel.value;
+                modelSel.innerHTML='';
+                d.models.forEach(m=>{ const o=document.createElement('option'); o.value=m.id; o.textContent=m.name; modelSel.appendChild(o); });
+                modelSel.value = sel;
+              }catch(_){ }
+            } else {
+              showMemoryChip('Vertex: ' + ((j && j.error) || 'no se pudo guardar la key'));
+              if(lastModel){ modelSel.value = lastModel; return; }
+            }
+          }catch(_){
+            showMemoryChip('Vertex: error guardando la key.');
+            if(lastModel){ modelSel.value = lastModel; return; }
+          }
+        }
+      }
     }
     // Guardar el modelo EN LA CONVERSACIÓN activa (no global).
     const c = getConv(activeId);
