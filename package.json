@@ -1,42 +1,40 @@
 {
-    "name":  "hanstlers",
-    "version":  "1.0.2",
-    "description":  "HanstlerS - tu asistente personal",
-    "main":  "electron-main.js",
-    "author":  "Cesar Zumbado",
-    "scripts":  {
-                    "start":  "electron .",
-                    "dist":  "electron-builder --win nsis",
-                    "test":  "node tests/context.test.js \u0026\u0026 node tests/vertex-tools.test.js \u0026\u0026 node tests/repo-open.test.js",
-                    "test:e2e":  "node tests/e2e-context.js"
-                },
-    "build":  {
-                  "appId":  "com.hanstler.hanstlers",
-                  "productName":  "HanstlerS",
-                  "directories":  {
-                                      "output":  "dist-electron"
-                                  },
-                  "files":  [
-                                "electron-main.js",
-                                "server.js",
-                                "public/**/*",
-                                "hanstlers.ico"
-                            ],
-                  "win":  {
-                              "target":  "nsis",
-                              "icon":  "hanstlers.ico"
-                          },
-                  "nsis":  {
-                               "oneClick":  false,
-                               "perMachine":  false,
-                               "allowToChangeInstallationDirectory":  true,
-                               "createDesktopShortcut":  true,
-                               "createStartMenuShortcut":  true,
-                               "shortcutName":  "HanstlerS"
-                           }
-              },
-    "devDependencies":  {
-                            "electron":  "^33.2.1",
-                            "electron-builder":  "^25.1.8"
-                        }
+  "name": "hanstlers",
+  "version": "1.0.2",
+  "description": "HanstlerS - tu asistente personal",
+  "main": "electron-main.js",
+  "author": "Cesar Zumbado",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis",
+    "test": "node tests/context.test.js && node tests/vertex-tools.test.js && node tests/repo-open.test.js",
+    "test:e2e": "node tests/e2e-context.js"
+  },
+  "build": {
+    "appId": "com.hanstler.hanstlers",
+    "productName": "HanstlerS",
+    "directories": { "output": "dist-electron" },
+    "files": [
+      "electron-main.js",
+      "server.js",
+      "public/**/*",
+      "hanstlers.ico"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "hanstlers.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "HanstlerS"
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  }
 }
