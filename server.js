@@ -61,18 +61,33 @@ function loadAzure() {
   return null;
 }
 const VERTEX_FILE = path.join(os.homedir(), '.hanstlers', 'vertex.json');
+
+// Modelos por defecto. Google deja modelos RETIRADOS visibles en /v1beta/models
+// aunque ya devuelvan 404, asi que la lista de la API no sirve para validar:
+// hay que mantener a mano los que sabemos muertos.
+const VERTEX_DEFAULT_PRO = 'gemini-3.8-flash';
+const VERTEX_DEFAULT_FLASH = 'gemini-3.5-flash';
+const VERTEX_DEFAULT_OPUS = 'claude-opus-5';
+const GEMINI_RETIRADOS = new Set([
+  'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite',
+  'gemini-2.0-pro', 'gemini-2.0-flash',
+  'gemini-1.5-pro', 'gemini-1.5-flash',
+  'gemini-pro', 'gemini-flash'
+]);
 function normalizeVertexModel(kind, value) {
   const v = String(value || '').trim();
   const low = v.toLowerCase();
   if (!v) {
-    if (kind === 'pro') return 'gemini-3.7-flash';
-    if (kind === 'flash') return 'gemini-3.5-flash';
-    return 'claude-opus-5';
+    if (kind === 'pro') return VERTEX_DEFAULT_PRO;
+    if (kind === 'flash') return VERTEX_DEFAULT_FLASH;
+    return VERTEX_DEFAULT_OPUS;
   }
-  // Evita modelos legacy que hoy devuelven 404 para varias llaves.
-  if (kind === 'pro' && (low === 'gemini-2.5-pro' || low === 'gemini-pro')) return 'gemini-3.7-flash';
-  if (kind === 'flash' && (low === 'gemini-2.5-flash' || low === 'gemini-flash')) return 'gemini-3.5-flash';
-  if (kind === 'opus' && low === 'claude-opus-4') return 'claude-opus-5';
+  // Evita modelos legacy que hoy devuelven 404 aunque sigan listados.
+  if (GEMINI_RETIRADOS.has(low)) {
+    if (kind === 'flash') return VERTEX_DEFAULT_FLASH;
+    if (kind === 'pro') return VERTEX_DEFAULT_PRO;
+  }
+  if (kind === 'opus' && low === 'claude-opus-4') return VERTEX_DEFAULT_OPUS;
   return v;
 }
 function loadVertex() {
@@ -100,9 +115,9 @@ function loadVertex() {
     region,
     apiKey,
     models: {
-      pro: normalizeVertexModel('pro', (allowModelEnv ? modelProEnv : '') || fileCfg.modelPro || 'gemini-3.7-flash'),
-      flash: normalizeVertexModel('flash', (allowModelEnv ? modelFlashEnv : '') || fileCfg.modelFlash || 'gemini-3.5-flash'),
-      opus: normalizeVertexModel('opus', (allowModelEnv ? modelOpusEnv : '') || fileCfg.modelOpus || 'claude-opus-5')
+      pro: normalizeVertexModel('pro', (allowModelEnv ? modelProEnv : '') || fileCfg.modelPro || VERTEX_DEFAULT_PRO),
+      flash: normalizeVertexModel('flash', (allowModelEnv ? modelFlashEnv : '') || fileCfg.modelFlash || VERTEX_DEFAULT_FLASH),
+      opus: normalizeVertexModel('opus', (allowModelEnv ? modelOpusEnv : '') || fileCfg.modelOpus || VERTEX_DEFAULT_OPUS)
     },
     authMode: hasProjectCfg ? 'adc' : 'api-key'
   };
@@ -467,7 +482,7 @@ function getGcpAccessToken(cb) {
   });
 }
 
-function summarizeVertexError(statusCode, raw) {
+function summarizeVertexError(statusCode, raw, model) {
   const code = Number(statusCode) || 0;
   let msg = '';
   try {
@@ -475,11 +490,28 @@ function summarizeVertexError(statusCode, raw) {
     msg = String((j && j.error && j.error.message) || '').trim();
   } catch (e) {}
   const low = (msg || String(raw || '')).toLowerCase();
+  // El modo de autenticacion cambia por completo la solucion: mandar a "gcloud
+  // auth" a quien usa API key lo hace perder el tiempo en algo que no usa.
+  let modo = '';
+  try { const c = loadVertex(); modo = c ? c.authMode : ''; } catch (e) {}
+  const nombreModelo = String(model || '').trim();
   if (code === 400 && msg) return 'Vertex rechazó la solicitud: ' + msg.slice(0, 280);
   if ((code === 429) || /quota exceeded|resource_exhausted|rate limit|too many requests/.test(low)) return 'Vertex no disponible: cuota/rate-limit agotado. Sube cuota de Vertex o espera el reset.';
   if (code === 403 && /billing/.test(low)) return 'Vertex no disponible: habilita billing en el proyecto GCP.';
   if (code === 403 && /permission denied|permission_denied|denied/.test(low)) return 'Vertex no disponible: faltan permisos IAM para ese proyecto/modelo.';
-  if (code === 401 || /unauthenticated|invalid_grant|login required/.test(low)) return 'Vertex no disponible: autentica ADC con gcloud.';
+  if (code === 404 || /not found|is not found|no está disponible/.test(low)) {
+    return 'Vertex no disponible: el modelo' + (nombreModelo ? ' "' + nombreModelo + '"' : '') +
+      ' ya no existe o fue retirado por Google (sigue apareciendo listado, pero responde 404). ' +
+      'Cambia modelPro/modelFlash en ~/.hanstlers/vertex.json; hoy funcionan ' +
+      VERTEX_DEFAULT_PRO + ' y ' + VERTEX_DEFAULT_FLASH + '.';
+  }
+  if (code === 401 || /unauthenticated|invalid_grant|login required|invalid authentication credentials|api key not valid/.test(low)) {
+    if (modo === 'api-key') {
+      return 'Vertex no disponible: la API key es inválida, expiró o fue revocada. ' +
+        'Genera otra en Google AI Studio y guárdala en ~/.hanstlers/vertex.json (UTF-8 sin BOM).';
+    }
+    return 'Vertex no disponible: autentica ADC con gcloud (gcloud auth application-default login).';
+  }
   if (code) return 'Vertex no disponible (HTTP ' + code + ').';
   return 'Vertex no disponible temporalmente.';
 }
@@ -649,7 +681,7 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       resp.on('data', (d) => { raw += d.toString(); if (raw.length > 2 * 1024 * 1024) raw = raw.slice(-2 * 1024 * 1024); });
       resp.on('end', () => {
         if (reqAborted) return;
-        if (resp.statusCode >= 400) return onDone(1, summarizeVertexError(resp.statusCode, raw));
+        if (resp.statusCode >= 400) return onDone(1, summarizeVertexError(resp.statusCode, raw, modelUsed || pick.model));
         const currentModel = modelUsed || pick.model;
         const parsed = parseAndEmit(pick.publisher || 'google', raw, currentModel, routeReason || pick.reason);
         if (!parsed.ok && (pick.publisher || 'google') === 'google') {
@@ -1624,7 +1656,7 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
             intento++;
             return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed, payloadOverride), 1500 * intento);
           }
-          return terminar(new Error(summarizeVertexError(resp.statusCode, raw)));
+          return terminar(new Error(summarizeVertexError(resp.statusCode, raw, modelUsed)));
         }
         let j = null;
         try { j = JSON.parse(raw || '{}'); } catch (e) { return terminar(new Error('Gemini devolvio una respuesta invalida.')); }
@@ -4280,9 +4312,9 @@ const server = http.createServer(async (req, res) => {
     }
     const next = Object.assign({}, cur, {
       region,
-      modelPro: normalizeVertexModel('pro', cur.modelPro || 'gemini-3.7-flash'),
-      modelFlash: normalizeVertexModel('flash', cur.modelFlash || 'gemini-3.5-flash'),
-      modelOpus: normalizeVertexModel('opus', cur.modelOpus || 'claude-opus-5')
+      modelPro: normalizeVertexModel('pro', cur.modelPro || VERTEX_DEFAULT_PRO),
+      modelFlash: normalizeVertexModel('flash', cur.modelFlash || VERTEX_DEFAULT_FLASH),
+      modelOpus: normalizeVertexModel('opus', cur.modelOpus || VERTEX_DEFAULT_OPUS)
     });
     if (apiKey) next.apiKey = apiKey; else delete next.apiKey;
     if (projectId) next.projectId = projectId;
