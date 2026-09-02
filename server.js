@@ -1525,22 +1525,9 @@ function toGeminiAgentContents(messages) {
     }
     filtered.push(t);
   }
-  const repaired = [];
-  for (let i = 0; i < filtered.length; i++) {
-    const t = filtered[i];
-    if (t && t.role === 'model' && t.hasFnCall) {
-      const next = filtered[i + 1];
-      if (!(next && next.role === 'user' && next.fromTool)) {
-        const txtParts = (t.parts || []).filter((p) => p && typeof p.text === 'string' && p.text.trim());
-        if (txtParts.length) repaired.push({ role: 'model', parts: txtParts, fromTool: false, hasFnCall: false });
-        continue;
-      }
-    }
-    repaired.push(t);
-  }
   // Gemini rechaza un historial que no empiece por un turno de 'user'.
-  while (repaired.length && repaired[0].role !== 'user') repaired.shift();
-  const contents = repaired.map((t) => ({ role: t.role, parts: t.parts }));
+  while (filtered.length && filtered[0].role !== 'user') filtered.shift();
+  const contents = filtered.map((t) => ({ role: t.role, parts: t.parts }));
   return {
     contents: contents,
     systemInstruction: sys.length ? { parts: [{ text: sys.join('\n\n') }] } : null
@@ -1768,7 +1755,13 @@ function sanitizeAgentBody(body) {
   while (i < body.length) {
     const m = body[i] || null;
     const role = String(m && m.role || '');
-    if (role === 'tool') { i++; continue; }
+    if (role === 'tool') {
+      // Conserva tools sueltos del transcript: toGeminiAgentContents ya descarta
+      // cualquier tool huérfano al serializar para la API.
+      out.push(m);
+      i++;
+      continue;
+    }
     if (role !== 'assistant') {
       out.push(m);
       i++;
