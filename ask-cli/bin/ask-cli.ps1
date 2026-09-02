@@ -12,7 +12,7 @@ $ConfigPath = Join-Path $AskHome 'config.json'
 $HistoryPath = Join-Path $AskHome 'history.jsonl'
 $ProfilesPath = Join-Path $AskHome 'project-profiles.json'
 
-$script:AskCliVersion = '0.7.0'
+$script:AskCliVersion = '0.9.0'
 $script:ResolvedCopilot = ''
 $script:Invoker = $null
 $script:Cfg = $null
@@ -126,6 +126,8 @@ function Default-Config {
     verifyCommand = ''
     loopThreshold = 3     # llamadas identicas consecutivas que se consideran bucle
     hanstlersUrl = 'http://127.0.0.1:8717'  # backend del provider vertex (local, opcional)
+    autoStartHanstlers = $true  # si el backend no responde, arrancar la app en vez de fallar
+    startTimeoutSec = 60        # cuanto esperar a que el backend recien abierto responda
     guard = 'auto'   # auto|always|off
   }
 }
@@ -1021,11 +1023,119 @@ function Get-HanstlersUrl($settings) {
   return $u.TrimEnd('/')
 }
 
+# Comprueba si el backend local responde. Barato y con timeout corto: se usa
+# antes de cada prompt de vertex, no puede costar segundos.
+function Test-HanstlersUp([string]$baseUrl, [int]$timeoutSec = 3) {
+  try {
+    $null = Invoke-RestMethod -Uri ($baseUrl.TrimEnd('/') + '/healthz') -TimeoutSec $timeoutSec
+    return $true
+  } catch { return $false }
+}
+
+# Localiza el ejecutable instalado de HanstlerS.
+function Find-HanstlersExe {
+  $cands = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\HanstlerS\HanstlerS.exe'),
+    (Join-Path ${env:ProgramFiles} 'HanstlerS\HanstlerS.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'HanstlerS\HanstlerS.exe')
+  ) | Where-Object { $_ }
+  foreach ($c in $cands) { if (Test-Path $c) { return $c } }
+  return ''
+}
+
+# Descubre en que puerto escucha HanstlerS de verdad. Sirve para diagnosticar
+# el fallo mas comun: hanstlersUrl apuntando a un puerto que ya no se usa.
+function Find-HanstlersPort {
+  try {
+    $pids = @(Get-Process -Name 'HanstlerS' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    if (-not $pids) { return '' }
+    $conns = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+             Where-Object { $pids -contains $_.OwningProcess }
+    foreach ($c in ($conns | Sort-Object LocalPort)) {
+      if (Test-HanstlersUp ("http://127.0.0.1:" + $c.LocalPort) 2) { return [string]$c.LocalPort }
+    }
+  } catch {}
+  return ''
+}
+
+# provider=vertex depende del backend local. Si no esta arriba, ask-cli moria
+# con "Error conectando" y habia que abrir la app a mano. Ahora la arranca y
+# espera a que responda: el usuario no deberia notar la diferencia.
+function Ensure-HanstlersUp([string]$baseUrl, [hashtable]$settings, [hashtable]$opts) {
+  if (Test-HanstlersUp $baseUrl 3) { return @{ ok = $true; started = $false } }
+  # Un unico sondeo de 3s da falsos negativos cuando el backend esta ocupado
+  # sirviendo otra peticion (visto en vivo: HanstlerS respondia /healthz pero
+  # ask-cli lo daba por muerto y perdia 60s "arrancandolo"). Se confirma.
+  Start-Sleep -Milliseconds 400
+  if (Test-HanstlersUp $baseUrl 10) { return @{ ok = $true; started = $false } }
+
+  # Solo tiene sentido levantar la app si el backend es el local.
+  if ($baseUrl -notmatch '^https?://(127\.0\.0\.1|localhost)(:|/|$)') {
+    return @{ ok = $false; started = $false; error = "El backend remoto $baseUrl no responde." }
+  }
+  if (-not (ConvertTo-BoolValue (Get-Prop $settings 'autoStartHanstlers') $true)) {
+    return @{ ok = $false; started = $false; error = "HanstlerS no responde en $baseUrl y autoStartHanstlers esta desactivado." }
+  }
+
+  $exe = Find-HanstlersExe
+  if (-not $exe) {
+    return @{ ok = $false; started = $false; error = "HanstlerS no responde en $baseUrl y no encontre HanstlerS.exe instalado." }
+  }
+
+  # Si el proceso YA corre pero la URL no contesta, arrancarlo otra vez no
+  # arregla nada: lo que falla es hanstlersUrl (puerto equivocado). Avisar al
+  # momento en vez de esperar el timeout completo para nada.
+  $yaCorre = @(Get-Process -Name 'HanstlerS' -ErrorAction SilentlyContinue).Count -gt 0
+  if ($yaCorre) {
+    $puerto = Find-HanstlersPort
+    if ($puerto -and ($baseUrl -notmatch (':' + $puerto + '\b'))) {
+      return @{ ok = $false; started = $false; resuelto = $true; error = "HanstlerS ya esta abierto pero escucha en http://127.0.0.1:$puerto, no en $baseUrl. Corrigelo con: ask-cli config set hanstlersUrl http://127.0.0.1:$puerto" }
+    }
+    return @{ ok = $false; started = $false; resuelto = $true; error = "HanstlerS ya esta abierto pero no responde en $baseUrl. Revisa hanstlersUrl (ask-cli config show) o reinicia la app." }
+  }
+
+  Write-Notice "HanstlerS no esta abierto; lo arranco..." $settings 'DarkGray'
+  try { Start-Process -FilePath $exe -WindowStyle Minimized | Out-Null }
+  catch { return @{ ok = $false; started = $false; error = "No pude arrancar HanstlerS: $($_.Exception.Message)" } }
+
+  $espera = ConvertTo-IntValue (Get-Prop $settings 'startTimeoutSec') 60
+  if ($espera -le 0) { $espera = 60 }
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($sw.Elapsed.TotalSeconds -lt $espera) {
+    Start-Sleep -Milliseconds 1000
+    if (Test-HanstlersUp $baseUrl 3) {
+      Write-Notice ("HanstlerS listo en " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s.") $settings 'DarkGray'
+      return @{ ok = $true; started = $true }
+    }
+  }
+  return @{ ok = $false; started = $true; error = "Arranque HanstlerS pero no respondio en $espera s." }
+}
+
 function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opts, [hashtable]$cfg) {
   $model = if ($opts.model) { $opts.model } else { $settings.vertexModel }
   if (-not $model) { $model = 'vertex-gemini-pro' }
   $baseUrl = Get-HanstlersUrl $settings
   $convId = if ($opts.resume) { $opts.resume } else { ('askcli-' + [Guid]::NewGuid().ToString()) }
+
+  # Sin backend no hay ruta vertex: se levanta antes de gastar el prompt.
+  $up = Ensure-HanstlersUp $baseUrl $settings $opts
+  if (-not $up.ok) {
+    # La pista depende de donde vive el backend: sugerir el .exe local cuando
+    # hanstlersUrl apunta a otra maquina solo confunde.
+    $esLocal = ($baseUrl -match '^https?://(127\.0\.0\.1|localhost)(:|/|$)')
+    $exe = if ($esLocal) { Find-HanstlersExe } else { '' }
+    $pista = if (Get-Prop $up 'resuelto') {
+      # El error ya trae el comando exacto para arreglarlo; anadir mas confunde.
+      ''
+    } elseif ($exe) {
+      " Abrelo a mano: $exe"
+    } elseif ($esLocal) {
+      " Instala HanstlerS o usa --provider copilot."
+    } else {
+      " Revisa que HanstlerS este abierto en esa maquina y que el puerto sea alcanzable, o usa --provider copilot."
+    }
+    return @{ code = 1; text = ([string]$up.error + $pista); resume = $convId; route = ''; raw = ''; streamed = $false }
+  }
   $body = @{
     message = $prompt
     model = $model
@@ -1101,10 +1211,14 @@ function Invoke-VertexPrompt([string]$prompt, [hashtable]$settings, [hashtable]$
         $rdr.Dispose()
       } catch {}
     }
-    $msg = if ($statusCode -gt 0) { "HTTP $statusCode en HanstlerS API ($baseUrl)." } else { "Error conectando a HanstlerS local API ($baseUrl)." }
+    $msg = if ($statusCode -gt 0) {
+      "HTTP $statusCode desde HanstlerS ($baseUrl). Mira la ventana de HanstlerS para el detalle."
+    } else {
+      "Se corto la conexion con HanstlerS ($baseUrl) a mitad de la respuesta. Comprueba que siga abierto y reintenta."
+    }
     return @{ code = 1; text = $msg; resume = $convId; route = $route; raw = $errBody; streamed = $printedStream }
   } catch {
-    return @{ code = 1; text = "Error conectando a HanstlerS local API ($baseUrl)."; resume = $convId; route = $route; raw = $_.Exception.Message; streamed = $printedStream }
+    return @{ code = 1; text = "Fallo hablando con HanstlerS ($baseUrl): $($_.Exception.Message)"; resume = $convId; route = $route; raw = $_.Exception.Message; streamed = $printedStream }
   } finally {
     if ($printedStream -and $settings.output -ne 'json' -and -not $opts.noStream) { Write-Host '' }
     if ($reader) { try { $reader.Dispose() } catch {} }
@@ -1131,6 +1245,15 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
   $effective = Build-ExecutionFirstPrompt $prompt $settings
 
   if ($isVertex) {
+    # Los flags desconocidos solo tienen sentido como passthrough a Copilot CLI.
+    # En la ruta Vertex se descartan, y hacerlo en silencio convertia cualquier
+    # errata (--modell) en una opcion que el usuario cree aplicada y no lo esta.
+    if (@($opts.passthrough).Count -gt 0) {
+      $ignorados = (@($opts.passthrough) | Where-Object { $_ -like '--*' }) -join ', '
+      if ($ignorados) {
+        Write-Notice "Aviso: en modo vertex se ignoran estos flags: $ignorados (solo aplican a --provider copilot). Revisa si hay una errata." $settings 'DarkYellow'
+      }
+    }
     $res = Invoke-VertexPrompt $effective $settings $opts $cfg
     if ((ConvertTo-BoolValue $opts.retry $true) -and (ConvertTo-BoolValue $cfg.retry $true) -and
         ($res.code -eq 0) -and (Is-NonOperationalCopilotReply $res.text)) {
@@ -1188,6 +1311,14 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
 
     $res.verified = [bool]$verification.ok
     $res.issues = @($verification.issues)
+    # code != 0 significa que no hubo respuesta que verificar. El default
+    # optimista de $verification hacia que un fallo saliera con verified=$true.
+    if ($res.code -ne 0) {
+      $res.verified = $false
+      if (@($res.issues).Count -eq 0) {
+        $res.issues = @("La invocacion fallo (exit $($res.code)); no se verifico nada.")
+      }
+    }
     return $res
   }
 
@@ -1284,10 +1415,19 @@ function Invoke-AskPrompt([string]$prompt, [hashtable]$settings, [hashtable]$opt
     }
   }
 
+  # Coherencia del envelope: si la invocacion fallo (code != 0) no hay nada que
+  # verificar. Devolver verified=$true junto a ok=$false confundia a cualquier
+  # consumidor que mirase solo verified.
+  if ((Get-Prop $res 'code') -ne 0) {
+    $res.verified = $false
+    if (@($res.issues).Count -eq 0) {
+      $res.issues = @("La invocacion fallo (exit $($res.code)); no se verifico nada.")
+    }
+  }
+
   if ($res.resume) { $cfg.lastResume = $res.resume }
   return $res
 }
-
 function Show-Help {
 @'
 ask-cli - Wrapper avanzado para Copilot CLI + Vertex (HanstlerS)
@@ -1816,7 +1956,32 @@ switch ($cmd) {
       try {
         $state = Invoke-RestMethod -Uri ($hUrl + '/api/state') -TimeoutSec 5
         Write-Host ("hanstlers: OK model=" + $state.model + " (" + $hUrl + ")")
-      } catch { Write-Host ("hanstlers: FAIL no responde en " + $hUrl + " (provider=vertex lo necesita)") }
+        try {
+          $vst = Invoke-RestMethod -Uri ($hUrl + '/api/vertex/status') -TimeoutSec 5
+          if ($vst.configured) {
+            Write-Host ("vertex: OK auth=" + $vst.authMode + " modelo=" + $vst.models.pro)
+          } else {
+            Write-Host "vertex: FAIL sin API key ni projectId (revisa ~/.hanstlers/vertex.json)"
+          }
+          $mw = Invoke-RestMethod -Uri ($hUrl + '/api/vertex/models/status') -TimeoutSec 5
+          if ($mw.pendiente) {
+            Write-Host ("modelo: hay uno mejor disponible -> " + $mw.pendiente.a + " (" + $mw.pendiente.mejoraPct + "% mas rapido)")
+          }
+        } catch {}
+      } catch {
+        $exeDoc = Find-HanstlersExe
+        $puertoReal = Find-HanstlersPort
+        if ($puertoReal -and ($hUrl -notmatch (':' + $puertoReal + '\b'))) {
+          Write-Host ("hanstlers: FAIL escucha en http://127.0.0.1:" + $puertoReal + " pero hanstlersUrl=" + $hUrl)
+          Write-Host ("  arregla:  ask-cli config set hanstlersUrl http://127.0.0.1:" + $puertoReal)
+        } elseif ($exeDoc -and (ConvertTo-BoolValue (Get-Prop $cfg 'autoStartHanstlers') $true)) {
+          Write-Host ("hanstlers: cerrado, pero se arrancara solo al primer prompt (" + $exeDoc + ")")
+        } elseif ($exeDoc) {
+          Write-Host ("hanstlers: FAIL cerrado y autoStartHanstlers=off. Abrelo: " + $exeDoc)
+        } else {
+          Write-Host ("hanstlers: FAIL no responde en " + $hUrl + " y no encontre HanstlerS.exe instalado")
+        }
+      }
     } else {
       Write-Host "hanstlers: n/a (backend local opcional; solo lo usa provider=vertex)"
     }
@@ -1924,8 +2089,8 @@ switch ($cmd) {
       $k = [string]$Args[2]
       $v = [string]$Args[3]
       if (-not ($cfg.ContainsKey($k))) { Write-Host ("Clave inválida: " + $k); exit 1 }
-      if ($k -in @('timeoutSec','historyMax')) { $cfg[$k] = ConvertTo-IntValue $v (ConvertTo-IntValue $cfg[$k] 0) }
-      elseif ($k -in @('retry')) { $cfg[$k] = ConvertTo-BoolValue $v $true }
+      if ($k -in @('timeoutSec','historyMax','startTimeoutSec','loopThreshold','maxCredits','maxContinues')) { $cfg[$k] = ConvertTo-IntValue $v (ConvertTo-IntValue $cfg[$k] 0) }
+      elseif ($k -in @('retry','verify','autoStartHanstlers','assistedApproval','noAskUser','qualityGate')) { $cfg[$k] = ConvertTo-BoolValue $v $true }
       else { $cfg[$k] = $v }
       Save-Config $cfg
       Write-Host ("OK " + $k + "=" + [string]$cfg[$k])

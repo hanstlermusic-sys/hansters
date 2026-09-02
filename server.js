@@ -1606,6 +1606,49 @@ function toGeminiAgentContents(messages) {
 const GEMINI_REINTENTABLES = [429, 500, 502, 503];
 const GEMINI_MAX_REINTENTOS = 3;
 
+// Espera antes de reintentar. Antes era lineal (1.5s, 3s, 4.5s) y suele ser
+// poco para un 429: Google dice EXACTAMENTE cuanto esperar en la cabecera
+// Retry-After (o en RetryInfo del cuerpo) y hay que hacerle caso. Sin eso, los
+// tres reintentos se gastan demasiado pronto y el turno muere igual.
+// El jitter evita que varias peticiones en curso reintenten todas a la vez.
+function geminiEsperaReintento(intento, headers, raw) {
+  const h = headers || {};
+  let segundos = 0;
+  // Bandera aparte: un Retry-After de 0 es una pista valida ("reintenta ya"),
+  // y comprobar solo `if (!segundos)` lo confundiria con no tener pista.
+  let hayPista = false;
+
+  const ra = h['retry-after'];
+  if (ra != null) {
+    const n = Number(String(ra).trim());
+    if (Number.isFinite(n) && n >= 0) { segundos = n; hayPista = true; }
+    else {
+      const fecha = Date.parse(String(ra));
+      if (Number.isFinite(fecha)) { segundos = Math.max(0, (fecha - Date.now()) / 1000); hayPista = true; }
+    }
+  }
+
+  if (!hayPista) {
+    // google.rpc.RetryInfo llega dentro de error.details como "12s".
+    try {
+      const j = JSON.parse(String(raw || '{}'));
+      const det = (j && j.error && j.error.details) || [];
+      for (const d of det) {
+        const delay = d && (d.retryDelay || (d.retryInfo && d.retryInfo.retryDelay));
+        if (delay) {
+          const n = parseFloat(String(delay));
+          if (Number.isFinite(n) && n >= 0) { segundos = n; hayPista = true; break; }
+        }
+      }
+    } catch (e) {}
+  }
+
+  // Sin pista del servidor: retroceso exponencial 2s, 4s, 8s.
+  let ms = hayPista ? segundos * 1000 : Math.pow(2, intento) * 1000;
+  ms = Math.min(ms, 60000);
+  return Math.round(ms + Math.random() * 500);
+}
+
 // Misma firma que azureChatStreamTools, para que el bucle de agente no note la
 // diferencia: (messages, tools, onChunk, cb) -> cb(err, {role, content, tool_calls}).
 function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
@@ -1665,7 +1708,8 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
         if (resp.statusCode >= 400) {
           if (GEMINI_REINTENTABLES.indexOf(resp.statusCode) !== -1 && intento < GEMINI_MAX_REINTENTOS) {
             intento++;
-            return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed, payloadOverride), 1500 * intento);
+            const espera = geminiEsperaReintento(intento, resp.headers, raw);
+            return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed, payloadOverride), espera);
           }
           return terminar(new Error(summarizeVertexError(resp.statusCode, raw, modelUsed)));
         }
@@ -1727,7 +1771,10 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
       if (liquidado) return;
       if (intento < GEMINI_MAX_REINTENTOS) {
         intento++;
-        return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed), 1500 * intento);
+        // Hay que reenviar el MISMO payload: omitir payloadOverride hacia que
+        // el reintento mandara una conversacion distinta a la que fallo.
+        const espera = geminiEsperaReintento(intento, null, null);
+        return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed, payloadOverride), espera);
       }
       return terminar(e);
     });

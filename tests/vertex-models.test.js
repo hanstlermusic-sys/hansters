@@ -28,19 +28,25 @@ const bloqueError = extraer(
   'const GEMINI_NO_CONTENT_RETRY_REASONS',
   'summarizeVertexError');
 
+const bloqueEspera = extraer(
+  'function geminiEsperaReintento(',
+  '// Misma firma que azureChatStreamTools',
+  'geminiEsperaReintento');
+
 // summarizeVertexError consulta loadVertex() para saber el modo de auth;
 // lo sustituimos por un doble controlable.
 let modoAuth = 'api-key';
+
 const sandbox = {
   __out: null,
-  String, Number, Set, JSON,
+  String, Number, Set, JSON, Date, Math, parseFloat,
   loadVertex: () => ({ authMode: modoAuth })
 };
 vm.runInNewContext(
-  bloqueModelos + '\n' + bloqueError +
-  '\n__out = { normalizeVertexModel, summarizeVertexError, VERTEX_DEFAULT_PRO, VERTEX_DEFAULT_FLASH, GEMINI_RETIRADOS };',
+  bloqueModelos + '\n' + bloqueError + '\n' + bloqueEspera +
+  '\n__out = { normalizeVertexModel, summarizeVertexError, VERTEX_DEFAULT_PRO, VERTEX_DEFAULT_FLASH, GEMINI_RETIRADOS, geminiEsperaReintento };',
   sandbox);
-const { normalizeVertexModel, summarizeVertexError, VERTEX_DEFAULT_PRO, VERTEX_DEFAULT_FLASH } = sandbox.__out;
+const { normalizeVertexModel, summarizeVertexError, VERTEX_DEFAULT_PRO, VERTEX_DEFAULT_FLASH, geminiEsperaReintento } = sandbox.__out;
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -59,6 +65,9 @@ function noInc(txt, frag, m) {
   if (String(txt).toLowerCase().indexOf(String(frag).toLowerCase()) >= 0) {
     throw new Error((m || '') + ' NO debia contener "' + frag + '" pero fue: ' + txt);
   }
+}
+function ok(cond, m) {
+  if (!cond) throw new Error(m || 'condicion falsa');
 }
 
 console.log('\n--- normalizeVertexModel ---');
@@ -149,7 +158,7 @@ console.log('\n--- coherencia con el resto del codigo ---');
 
 t('ya no quedan modelos por defecto hardcodeados en la config de Vertex', () => {
   // Solo las zonas que fijan defaults: loadVertex y la ruta /api/vertex/config.
-  // La lista del selector de /api/models sí nombra modelos a proposito.
+  // La lista del selector de /api/models sÃƒÆ’Ã‚Â­ nombra modelos a proposito.
   const zonas = [
     src.slice(src.indexOf('function loadVertex() {'), src.indexOf('function summarizeVertexError(')),
     (function () {
