@@ -36,6 +36,20 @@ function loadAzure() {
   return null;
 }
 const VERTEX_FILE = path.join(os.homedir(), '.hanstlers', 'vertex.json');
+function normalizeVertexModel(kind, value) {
+  const v = String(value || '').trim();
+  const low = v.toLowerCase();
+  if (!v) {
+    if (kind === 'pro') return 'gemini-3.7-flash';
+    if (kind === 'flash') return 'gemini-3.5-flash';
+    return 'claude-opus-5';
+  }
+  // Evita modelos legacy que hoy devuelven 404 para varias llaves.
+  if (kind === 'pro' && (low === 'gemini-2.5-pro' || low === 'gemini-pro')) return 'gemini-3.7-flash';
+  if (kind === 'flash' && (low === 'gemini-2.5-flash' || low === 'gemini-flash')) return 'gemini-3.5-flash';
+  if (kind === 'opus' && low === 'claude-opus-4') return 'claude-opus-5';
+  return v;
+}
 function loadVertex() {
   let fileCfg = {};
   try {
@@ -52,14 +66,18 @@ function loadVertex() {
   const hasProjectCfg = !!(projectId && region);
   const hasApiKey = !!apiKey;
   if (!hasProjectCfg && !hasApiKey) return null;
+  const allowModelEnv = /^(1|true|yes|on)$/i.test(String(process.env.HANSTLERS_ALLOW_VERTEX_MODEL_ENV || '').trim());
+  const modelProEnv = String(process.env.VERTEX_MODEL_PRO || '').trim();
+  const modelFlashEnv = String(process.env.VERTEX_MODEL_FLASH || '').trim();
+  const modelOpusEnv = String(process.env.VERTEX_MODEL_OPUS || '').trim();
   return {
     projectId,
     region,
     apiKey,
     models: {
-      pro: String(process.env.VERTEX_MODEL_PRO || fileCfg.modelPro || 'gemini-3.7-flash').trim(),
-      flash: String(process.env.VERTEX_MODEL_FLASH || fileCfg.modelFlash || 'gemini-3.5-flash').trim(),
-      opus: String(process.env.VERTEX_MODEL_OPUS || fileCfg.modelOpus || 'claude-opus-5').trim()
+      pro: normalizeVertexModel('pro', (allowModelEnv ? modelProEnv : '') || fileCfg.modelPro || 'gemini-3.7-flash'),
+      flash: normalizeVertexModel('flash', (allowModelEnv ? modelFlashEnv : '') || fileCfg.modelFlash || 'gemini-3.5-flash'),
+      opus: normalizeVertexModel('opus', (allowModelEnv ? modelOpusEnv : '') || fileCfg.modelOpus || 'claude-opus-5')
     },
     authMode: hasProjectCfg ? 'adc' : 'api-key'
   };
@@ -432,6 +450,7 @@ function summarizeVertexError(statusCode, raw) {
     msg = String((j && j.error && j.error.message) || '').trim();
   } catch (e) {}
   const low = (msg || String(raw || '')).toLowerCase();
+  if (code === 400 && msg) return 'Vertex rechazó la solicitud: ' + msg.slice(0, 280);
   if ((code === 429) || /quota exceeded|resource_exhausted|rate limit|too many requests/.test(low)) return 'Vertex no disponible: cuota/rate-limit agotado. Sube cuota de Vertex o espera el reset.';
   if (code === 403 && /billing/.test(low)) return 'Vertex no disponible: habilita billing en el proyecto GCP.';
   if (code === 403 && /permission denied|permission_denied|denied/.test(low)) return 'Vertex no disponible: faltan permisos IAM para ese proyecto/modelo.';
@@ -440,39 +459,87 @@ function summarizeVertexError(statusCode, raw) {
   return 'Vertex no disponible temporalmente.';
 }
 
+const GEMINI_NO_CONTENT_RETRY_REASONS = new Set([
+  'MALFORMED_FUNCTION_CALL',
+  'UNEXPECTED_TOOL_CALL',
+  'OTHER',
+  'FINISH_REASON_UNSPECIFIED'
+]);
+
+function normalizeGeminiFinishReason(reason) {
+  return String(reason || '').trim().toUpperCase();
+}
+
+function summarizeGeminiNoContent(reason) {
+  const r = normalizeGeminiFinishReason(reason);
+  if (!r) return 'Gemini no devolvio contenido.';
+  if (r === 'MALFORMED_FUNCTION_CALL') return 'Gemini devolvio una llamada de funcion malformada. Se reintentara automaticamente.';
+  if (r === 'UNEXPECTED_TOOL_CALL') return 'Gemini intento usar una herramienta no esperada. Se reintentara automaticamente.';
+  if (r === 'SAFETY') return 'Gemini bloqueo la respuesta por politicas de seguridad. Reformula la peticion con mas contexto tecnico.';
+  if (r === 'RECITATION') return 'Gemini bloqueo la salida por recitacion de contenido protegido. Pide un resumen o transformacion.';
+  if (r === 'MAX_TOKENS') return 'Gemini llego al limite de tokens sin producir salida util. Reduce el alcance del pedido.';
+  return 'Gemini no devolvio contenido (' + r + ').';
+}
+
 function isVertexOnlyMode(selectedModel) {
   const forced = String(process.env.HANSTLERS_VERTEX_ONLY || '').trim().toLowerCase();
   if (forced === '1' || forced === 'true' || forced === 'yes' || forced === 'on') return true;
   return String(selectedModel || '').trim().toLowerCase() === 'vertex-claude-opus-5';
 }
+function allowVertexCopilotFallback() {
+  const v = String(process.env.HANSTLERS_VERTEX_ALLOW_COPILOT_FALLBACK || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
 
 function toGeminiContents(history, message, images) {
-  const out = [];
+  const raw = [];
   (Array.isArray(history) ? history : []).forEach((m) => {
     const role = String(m && m.role || '').toLowerCase() === 'user' ? 'user' : 'model';
     const txt = String(m && (m.content || m.html) || '').trim();
     if (!txt) return;
-    out.push({ role, parts: [{ text: txt.slice(0, 2000) }] });
+    raw.push({ role, text: txt.slice(0, 2000) });
   });
-  const userParts = [{ text: String(message || '') }];
+  while (raw.length && raw[0].role !== 'user') raw.shift();
+  const out = [];
+  raw.forEach((m) => {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) {
+      last.parts.push({ text: m.text });
+    } else {
+      out.push({ role: m.role, parts: [{ text: m.text }] });
+    }
+  });
+  const userParts = [{ text: String(message || '').trim() }];
   (Array.isArray(images) ? images : []).slice(0, 4).forEach((im) => {
     const mm = /^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/i.exec(String(im || ''));
     if (!mm) return;
     userParts.push({ inlineData: { mimeType: mm[1], data: mm[2] } });
   });
-  out.push({ role: 'user', parts: userParts });
+  if (out.length && out[out.length - 1].role === 'user') out[out.length - 1].parts = out[out.length - 1].parts.concat(userParts);
+  else out.push({ role: 'user', parts: userParts });
   return out;
 }
 
 function toAnthropicMessages(history, message) {
-  const out = [];
+  const raw = [];
   (Array.isArray(history) ? history : []).forEach((m) => {
     const role = String(m && m.role || '').toLowerCase() === 'user' ? 'user' : 'assistant';
     const txt = String(m && (m.content || m.html) || '').trim();
     if (!txt) return;
-    out.push({ role, content: [{ type: 'text', text: txt.slice(0, 2000) }] });
+    raw.push({ role, text: txt.slice(0, 2000) });
   });
-  out.push({ role: 'user', content: [{ type: 'text', text: String(message || '') }] });
+  while (raw.length && raw[0].role !== 'user') raw.shift();
+  const out = [];
+  raw.forEach((m) => {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) {
+      last.content.push({ type: 'text', text: m.text });
+    } else {
+      out.push({ role: m.role, content: [{ type: 'text', text: m.text }] });
+    }
+  });
+  if (out.length && out[out.length - 1].role === 'user') out[out.length - 1].content.push({ type: 'text', text: String(message || '') });
+  else out.push({ role: 'user', content: [{ type: 'text', text: String(message || '') }] });
   return out;
 }
 
@@ -496,12 +563,21 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       contents: toGeminiContents(history, finalMsg, images),
       generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
     });
-  const parseAndEmit = (publisher, raw) => {
+  const buildGoogleEndpoint = (modelName) => {
+    if (cfg.authMode === 'api-key') {
+      return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(cfg.apiKey)}`;
+    }
+    return `https://${cfg.region}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/locations/${encodeURIComponent(cfg.region)}/publishers/google/models/${encodeURIComponent(modelName)}:generateContent`;
+  };
+  let noContentRetry = false;
+  let malformedRecovered = false;
+  const parseAndEmit = (publisher, raw, modelUsed, routeReason) => {
     let j = null;
     try { j = JSON.parse(raw || '{}'); } catch (e) { return { ok: false, err: 'Vertex devolvió una respuesta inválida.' }; }
     let txt = '';
     let promptTok = 0;
     let outTok = 0;
+    let finishReason = '';
     if (publisher === 'anthropic') {
       txt = Array.isArray(j.content)
         ? j.content.map((p) => String(p && p.text || '')).join('').trim()
@@ -510,22 +586,28 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       promptTok = Number(usage.input_tokens);
       outTok = Number(usage.output_tokens);
     } else {
-      const parts = (((j || {}).candidates || [])[0] || {}).content || {};
+      const cand = (((j || {}).candidates || [])[0] || {});
+      const parts = cand.content || {};
+      finishReason = normalizeGeminiFinishReason(cand.finishReason || '');
       txt = Array.isArray(parts.parts) ? parts.parts.map((p) => String(p && p.text || '')).join('').trim() : '';
       const usage = j.usageMetadata || {};
       promptTok = Number(usage.promptTokenCount);
       outTok = Number(usage.candidatesTokenCount);
     }
-    if (!txt) return { ok: false, err: 'Vertex devolvió respuesta vacía.' };
-    send('route', { model: 'vertex:' + (publisher === 'anthropic' ? ('anthropic/' + pick.model) : pick.model), reason: pick.reason });
+    if (!txt) {
+      const userMessage = summarizeGeminiNoContent(finishReason);
+      if (finishReason) return { ok: false, err: 'Vertex devolvió respuesta vacía (' + finishReason + ').', finishReason: finishReason, userMessage: userMessage };
+      return { ok: false, err: 'Vertex devolvió respuesta vacía.', finishReason: '', userMessage: userMessage };
+    }
+    send('route', { model: 'vertex:' + (publisher === 'anthropic' ? ('anthropic/' + modelUsed) : modelUsed), reason: routeReason || pick.reason });
     send('chunk', txt);
     if ((Number.isFinite(promptTok) && promptTok > 0) || (Number.isFinite(outTok) && outTok > 0)) {
-      addGoogleTokens(pick.model, promptTok, outTok);
+      addGoogleTokens(modelUsed, promptTok, outTok);
       send('usage', { quota: quotaInfo(), google: googleQuotaInfo() });
     }
     return { ok: true };
   };
-  const sendVertexRequest = (authHeader, endpoint) => {
+  const sendVertexRequest = (authHeader, endpoint, modelUsed, routeReason) => {
     const u = new URL(endpoint);
     let reqAborted = false;
     const req = https.request({
@@ -543,8 +625,22 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       resp.on('end', () => {
         if (reqAborted) return;
         if (resp.statusCode >= 400) return onDone(1, summarizeVertexError(resp.statusCode, raw));
-        const parsed = parseAndEmit(pick.publisher || 'google', raw);
-        if (!parsed.ok) return onDone(1, parsed.err);
+        const currentModel = modelUsed || pick.model;
+        const parsed = parseAndEmit(pick.publisher || 'google', raw, currentModel, routeReason || pick.reason);
+        if (!parsed.ok && (pick.publisher || 'google') === 'google') {
+          if (!noContentRetry && GEMINI_NO_CONTENT_RETRY_REASONS.has(parsed.finishReason)) {
+            noContentRetry = true;
+            return sendVertexRequest(authHeader, endpoint, currentModel, (routeReason || pick.reason) + '-retry-empty');
+          }
+          if (!malformedRecovered && parsed.finishReason === 'MALFORMED_FUNCTION_CALL') {
+            malformedRecovered = true;
+            const fallbackModel = cfg.models.flash || currentModel;
+            if (fallbackModel && fallbackModel !== currentModel) {
+              return sendVertexRequest(authHeader, buildGoogleEndpoint(fallbackModel), fallbackModel, (routeReason || pick.reason) + '-fallback-malformed');
+            }
+          }
+        }
+        if (!parsed.ok) return onDone(1, parsed.userMessage || parsed.err);
         return onDone(0);
       });
     });
@@ -554,10 +650,8 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
     req.write(payload);
     req.end();
   };
-
   if (cfg.authMode === 'api-key') {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(pick.model)}:generateContent?key=${encodeURIComponent(cfg.apiKey)}`;
-    return sendVertexRequest({}, endpoint);
+    return sendVertexRequest({}, buildGoogleEndpoint(pick.model), pick.model, pick.reason);
   }
 
   try {
@@ -566,7 +660,7 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       const publisher = pick.publisher || 'google';
       const method = publisher === 'anthropic' ? 'rawPredict' : 'generateContent';
       const endpoint = `https://${cfg.region}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/locations/${encodeURIComponent(cfg.region)}/publishers/${encodeURIComponent(publisher)}/models/${encodeURIComponent(pick.model)}:${method}`;
-      return sendVertexRequest({ 'Authorization': 'Bearer ' + token }, endpoint);
+      return sendVertexRequest({ 'Authorization': 'Bearer ' + token }, endpoint, pick.model, pick.reason);
     });
   } catch (e) {
     onDone(1, 'Vertex auth: ' + e.message);
@@ -1351,18 +1445,42 @@ function geminiPartsFromContent(content) {
 // anterior del modelo (varias herramientas en paralelo = un solo turno).
 function toGeminiAgentContents(messages) {
   const sys = [];
-  const contents = [];
+  const turns = [];
   const nombrePorId = {};
-  const push = (role, parts) => {
+  const pushTurn = (role, parts, meta) => {
     if (!parts || !parts.length) return;
-    const ultimo = contents[contents.length - 1];
-    if (ultimo && ultimo.role === role) { ultimo.parts = ultimo.parts.concat(parts); return; }
-    contents.push({ role: role, parts: parts });
+    turns.push({
+      role: role,
+      parts: parts,
+      fromTool: !!(meta && meta.fromTool),
+      hasFnCall: !!(meta && meta.hasFnCall)
+    });
+  };
+  const pushUserText = (parts) => {
+    if (!parts || !parts.length) return;
+    const ultimo = turns[turns.length - 1];
+    if (ultimo && ultimo.role === 'user' && !ultimo.fromTool) { ultimo.parts = ultimo.parts.concat(parts); return; }
+    pushTurn('user', parts, { fromTool: false, hasFnCall: false });
+  };
+  const pushModel = (parts, hasFnCall) => {
+    if (!parts || !parts.length) return;
+    const ultimo = turns[turns.length - 1];
+    if (ultimo && ultimo.role === 'model' && !ultimo.hasFnCall && !hasFnCall) {
+      ultimo.parts = ultimo.parts.concat(parts);
+      return;
+    }
+    pushTurn('model', parts, { fromTool: false, hasFnCall: !!hasFnCall });
+  };
+  const pushToolResponse = (part) => {
+    if (!part) return;
+    const ultimo = turns[turns.length - 1];
+    if (ultimo && ultimo.role === 'user' && ultimo.fromTool) { ultimo.parts.push(part); return; }
+    pushTurn('user', [part], { fromTool: true, hasFnCall: false });
   };
   (messages || []).forEach((m) => {
     if (!m) return;
     if (m.role === 'system') { if (m.content) sys.push(String(m.content)); return; }
-    if (m.role === 'user') { push('user', geminiPartsFromContent(m.content)); return; }
+    if (m.role === 'user') { pushUserText(geminiPartsFromContent(m.content)); return; }
     if (m.role === 'assistant') {
       (m.tool_calls || []).forEach((tc) => {
         nombrePorId[tc.id] = {
@@ -1373,15 +1491,21 @@ function toGeminiAgentContents(messages) {
       // Gemini 3.x firma cada part con un `thoughtSignature` opaco y EXIGE que se
       // le devuelva tal cual; reconstruir la part desde {name,args} da un 400.
       // Por eso se reenvian las parts crudas del modelo cuando las tenemos.
-      if (m._geminiParts && m._geminiParts.length) { push('model', m._geminiParts); return; }
+      if (m._geminiParts && m._geminiParts.length) {
+        const hasFn = m._geminiParts.some((p) => !!(p && p.functionCall));
+        pushModel(m._geminiParts, hasFn);
+        return;
+      }
       const parts = [];
+      let hasFnCall = false;
       if (m.content) parts.push({ text: String(m.content) });
       (m.tool_calls || []).forEach((tc) => {
         let args = {};
         try { args = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) { args = {}; }
         parts.push({ functionCall: { name: (tc.function && tc.function.name) || 'tool', args: args } });
+        hasFnCall = true;
       });
-      push('model', parts);
+      pushModel(parts, hasFnCall);
       return;
     }
     if (m.role === 'tool') {
@@ -1389,11 +1513,34 @@ function toGeminiAgentContents(messages) {
       const salida = String(m.content == null ? '' : m.content);
       const fr = { name: info.name || 'tool', response: { output: salida } };
       if (info.gid) fr.id = info.gid;
-      push('user', [{ functionResponse: fr }]);
+      pushToolResponse({ functionResponse: fr });
     }
   });
+  const filtered = [];
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t && t.fromTool) {
+      const prev = filtered[filtered.length - 1];
+      if (!(prev && prev.role === 'model' && prev.hasFnCall)) continue;
+    }
+    filtered.push(t);
+  }
+  const repaired = [];
+  for (let i = 0; i < filtered.length; i++) {
+    const t = filtered[i];
+    if (t && t.role === 'model' && t.hasFnCall) {
+      const next = filtered[i + 1];
+      if (!(next && next.role === 'user' && next.fromTool)) {
+        const txtParts = (t.parts || []).filter((p) => p && typeof p.text === 'string' && p.text.trim());
+        if (txtParts.length) repaired.push({ role: 'model', parts: txtParts, fromTool: false, hasFnCall: false });
+        continue;
+      }
+    }
+    repaired.push(t);
+  }
   // Gemini rechaza un historial que no empiece por un turno de 'user'.
-  while (contents.length && contents[0].role !== 'user') contents.shift();
+  while (repaired.length && repaired[0].role !== 'user') repaired.shift();
+  const contents = repaired.map((t) => ({ role: t.role, parts: t.parts }));
   return {
     contents: contents,
     systemInstruction: sys.length ? { parts: [{ text: sys.join('\n\n') }] } : null
@@ -1415,12 +1562,33 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
   if (conv.systemInstruction) body.systemInstruction = conv.systemInstruction;
   const decls = geminiFunctionDeclarations(tools);
   if (decls.length) body.tools = [{ functionDeclarations: decls }];
-  const payload = JSON.stringify(body);
+  const payloadTools = JSON.stringify(body);
+  const bodyPlain = {
+    contents: conv.contents,
+    generationConfig: { temperature: 0.15, maxOutputTokens: 8192 }
+  };
+  if (conv.systemInstruction) bodyPlain.systemInstruction = conv.systemInstruction;
+  const payloadPlain = JSON.stringify(bodyPlain);
+  const bodyRepair = {
+    contents: conv.contents.concat([{ role: 'user', parts: [{ text: 'Responde SOLO en texto plano en espanol. No llames herramientas ni funciones en esta respuesta.' }] }]),
+    generationConfig: { temperature: 0.1, maxOutputTokens: 2048 }
+  };
+  if (conv.systemInstruction) bodyRepair.systemInstruction = conv.systemInstruction;
+  const payloadRepair = JSON.stringify(bodyRepair);
   let liquidado = false;
   const terminar = (err, msg) => { if (liquidado) return; liquidado = true; cb(err, msg); };
   let intento = 0;
+  let intentoPlano = false;
+  let intentoFlash = false;
+  let intentoReparacion = false;
+  const swapEndpointModel = (endpoint, nextModel) => String(endpoint || '').replace(
+    /\/models\/[^:]+:generateContent/i,
+    '/models/' + encodeURIComponent(String(nextModel || '').trim()) + ':generateContent'
+  );
 
-  const lanzar = (endpoint, authHeader) => {
+  const lanzar = (endpoint, authHeader, sinTools, modelActivo, payloadOverride) => {
+    const modelUsed = String(modelActivo || model || '').trim();
+    const payload = payloadOverride || (sinTools ? payloadPlain : payloadTools);
     const u = new URL(endpoint);
     const req = https.request({
       hostname: u.hostname,
@@ -1442,7 +1610,7 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
         if (resp.statusCode >= 400) {
           if (GEMINI_REINTENTABLES.indexOf(resp.statusCode) !== -1 && intento < GEMINI_MAX_REINTENTOS) {
             intento++;
-            return setTimeout(() => lanzar(endpoint, authHeader), 1500 * intento);
+            return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed, payloadOverride), 1500 * intento);
           }
           return terminar(new Error(summarizeVertexError(resp.statusCode, raw)));
         }
@@ -1471,11 +1639,26 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
         const pt = Number(usage.promptTokenCount);
         const ot = Number(usage.candidatesTokenCount);
         if ((Number.isFinite(pt) && pt > 0) || (Number.isFinite(ot) && ot > 0)) {
-          try { addGoogleTokens(model, pt, ot); } catch (e) {}
+          try { addGoogleTokens(modelUsed, pt, ot); } catch (e) {}
         }
         if (!texto && !tool_calls.length) {
-          const fin = cand.finishReason || 'sin contenido';
-          if (fin !== 'STOP') return terminar(new Error('Gemini no devolvio contenido (' + fin + ').'));
+          const fin = normalizeGeminiFinishReason(cand.finishReason || '');
+          if (!sinTools && GEMINI_NO_CONTENT_RETRY_REASONS.has(fin)) {
+            const flashModel = String(cfg && cfg.models && cfg.models.flash || '').trim();
+            if (!intentoFlash && flashModel && flashModel !== modelUsed) {
+              intentoFlash = true;
+              return lanzar(swapEndpointModel(endpoint, flashModel), authHeader, false, flashModel);
+            }
+          }
+          if (!sinTools && !intentoPlano && GEMINI_NO_CONTENT_RETRY_REASONS.has(fin)) {
+            intentoPlano = true;
+            return lanzar(endpoint, authHeader, true, modelUsed);
+          }
+          if (sinTools && !intentoReparacion && GEMINI_NO_CONTENT_RETRY_REASONS.has(fin)) {
+            intentoReparacion = true;
+            return lanzar(endpoint, authHeader, true, modelUsed, payloadRepair);
+          }
+          return terminar(new Error(summarizeGeminiNoContent(fin)));
         }
         if (texto && onChunk) onChunk(texto);
         const msg = { role: 'assistant', content: texto || null };
@@ -1489,7 +1672,7 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
       if (liquidado) return;
       if (intento < GEMINI_MAX_REINTENTOS) {
         intento++;
-        return setTimeout(() => lanzar(endpoint, authHeader), 1500 * intento);
+        return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed), 1500 * intento);
       }
       return terminar(e);
     });
@@ -1500,7 +1683,7 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
 
   if (cfg.authMode === 'api-key') {
     return lanzar('https://generativelanguage.googleapis.com/v1beta/models/' +
-      encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(cfg.apiKey), {});
+      encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(cfg.apiKey), {}, false, model);
   }
   try {
     getGcpAccessToken((tokErr, token) => {
@@ -1508,7 +1691,7 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
       return lanzar('https://' + cfg.region + '-aiplatform.googleapis.com/v1/projects/' +
         encodeURIComponent(cfg.projectId) + '/locations/' + encodeURIComponent(cfg.region) +
         '/publishers/google/models/' + encodeURIComponent(model) + ':generateContent',
-        { 'Authorization': 'Bearer ' + token });
+        { 'Authorization': 'Bearer ' + token }, false, model);
     });
   } catch (e) {
     terminar(new Error('Vertex auth: ' + e.message));
@@ -1578,6 +1761,64 @@ const AGENT_DIR = path.join(os.homedir(), '.hanstlers', 'agent');
 
 function msgSize(m) { try { return JSON.stringify(m).length; } catch (e) { return 0; } }
 
+function sanitizeAgentBody(body) {
+  if (!Array.isArray(body) || !body.length) return [];
+  const out = [];
+  let i = 0;
+  while (i < body.length) {
+    const m = body[i] || null;
+    const role = String(m && m.role || '');
+    if (role === 'tool') { i++; continue; }
+    if (role !== 'assistant') {
+      out.push(m);
+      i++;
+      continue;
+    }
+
+    const rawCalls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+    if (!rawCalls.length) {
+      out.push(m);
+      i++;
+      continue;
+    }
+
+    const ids = rawCalls
+      .map((tc) => String(tc && tc.id || '').trim())
+      .filter(Boolean);
+    if (ids.length !== rawCalls.length) {
+      const plain = Object.assign({}, m);
+      delete plain.tool_calls;
+      delete plain._geminiParts;
+      if (plain.content) out.push(plain);
+      i++;
+      continue;
+    }
+
+    const byId = {};
+    let j = i + 1;
+    while (j < body.length) {
+      const tm = body[j] || null;
+      if (String(tm && tm.role || '') !== 'tool') break;
+      const tid = String(tm && tm.tool_call_id || '').trim();
+      if (tid && byId[tid] === undefined) byId[tid] = tm;
+      j++;
+    }
+
+    const complete = ids.every((id) => !!byId[id]);
+    if (complete) {
+      out.push(m);
+      ids.forEach((id) => out.push(byId[id]));
+    } else if (m.content) {
+      const plain = Object.assign({}, m);
+      delete plain.tool_calls;
+      delete plain._geminiParts;
+      out.push(plain);
+    }
+    i = j;
+  }
+  return out;
+}
+
 // Recorta por el principio. Nunca deja un mensaje role:'tool' huerfano al frente:
 // la API devuelve 400 si un 'tool' no va precedido del 'assistant' que lo pidio.
 function trimAgentMessages(body, maxChars) {
@@ -1588,7 +1829,8 @@ function trimAgentMessages(body, maxChars) {
   let cut = 0;
   while (cut < body.length && total > limit) { total -= msgSize(body[cut]); cut++; }
   while (cut < body.length && body[cut] && body[cut].role === 'tool') cut++;
-  return cut === 0 ? body : body.slice(cut);
+  const sliced = cut === 0 ? body : body.slice(cut);
+  return sanitizeAgentBody(sliced);
 }
 
 function agentFile(id) { return path.join(AGENT_DIR, String(id).replace(/[^a-z0-9_-]/gi, '') + '.json'); }
@@ -1613,7 +1855,14 @@ function buildAgentMessages(convId, history, preamble) {
   state.convAgentMessages = state.convAgentMessages || {};
   let prior = convId ? state.convAgentMessages[convId] : null;
   if (!(Array.isArray(prior) && prior.length)) prior = loadAgentTranscript(convId);
-  const body = (Array.isArray(prior) && prior.length) ? prior : (history || []);
+  const bodyRaw = (Array.isArray(prior) && prior.length) ? prior : (history || []);
+  const body = sanitizeAgentBody(bodyRaw);
+  const rawSig = (() => { try { return JSON.stringify(bodyRaw); } catch (e) { return ''; } })();
+  const cleanSig = (() => { try { return JSON.stringify(body); } catch (e) { return ''; } })();
+  if (convId && Array.isArray(bodyRaw) && bodyRaw.length && rawSig !== cleanSig) {
+    state.convAgentMessages[convId] = body;
+    saveAgentTranscript(convId, body);
+  }
   return (preamble || []).concat(body);
 }
 
@@ -1762,15 +2011,22 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
       if (msg.tool_calls && msg.tool_calls.length) {
         let pending = msg.tool_calls.length;
         send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acción…' : ' acciones…'));
-        msg.tool_calls.forEach((tc) => {
+        const orderedToolResults = new Array(msg.tool_calls.length);
+        msg.tool_calls.forEach((tc, idx) => {
           let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
           const label = (args.path || args.command || '').toString();
           const shortLabel = label.length > 60 ? '…' + label.slice(-58) : label;
           send('chunk', '\n' + iconOf(tc.function.name) + ' ' + tc.function.name + '(' + shortLabel + ') …');
           runToolGated(tc, args, (result, summary) => {
             send('chunk', ' ✓' + (summary ? ' ' + summary : ''));
-            messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 12000) });
-            if (--pending === 0) { send('chunk', '\n'); loop(); }
+            orderedToolResults[idx] = { role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 12000) };
+            if (--pending === 0) {
+              for (let i = 0; i < orderedToolResults.length; i++) {
+                if (orderedToolResults[i]) messages.push(orderedToolResults[i]);
+              }
+              send('chunk', '\n');
+              loop();
+            }
           });
         });
       } else {
@@ -2260,6 +2516,26 @@ function isVertexModel(model) {
   const m = String(model || '').trim().toLowerCase();
   return m === 'vertex-auto' || m === 'vertex-gemini-pro' || m === 'vertex-gemini-flash' || m === 'vertex-claude-opus-5';
 }
+function isModelIdentityQuestion(text) {
+  const t = String(text || '').toLowerCase();
+  return /\b(que|qué|cual|cuál)\s+modelo\b/.test(t)
+    || /\bde\s+donde\s+viene\s+ese\s+modelo\b/.test(t)
+    || /\bwhat\s+model\b/.test(t)
+    || /\bwhich\s+model\b/.test(t);
+}
+function describeEffectiveModel(reqModel, routeReason) {
+  const m = String(reqModel || '').trim();
+  if (!m || m === 'auto') return 'Modelo activo: auto (router inteligente).';
+  if (m === 'azure-agent') return 'Modelo activo: Azure Agent (herramientas en servidor local).';
+  if (m === 'azure' || m === 'azure-gpt-5-mini') return 'Modelo activo: Azure OpenAI (' + m + ').';
+  if (isVertexModel(m)) {
+    const pick = pickVertexTarget(m, '', false);
+    const real = pick && pick.model ? pick.model : m;
+    const pub = pick && pick.publisher === 'anthropic' ? 'Anthropic en Vertex' : 'Google Gemini en Vertex';
+    return 'Modelo activo: ' + m + ' → ' + real + ' (' + pub + ').';
+  }
+  return 'Modelo activo: ' + m + (routeReason ? (' (' + routeReason + ').') : '.');
+}
 function pickVertexTarget(model, message, hasAttachments) {
   const cfg = loadVertex();
   const m = String(model || '').trim().toLowerCase();
@@ -2280,10 +2556,7 @@ function chooseModelForRequest(requestedModel, message, hasAttachments, fromLoca
     const wantsExecution = looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments;
     const explicitVertex = explicit === 'vertex-auto' || explicit === 'vertex-gemini-pro' || explicit === 'vertex-gemini-flash' || explicit === 'vertex-claude-opus-5';
     if (explicitVertex && wantsExecution) {
-      // Con herramientas conectadas, Vertex se basta: no lo desviamos.
-      if (feats.vertexAgentTools && loadVertex()) return { model: base, reason: 'explicit-vertex-agent-tools' };
-      if (feats.routeExecutionToAzureAgent && loadAzure()) return { model: 'azure-agent', reason: 'explicit-vertex-execution-reroute' };
-      return { model: 'auto', reason: 'explicit-vertex-execution-fallback-auto' };
+      return { model: base, reason: 'explicit-vertex-locked' };
     }
     return { model: base || 'auto', reason: 'explicit-model' };
   }
@@ -3086,6 +3359,19 @@ function handleChat(req, res, body) {
   const requestedModel = model || state.model;
   const routePick = chooseModelForRequest(requestedModel, body.message || message, (images.length > 0 || files.length > 0), fromLocalAgent);
   const reqModel = routePick.model || model || state.model;
+  if (isModelIdentityQuestion(body.message || message)) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    const sendQuick = (event, data) => { try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {} };
+    sendQuick('route', { model: reqModel || 'auto', reason: routePick.reason || '' });
+    sendQuick('chunk', describeEffectiveModel(reqModel, routePick.reason || ''));
+    sendQuick('done', { code: 0 });
+    try { res.end(); } catch (_) {}
+    return;
+  }
   const isXCoreReq = (reqModel === 'x-core' || reqModel === 'x-core:latest');
 
   // AHORRO DE TOKENS: inyectar la memoria SOLO cuando aporta valor:
@@ -3202,8 +3488,8 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
           try { res.end(); } catch (e) {}
           return;
         }
-        if (isVertexOnlyMode(effModel)) {
-          send('error', reason || 'Vertex falló y el modo solo-Vertex está activo.');
+        if (isVertexOnlyMode(effModel) || !allowVertexCopilotFallback()) {
+          send('error', reason || 'Vertex falló y la política anti-fallback a Copilot está activa.');
           send('done', { code: 1 });
           try { res.end(); } catch (e) {}
           return;
@@ -3976,8 +4262,9 @@ const server = http.createServer(async (req, res) => {
     }
     const next = Object.assign({}, cur, {
       region,
-      modelPro: cur.modelPro || 'gemini-3.7-flash',
-      modelFlash: cur.modelFlash || 'gemini-3.5-flash'
+      modelPro: normalizeVertexModel('pro', cur.modelPro || 'gemini-3.7-flash'),
+      modelFlash: normalizeVertexModel('flash', cur.modelFlash || 'gemini-3.5-flash'),
+      modelOpus: normalizeVertexModel('opus', cur.modelOpus || 'claude-opus-5')
     });
     if (apiKey) next.apiKey = apiKey; else delete next.apiKey;
     if (projectId) next.projectId = projectId;

@@ -203,6 +203,27 @@ function pathKey(p){
 function isRepoDirectMode(){
   return sidebarMode === 'repo' && (!!activeRepoPath || !!activeRepoRef);
 }
+function fmtSidebarTime(ts){
+  const n = Number(ts || 0);
+  if(!Number.isFinite(n) || n <= 0) return 'sin fecha';
+  const d = new Date(n);
+  const now = Date.now();
+  const diff = Math.max(0, now - d.getTime());
+  if(diff < 60*1000) return 'hace un momento';
+  if(diff < 60*60*1000) return 'hace ' + Math.floor(diff/(60*1000)) + ' min';
+  if(diff < 24*60*60*1000) return 'hace ' + Math.floor(diff/(60*60*1000)) + ' h';
+  return d.toLocaleDateString('es-CR', { day:'2-digit', month:'2-digit' }) + ' ' + d.toLocaleTimeString('es-CR', { hour:'2-digit', minute:'2-digit' });
+}
+function renderConvPanelCard(box, total, shown){
+  const card = document.createElement('div');
+  card.className = 'repo-auth conv-overview';
+  const subtitle = shown !== total ? ('Mostrando ' + shown + ' de ' + total + '.') : (total + ' conversaciones disponibles.');
+  card.innerHTML =
+    '<div class="repo-auth-title">Conversaciones</div>' +
+    '<div class="repo-auth-status">Historial organizado con cambios rápidos.</div>' +
+    '<div class="repo-auth-note">' + esc(subtitle) + '</div>';
+  box.appendChild(card);
+}
 function buildCompactHistory(c, botIdx){
   ensureConvMeta(c);
   const prev = c.messages.slice(0, botIdx).filter(m=>m && (m.role==='user' || m.role==='bot' || m.role==='assistant'));
@@ -270,12 +291,17 @@ async function loadConvList(){
     const r = await fetch('/api/conv/list'); const j = await r.json();
     const box = document.getElementById('conv-list'); box.innerHTML='';
     const q = (document.getElementById('conv-search')?.value||'').trim().toLowerCase();
-    (j.items||[]).filter(it=> !q || (it.title||'').toLowerCase().includes(q)).forEach(it=>{
+    const allItems = (j.items||[]);
+    const shownItems = allItems.filter(it=> !q || (it.title||'').toLowerCase().includes(q));
+    renderConvPanelCard(box, allItems.length, shownItems.length);
+    shownItems.forEach(it=>{
       const busy = convData[it.id] && convData[it.id].busy;
+      const model = (convData[it.id] && convData[it.id].model) ? String(convData[it.id].model) : 'auto';
+      const timeTxt = fmtSidebarTime(it.updatedAt);
       const el = document.createElement('div');
-      el.className = 'conv-item' + (it.id===activeId?' active':'');
-      el.innerHTML = `<span class="t" title="${esc(it.title)}">${busy?'<span class="spin">●</span> ':''}${esc(it.title)}</span><span class="ren" title="Renombrar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></span><span class="del" title="Borrar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></span>`;
-      el.querySelector('.t').onclick = ()=> openConv(it.id);
+      el.className = 'conv-item conversation-item' + (it.id===activeId?' active':'');
+      el.innerHTML = `<div class="conv-row"><span class="t" title="${esc(it.title)}">${busy?'<span class="spin">●</span> ':''}${esc(it.title)}</span><span class="ren" title="Renombrar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></span><span class="del" title="Borrar"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></span></div><div class="conv-meta" title="Modelo: ${esc(model)} · ${esc(timeTxt)}">🧠 ${esc(model)} · ${esc(timeTxt)}</div>`;
+      el.onclick = ()=> openConv(it.id);
       el.querySelector('.ren').onclick = (e)=>{ e.stopPropagation();
         // Edición EN LÍNEA (Electron no soporta prompt()).
         const span = el.querySelector('.t');
