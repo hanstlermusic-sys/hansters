@@ -1566,7 +1566,12 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
     try{
       const r = await fetch('/api/update/check');
       info = await r.json();
-      if(dot) dot.hidden = !(info && info.ok && info.updateAvailable);
+      let hayModelo = false;
+      try{
+        const st = await (await fetch('/api/vertex/models/status')).json();
+        hayModelo = !!(st && st.pendiente);
+      }catch(e){}
+      if(dot) dot.hidden = !((info && info.ok && info.updateAvailable) || hayModelo);
       if(!silent) renderInfo();
     }catch(e){
       info = { ok:false, error:e.message };
@@ -1646,10 +1651,95 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
     poll();
   });
 
-  btn.addEventListener('click', ()=>{ open(); body.innerHTML = 'Comprobando…'; check(false); });
+  btn.addEventListener('click', ()=>{ open(); body.innerHTML = 'Comprobando…'; check(false); renderModelWatch(); });
   closeBtn.addEventListener('click', close);
   overlay.addEventListener('click', (e)=>{ if(e.target === overlay) close(); });
   document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape' && !overlay.hidden) close(); });
+
+  // ===== Vigía de modelos de Gemini =====
+  // El servidor comprueba solo, en segundo plano; aquí solo mostramos el
+  // hallazgo y dejamos aplicarlo con un clic.
+  const mw = document.getElementById('model-watch');
+  let mwBusy = false;
+
+  async function renderModelWatch(forzar){
+    if(!mw) return;
+    let st;
+    try{
+      if(forzar){
+        mw.hidden = false;
+        mw.innerHTML = '<div class="mw-title">🔍 Probando los modelos disponibles…</div>'+
+                       '<div class="mw-sub">Cada candidato se prueba de verdad con herramientas. Tarda ~1 minuto.</div>';
+        const r = await fetch('/api/vertex/models/check', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body:'{"deep":true}' });
+        await r.json();
+      }
+      st = await (await fetch('/api/vertex/models/status')).json();
+    }catch(e){ mw.hidden = true; return; }
+
+    const p = st.pendiente;
+    const actual = (st.actual && st.actual.pro) || '?';
+    mw.hidden = false;
+
+    if(p){
+      mw.innerHTML =
+        '<div class="mw-title">✨ Hay un modelo de Gemini mejor</div>'+
+        '<div>Pasar de <code>'+esc(p.de)+'</code> a <code>'+esc(p.a)+'</code>'+
+        (p.mejoraPct > 0 ? ' — <span class="mw-gain">'+p.mejoraPct+'% más rápido</span>' : '')+'</div>'+
+        '<div class="mw-sub">'+(p.motivo ? esc(p.motivo)+'. ' : '')+
+        'Probado con herramientas en paralelo: '+p.msAntes+'ms → '+p.msDespues+'ms.</div>'+
+        '<div class="mw-actions">'+
+          '<button class="primary" data-mw="apply" data-model="'+esc(p.a)+'">Cambiar a '+esc(p.a)+'</button>'+
+          '<button data-mw="dismiss" data-model="'+esc(p.a)+'">Ahora no</button>'+
+          '<label class="mw-auto"><input type="checkbox" data-mw="auto"'+(st.autoApply?' checked':'')+' /> Cambiar solo</label>'+
+        '</div>';
+    } else {
+      const cuando = st.lastCheck ? new Date(st.lastCheck).toLocaleString() : 'nunca';
+      mw.innerHTML =
+        '<div class="mw-title">🤖 Modelo de Gemini al día</div>'+
+        '<div class="mw-sub">Usando <code>'+esc(actual)+'</code>. Última revisión: '+esc(cuando)+
+        ' · cada '+(st.intervalHours||24)+' h.</div>'+
+        '<div class="mw-actions">'+
+          '<button data-mw="recheck">Buscar modelos ahora</button>'+
+          '<label class="mw-auto"><input type="checkbox" data-mw="auto"'+(st.autoApply?' checked':'')+' /> Cambiar solo</label>'+
+        '</div>';
+    }
+  }
+
+  if(mw){
+    mw.addEventListener('click', async (e)=>{
+      const el = e.target.closest('[data-mw]');
+      if(!el || mwBusy) return;
+      const acc = el.getAttribute('data-mw');
+      const model = el.getAttribute('data-model');
+
+      if(acc === 'auto'){
+        await fetch('/api/vertex/models/config', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ autoApply: el.checked }) }).catch(()=>{});
+        showMemoryChip(el.checked ? '🤖 Cambiaré de modelo solo' : '🤖 Te preguntaré antes de cambiar');
+        return;
+      }
+      mwBusy = true;
+      try{
+        if(acc === 'apply'){
+          const r = await (await fetch('/api/vertex/models/apply', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ model }) })).json();
+          showMemoryChip(r.ok ? '✅ Ahora usas '+model : '❌ '+(r.error||'no se pudo'));
+        } else if(acc === 'dismiss'){
+          await fetch('/api/vertex/models/dismiss', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ model }) });
+        } else if(acc === 'recheck'){
+          mwBusy = false;
+          return renderModelWatch(true);
+        }
+      }catch(err){}
+      mwBusy = false;
+      renderModelWatch();
+    });
+  }
 
   // Aviso silencioso al arrancar y cada 6 horas.
   setTimeout(()=>check(true), 6000);

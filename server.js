@@ -7,6 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const updater = require('./updater');
+const modelWatch = require('./model-watch');
 
 // Version instalada, para comparar contra la del repo en el actualizador.
 const APP_VERSION = (function () {
@@ -15,8 +16,18 @@ const APP_VERSION = (function () {
   } catch (e) { return ''; }
 })();
 
-// Cierra HanstlerS cuando el actualizador ya dejo el instalador corriendo.
-// El script externo espera a que el proceso muera, instala y vuelve a abrir.
+// Se registra el hallazgo del vigia de modelos; la interfaz lo consulta y lo
+// muestra. No se aplica solo salvo que el usuario active autoApply.
+function onModelFinding(r) {
+  try {
+    const rec = r && r.recomendacion;
+    if (!rec) return;
+    console.log('[model-watch] hay un modelo mejor: ' + rec.de + ' -> ' + rec.a +
+      ' (' + rec.msAntes + 'ms -> ' + rec.msDespues + 'ms)');
+  } catch (e) {}
+}
+
+// Cierra HanstlerS cuando el actualizador ya dejo el instalador corriendo.// El script externo espera a que el proceso muera, instala y vuelve a abrir.
 function quitForUpdate(j) {
   if (!j || !j.restarting) return;
   setTimeout(() => {
@@ -4473,6 +4484,37 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(r.ok ? 200 : 409, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(r));
   }
+  // ===== Vigia de modelos de Gemini =====
+  if (req.method === 'GET' && req.url === '/api/vertex/models/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(modelWatch.status()));
+  }
+  if (req.method === 'POST' && req.url === '/api/vertex/models/check') {
+    const b = (await readBody(req)) || {};
+    const r = await modelWatch.checkModels({ deep: b.deep !== false });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(r));
+  }
+  if (req.method === 'POST' && req.url === '/api/vertex/models/apply') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const b = (await readBody(req)) || {};
+    const r = modelWatch.applyModel(b.model);
+    res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(r));
+  }
+  if (req.method === 'POST' && req.url === '/api/vertex/models/dismiss') {
+    const b = (await readBody(req)) || {};
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(modelWatch.dismiss(b.model)));
+  }
+  if (req.method === 'POST' && req.url === '/api/vertex/models/config') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const b = (await readBody(req)) || {};
+    const st = modelWatch.setConfig(b);
+    modelWatch.schedule(onModelFinding);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, enabled: st.enabled, autoApply: st.autoApply, intervalHours: st.intervalHours }));
+  }
   if (req.method === 'GET' && req.url === '/api/shutdown') {
     res.writeHead(200); res.end('bye');
     // En modo Electron no matamos el proceso (Electron gestiona el ciclo de vida).
@@ -4503,6 +4545,8 @@ function startListen() {
     setTimeout(() => { try { detectFlags(() => {}); } catch (e) {} }, 50);
     // Sincronización silenciosa de cuota GitHub (si está habilitada).
     scheduleGithubQuotaSync();
+    // Vigilancia de modelos nuevos de Gemini (si está habilitada).
+    try { modelWatch.schedule(onModelFinding); } catch (e) {}
   });
 }
 

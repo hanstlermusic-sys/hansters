@@ -368,3 +368,25 @@ body[data-theme="light"] .bubble strong{ color:#000; }
 #update-go:hover{ box-shadow:0 0 14px rgba(138,180,248,.45); }
 #update-go[disabled]{ opacity:.5; cursor:default; box-shadow:none; }
 #update-go[hidden]{ display:none; }
+
+/* ===== Vigia de modelos de Gemini ===== */
+#model-watch{
+  margin:0 16px 14px; padding:12px 14px; border-radius:10px;
+  border:1px solid var(--border); background:rgba(138,180,248,.06); font-size:13px; line-height:1.55;
+}
+#model-watch[hidden]{ display:none; }
+#model-watch .mw-title{ font-weight:600; margin-bottom:6px; display:flex; align-items:center; gap:7px; }
+#model-watch .mw-sub{ color:var(--muted); font-size:12.5px; }
+#model-watch code{ background:rgba(138,180,248,.14); padding:1px 6px; border-radius:5px; font-size:12px; }
+#model-watch .mw-gain{ color:#3ddc84; font-weight:600; }
+#model-watch .mw-actions{ display:flex; gap:9px; margin-top:11px; align-items:center; flex-wrap:wrap; }
+#model-watch button{
+  border:1px solid var(--border); background:var(--panel); color:var(--text);
+  font-size:12.5px; padding:7px 13px; border-radius:8px; cursor:pointer;
+}
+#model-watch button.primary{ background:var(--neon); border-color:var(--neon); color:#fff; font-weight:600; }
+#model-watch button:hover{ border-color:var(--neon2); }
+#model-watch button[disabled]{ opacity:.5; cursor:default; }
+#model-watch label.mw-auto{
+  margin-left:auto; display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; cursor:pointer;
+}
