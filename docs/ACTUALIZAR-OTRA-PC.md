@@ -1,8 +1,35 @@
 # Actualizar HanstlerS en otra PC
 
-Pasos, en orden, en la PC destino.
+> **Atajo:** si ya tienes HanstlerS 1.0.3 o superior instalado, no necesitas
+> nada de esto. Abre la app y pulsa el boton **â†» Actualizar** de la barra
+> superior: hace el pull, las pruebas, la compilacion, la instalacion y el
+> reinicio solo. Los pasos manuales de abajo son para la **primera** vez en
+> una PC nueva, o si el boton no esta disponible.
 
-## 1. Traer el codigo
+## El boton Actualizar
+
+El icono circular de la barra superior abre el panel de actualizacion.
+
+- Muestra la version instalada, el repo, la rama y los commits pendientes.
+- Un punto verde sobre el icono avisa cuando hay algo nuevo (se comprueba al
+  arrancar y cada 6 horas).
+- **Actualizar ahora** ejecuta, con el progreso en vivo: descargar cambios â†’
+  dependencias (solo si cambio `package-lock.json`) â†’ pruebas â†’ sincronizar
+  `ask-cli` â†’ compilar â†’ instalar â†’ reiniciar.
+- Si el repo tiene cambios sin guardar, se detiene y avisa **antes** de tocar
+  nada. Haz commit o descartalos primero.
+- Si las pruebas fallan, **no** instala: prefiere dejarte la version que
+  funciona antes que una rota.
+- La casilla *Omitir pruebas* solo para cuando tengas prisa y sepas lo que haces.
+
+Requisitos: `git` en el PATH y el repositorio clonado. Si lo pusiste en una
+ruta poco habitual, definelo con la variable de entorno `HANSTLERS_REPO`.
+
+---
+
+## Primera instalacion en una PC nueva
+
+### 1. Traer el codigo
 
 ```powershell
 cd $env:USERPROFILE\Documents\HanstlerS
@@ -10,7 +37,7 @@ git pull origin main
 npm install
 ```
 
-## 2. Sincronizar ask-cli (v0.7.0)
+### 2. Sincronizar ask-cli (v0.7.0)
 
 ```powershell
 .\ask-cli\install.ps1
@@ -18,7 +45,7 @@ ask-cli version     # debe imprimir 0.7.0
 ask-cli doctor
 ```
 
-## 3. Configurar Vertex
+### 3. Configurar Vertex
 
 Crear/editar `%USERPROFILE%\.hanstlers\vertex.json`. **Debe ser UTF-8 SIN BOM**
 (un BOM rompe `JSON.parse` y HanstlerS se desvia a Azure en silencio).
@@ -48,13 +75,13 @@ $b = Get-Content "$env:USERPROFILE\.hanstlers\vertex.json" -Encoding Byte -Total
 
 > No uses modelos `gemini-2.5-*`: estan retirados y devuelven 404.
 
-## 4. Variable de entorno (sin fallback silencioso a Copilot)
+### 4. Variable de entorno (sin fallback silencioso a Copilot)
 
 ```powershell
 [Environment]::SetEnvironmentVariable('HANSTLERS_VERTEX_ALLOW_COPILOT_FALLBACK','false','User')
 ```
 
-## 5. Compilar e instalar la app
+### 5. Compilar e instalar la app
 
 ```powershell
 npm test          # deben pasar 41/41
@@ -74,7 +101,7 @@ Copy-Item $src.FullName "$c\winCodeSign-2.6.0" -Recurse -Force
 npm run dist
 ```
 
-## 6. Verificacion final
+### 6. Verificacion final
 
 ```powershell
 (Invoke-RestMethod http://127.0.0.1:8717/api/state).features.vertexAgentTools

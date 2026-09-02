@@ -1502,6 +1502,160 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
     persistConv(id);
   });
 })();
+
+// ===== Actualizador integrado =====
+// Un botón que hace todo: git pull, dependencias, pruebas, compilar,
+// instalar y reiniciar. El servidor lleva el trabajo; aquí solo pintamos.
+(function(){
+  const btn      = document.getElementById('btn-update');
+  const dot      = document.getElementById('update-dot');
+  const overlay  = document.getElementById('update-overlay');
+  const body     = document.getElementById('update-body');
+  const logEl    = document.getElementById('update-log');
+  const goBtn    = document.getElementById('update-go');
+  const optsEl   = document.getElementById('update-opts');
+  const skipEl   = document.getElementById('update-skiptests');
+  const closeBtn = document.getElementById('update-close');
+  if(!btn || !overlay) return;
+
+  let info = null, cursor = 0, polling = null, busy = false;
+
+  const esc = (s)=>String(s==null?'':s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const open = ()=>{ overlay.hidden = false; };
+  const close = ()=>{ if(busy) return; overlay.hidden = true; };
+
+  function renderInfo(){
+    goBtn.hidden = true; optsEl.hidden = true; logEl.hidden = true;
+    if(!info || !info.ok){
+      body.innerHTML = '<div class="upd-bad">⚠️ '+esc(info && info.error || 'No pude comprobar actualizaciones.')+'</div>';
+      return;
+    }
+    let h = '';
+    h += '<div class="upd-row">Versión instalada: <code>'+esc(info.installedVersion||'?')+'</code></div>';
+    h += '<div class="upd-row">Repositorio: <code>'+esc(info.repoRoot)+'</code> · rama <code>'+esc(info.branch)+'</code></div>';
+    if(info.offline){
+      h += '<div class="upd-warn">⚠️ No pude contactar GitHub. Muestro el estado local.</div>';
+    }
+    if(info.dirty && info.dirty.length){
+      h += '<div class="upd-warn">⚠️ Hay '+info.dirty.length+' archivo(s) con cambios sin guardar en el repo. '+
+           'Haz commit antes de actualizar.</div>';
+    }
+    if(info.updateAvailable){
+      h += '<div class="upd-good" style="margin-top:10px">⬇️ Hay '+info.behind+' cambio(s) nuevos ('+
+           esc(info.localCommit)+' → '+esc(info.remoteCommit)+'):</div><ul>';
+      (info.commits||[]).forEach(c=>{ h += '<li>'+esc(c)+'</li>'; });
+      h += '</ul>';
+      h += '<div style="margin-top:12px;color:var(--muted)">Al actualizar haré: traer cambios → dependencias → '+
+           'pruebas → compilar → instalar → reiniciar. Tarda unos minutos.</div>';
+      goBtn.hidden = false; goBtn.disabled = !!(info.dirty && info.dirty.length);
+      goBtn.textContent = 'Actualizar ahora';
+      optsEl.hidden = false;
+    } else {
+      h += '<div class="upd-good" style="margin-top:10px">✅ Ya estás en la última versión ('+esc(info.localCommit)+').</div>';
+      h += '<div style="margin-top:10px;color:var(--muted)">¿Reinstalaste esta PC o la app quedó desfasada del código? '+
+           'Puedes recompilar e instalar de todas formas.</div>';
+      goBtn.hidden = false; goBtn.disabled = false;
+      goBtn.textContent = 'Recompilar e instalar';
+      optsEl.hidden = false;
+    }
+    body.innerHTML = h;
+  }
+
+  async function check(silent){
+    btn.classList.add('spin');
+    try{
+      const r = await fetch('/api/update/check');
+      info = await r.json();
+      if(dot) dot.hidden = !(info && info.ok && info.updateAvailable);
+      if(!silent) renderInfo();
+    }catch(e){
+      info = { ok:false, error:e.message };
+      if(!silent) renderInfo();
+    }finally{ btn.classList.remove('spin'); }
+  }
+
+  function renderProgress(st){
+    let h = '';
+    (st.steps||[]).forEach((s,i)=>{
+      const last = i === st.steps.length-1;
+      const ico = (!last || st.done) ? (st.ok||!last ? '✅' : '❌') : '⏳';
+      h += '<div class="upd-step"><span class="ico">'+ico+'</span><span>'+esc(s.name)+'</span></div>';
+    });
+    if(st.done && st.error){
+      h += '<div class="upd-bad" style="margin-top:12px">❌ '+esc(st.error)+'</div>';
+    } else if(st.done && st.restarting){
+      h += '<div class="upd-good" style="margin-top:12px">✅ Listo. HanstlerS se cerrará y volverá a abrir solo.</div>';
+    } else if(st.done && st.ok){
+      h += '<div class="upd-good" style="margin-top:12px">✅ Actualización completada.</div>';
+    }
+    body.innerHTML = h;
+  }
+
+  function stopPolling(){ if(polling){ clearInterval(polling); polling = null; } }
+
+  async function poll(){
+    let st;
+    try{
+      const r = await fetch('/api/update/status?since='+cursor);
+      st = await r.json();
+    }catch(e){
+      // Si la app ya se está cerrando para instalar, esto es lo esperado.
+      return;
+    }
+    if(st.lines && st.lines.length){
+      cursor = st.nextCursor;
+      logEl.hidden = false;
+      logEl.textContent += st.lines.filter(l=>!/^### /.test(l)).join('\n')+'\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    renderProgress(st);
+    if(st.done){
+      stopPolling();
+      busy = false;
+      closeBtn.style.visibility = '';
+      if(st.error){ goBtn.hidden = false; goBtn.disabled = false; goBtn.textContent = 'Reintentar'; }
+    }
+  }
+
+  goBtn.addEventListener('click', async ()=>{
+    if(busy) return;
+    busy = true;
+    goBtn.hidden = true; optsEl.hidden = true;
+    closeBtn.style.visibility = 'hidden';
+    logEl.hidden = false; logEl.textContent = ''; cursor = 0;
+    body.innerHTML = '<div class="upd-step"><span class="ico">⏳</span><span>Preparando…</span></div>';
+    try{
+      const r = await fetch('/api/update/run', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ skipTests: !!(skipEl && skipEl.checked) })
+      });
+      const d = await r.json();
+      if(!d.ok){
+        busy = false; closeBtn.style.visibility = '';
+        body.innerHTML = '<div class="upd-bad">❌ '+esc(d.error||'No se pudo iniciar.')+'</div>';
+        goBtn.hidden = false; goBtn.disabled = false;
+        return;
+      }
+    }catch(e){
+      busy = false; closeBtn.style.visibility = '';
+      body.innerHTML = '<div class="upd-bad">❌ '+esc(e.message)+'</div>';
+      return;
+    }
+    stopPolling();
+    polling = setInterval(poll, 1200);
+    poll();
+  });
+
+  btn.addEventListener('click', ()=>{ open(); body.innerHTML = 'Comprobando…'; check(false); });
+  closeBtn.addEventListener('click', close);
+  overlay.addEventListener('click', (e)=>{ if(e.target === overlay) close(); });
+  document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape' && !overlay.hidden) close(); });
+
+  // Aviso silencioso al arrancar y cada 6 horas.
+  setTimeout(()=>check(true), 6000);
+  setInterval(()=>{ if(!busy) check(true); }, 6*60*60*1000);
+})();
+
 document.addEventListener('keydown', (e)=>{
   const ctrl = e.ctrlKey || e.metaKey;
   if(ctrl && e.key.toLowerCase()==='n'){ e.preventDefault(); if(sidebarMode==='conv') newConv(); }        // nueva conversación

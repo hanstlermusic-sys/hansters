@@ -1,13 +1,13 @@
 {
   "name": "hanstlers",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "HanstlerS - tu asistente personal",
   "main": "electron-main.js",
   "author": "Cesar Zumbado",
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win nsis",
-    "test": "node tests/context.test.js && node tests/vertex-tools.test.js && node tests/repo-open.test.js",
+    "test": "node tests/context.test.js && node tests/vertex-tools.test.js && node tests/repo-open.test.js && node tests/updater.test.js",
     "test:e2e": "node tests/e2e-context.js"
   },
   "build": {
@@ -17,6 +17,7 @@
     "files": [
       "electron-main.js",
       "server.js",
+      "updater.js",
       "public/**/*",
       "hanstlers.ico"
     ],

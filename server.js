@@ -6,6 +6,31 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
+const updater = require('./updater');
+
+// Version instalada, para comparar contra la del repo en el actualizador.
+const APP_VERSION = (function () {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8').replace(/^\uFEFF/, '')).version || '';
+  } catch (e) { return ''; }
+})();
+
+// Cierra HanstlerS cuando el actualizador ya dejo el instalador corriendo.
+// El script externo espera a que el proceso muera, instala y vuelve a abrir.
+function quitForUpdate(j) {
+  if (!j || !j.restarting) return;
+  setTimeout(() => {
+    try {
+      if (process.env.HANSTLERS_ELECTRON) {
+        const { app } = require('electron');
+        app.quit();
+        setTimeout(() => { try { process.exit(0); } catch (e) {} }, 4000);
+        return;
+      }
+    } catch (e) {}
+    try { process.exit(0); } catch (e) {}
+  }, 1500);
+}
 
 // AHORRO DE TOKENS: salidas de herramientas grandes van a archivo (el modelo ve
 // solo una vista previa), reduciendo el contexto por turno. Ajustable por env.
@@ -4394,6 +4419,27 @@ const server = http.createServer(async (req, res) => {
     trustMode = !!(b && b.trust);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ trust: trustMode }));
+  }
+  // ===== Actualizacion desde la propia app =====
+  if (req.method === 'GET' && req.url === '/api/update/check') {
+    const info = await updater.checkUpdate();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(Object.assign({ installedVersion: APP_VERSION }, info)));
+  }
+  if (req.method === 'GET' && req.url.startsWith('/api/update/status')) {
+    const since = Number(new URL(req.url, 'http://x').searchParams.get('since') || 0);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(updater.status(since)));
+  }
+  if (req.method === 'POST' && req.url === '/api/update/run') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const b = (await readBody(req)) || {};
+    const r = await updater.runUpdate(
+      { force: !!b.force, skipTests: !!b.skipTests, skipBuild: !!b.skipBuild },
+      quitForUpdate
+    );
+    res.writeHead(r.ok ? 200 : 409, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(r));
   }
   if (req.method === 'GET' && req.url === '/api/shutdown') {
     res.writeHead(200); res.end('bye');

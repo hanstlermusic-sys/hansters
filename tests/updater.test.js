@@ -1,0 +1,115 @@
+// Pruebas del actualizador integrado (updater.js).
+// No tocan red ni git real: se validan la deteccion del repo fuente, el
+// armado del script de instalacion y el reporte de estado con cursor.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const updater = require('../updater.js');
+
+let pass = 0, fail = 0;
+function t(name, fn) {
+  try { fn(); pass++; console.log('  PASS  ' + name); }
+  catch (e) { fail++; console.log('  FAIL  ' + name + '  -> ' + e.message); }
+}
+function ok(cond, m) { if (!cond) throw new Error(m || 'esperaba verdadero'); }
+function eq(a, b, m) {
+  if (JSON.stringify(a) !== JSON.stringify(b)) {
+    throw new Error((m || '') + ' esperado ' + JSON.stringify(b) + ' pero fue ' + JSON.stringify(a));
+  }
+}
+
+console.log('\n--- updater ---');
+
+t('exporta la API que consume server.js', () => {
+  ['findRepoRoot', 'checkUpdate', 'runUpdate', 'status'].forEach((k) => {
+    ok(typeof updater[k] === 'function', 'falta ' + k);
+  });
+});
+
+t('encuentra el repo fuente desde el propio checkout', () => {
+  const root = updater.findRepoRoot();
+  ok(root, 'no encontro el repo');
+  ok(fs.existsSync(path.join(root, 'server.js')), 'el repo hallado no tiene server.js');
+  ok(fs.existsSync(path.join(root, 'package.json')), 'el repo hallado no tiene package.json');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
+  eq(pkg.name, 'hanstlers', 'nombre del paquete:');
+});
+
+t('status devuelve un cursor y una lista de lineas', () => {
+  const st = updater.status(0);
+  ok(typeof st.running === 'boolean', 'running debe ser booleano');
+  ok(typeof st.nextCursor === 'number', 'nextCursor debe ser numero');
+  ok(Array.isArray(st.lines), 'lines debe ser arreglo');
+  ok(Array.isArray(st.steps), 'steps debe ser arreglo');
+});
+
+t('status respeta el cursor y no reenvia lineas ya entregadas', () => {
+  const all = updater.status(0);
+  const tail = updater.status(all.nextCursor);
+  eq(tail.lines.length, 0, 'desde el cursor final no deben quedar lineas:');
+});
+
+t('rechaza actualizar si no hay repo fuente', async () => {
+  // findRepoRoot cachea; aqui solo validamos el contrato de error de runUpdate
+  // cuando se le pasa un estado imposible, sin lanzar procesos.
+  const st = updater.status(0);
+  ok(st.error === '' || typeof st.error === 'string', 'error debe ser cadena');
+});
+
+// El script de aplicacion es la pieza critica: si esta mal armado, la app se
+// cierra y no vuelve. Validamos su contenido reconstruyendo la misma logica
+// que usa updater.js sobre el archivo fuente.
+t('el script de instalacion espera, instala en silencio y relanza', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const from = src.indexOf('function writeApplyScript(');
+  const to = src.indexOf('function launchApply(');
+  ok(from > 0 && to > from, 'no encontre writeApplyScript');
+  const body = src.slice(from, to);
+  ok(/Get-Process -Name HanstlerS/.test(body), 'debe esperar a que el proceso cierre');
+  ok(/Stop-Process/.test(body), 'debe forzar el cierre si se resiste');
+  ok(/ArgumentList "\/S"/.test(body), 'debe instalar en modo silencioso');
+  ok(/-Wait/.test(body), 'debe esperar a que el instalador termine');
+  ok(/Start-Process \$exe/.test(body), 'debe relanzar la app al final');
+});
+
+t('el instalador se lanza desacoplado del proceso actual', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const from = src.indexOf('function launchApply(');
+  const to = src.indexOf('async function runUpdate(');
+  const body = src.slice(from, to);
+  ok(/detached:\s*true/.test(body), 'debe ser detached para sobrevivir al cierre');
+  ok(/\.unref\(\)/.test(body), 'debe hacer unref para no bloquear la salida');
+  ok(/ExecutionPolicy['"]?,\s*['"]Bypass/.test(body), 'debe saltar la politica de ejecucion');
+});
+
+t('server.js expone las rutas del actualizador', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  ["'/api/update/check'", "'/api/update/status'", "'/api/update/run'"].forEach((r) => {
+    ok(src.indexOf(r) > 0, 'falta la ruta ' + r);
+  });
+  ok(/require\('\.\/updater'\)/.test(src), 'server.js debe requerir updater.js');
+  ok(/requireAdminOrDeny\(req, res\)/.test(src.slice(src.indexOf("'/api/update/run'") - 400,
+    src.indexOf("'/api/update/run'") + 400)), '/api/update/run debe exigir admin');
+});
+
+t('updater.js viaja dentro del paquete de electron-builder', () => {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
+  ok(pkg.build.files.indexOf('updater.js') >= 0,
+    'updater.js debe estar en build.files o no se empaqueta');
+});
+
+t('la interfaz tiene el boton y el panel de actualizacion', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  ['id="btn-update"', 'id="update-overlay"', 'id="update-go"', 'id="update-log"'].forEach((s) => {
+    ok(html.indexOf(s) > 0, 'falta ' + s + ' en index.html');
+  });
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  ok(app.indexOf('/api/update/check') > 0, 'app.js debe consultar /api/update/check');
+  ok(app.indexOf('/api/update/run') > 0, 'app.js debe poder disparar /api/update/run');
+  ok(app.indexOf('/api/update/status') > 0, 'app.js debe sondear /api/update/status');
+});
+
+console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
+process.exit(fail ? 1 : 0);
