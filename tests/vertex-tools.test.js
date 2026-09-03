@@ -463,5 +463,51 @@ t('el reintento degradado esta cableado en la llamada a Gemini', () => {
   ok(/geminiErrorDeHistorial\(raw\)/.test(srvSrc), 'el 400 de estructura no dispara el reintento');
 });
 
+console.log('\n--- regresion 1.0.13: el historial degradado no se puede imitar ---');
+
+// Medido contra la API real: cuando el tramo degradado se redactaba en primera
+// persona ("Llamé a la herramienta X con {...}"), el modelo acababa imitando el
+// patron y ESCRIBIA la llamada como texto en vez de emitirla, con lo que el
+// agente se detenia a mitad de tarea. 4 de 34 muestras narraron con el formato
+// viejo; 0 de 34 con el nuevo, conservando igual el contenido.
+t('el tramo degradado no se redacta en primera persona', () => {
+  const sinFirma = [
+    { role: 'user', content: 'revisa el archivo' },
+    { role: 'assistant', content: '', tool_calls: [
+      { id: 'a1', function: { name: 'run_command', arguments: '{"command":"type x.html"}' } } ] },
+    { role: 'tool', tool_call_id: 'a1', content: '125: <div class=fillLight>' }
+  ];
+  const r = toGeminiAgentContents(sinFirma);
+  const todo = JSON.stringify(r.contents);
+  ok(!/Llam[\u00e9e] a la herramienta/.test(todo),
+    'sigue en primera persona: el modelo imitara el patron y narrara la llamada');
+  ok(!/"Resultado de run_command/.test(todo),
+    'el resultado sigue redactado como si lo dijera el asistente');
+  ok(/registro de la sesion/.test(todo), 'no se marca como acta de la sesion');
+});
+
+t('pero el contenido del tramo degradado se conserva', () => {
+  const sinFirma = [
+    { role: 'user', content: 'busca el token' },
+    { role: 'assistant', content: '', tool_calls: [
+      { id: 'a1', function: { name: 'run_command', arguments: '{"command":"type secreto.txt"}' } } ] },
+    { role: 'tool', tool_call_id: 'a1', content: 'el token es HANSTLER42' }
+  ];
+  const todo = JSON.stringify(toGeminiAgentContents(sinFirma).contents);
+  ok(/run_command/.test(todo), 'se pierde el nombre de la herramienta');
+  ok(/secreto\.txt/.test(todo), 'se pierden los argumentos');
+  ok(/HANSTLER42/.test(todo), 'se pierde la salida: la degradacion no sirve de nada');
+});
+
+t('la red de seguridad usa la misma redaccion', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = src.indexOf('const payloadDegradado');
+  ok(i !== -1, 'no encuentro payloadDegradado');
+  const bloque = src.slice(i, i + 1400);
+  ok(!/Llam[\u00e9e] a la herramienta/.test(bloque),
+    'el reintento degradado sigue en primera persona');
+  ok(/registro de la sesion/.test(bloque), 'el reintento no marca el texto como registro');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

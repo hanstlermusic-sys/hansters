@@ -1,6 +1,6 @@
 {
   "name": "hanstlers",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "HanstlerS - tu asistente personal",
   "main": "electron-main.js",
   "author": "Cesar Zumbado",

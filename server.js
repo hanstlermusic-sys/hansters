@@ -1626,6 +1626,13 @@ function toGeminiAgentContents(messages) {
   // En vez de tirar ese tramo del historial, se degrada a texto plano: el
   // modelo pierde la estructura de la llamada pero conserva lo que se ejecuto y
   // lo que devolvio, que es lo que de verdad importa para seguir la tarea.
+  // El texto de la degradacion va en tercera persona y marcado como acta de la
+  // sesion, NO en primera persona ("Llamé a la herramienta X..."). Medido
+  // contra la API real: con la redaccion en primera persona el modelo acaba
+  // imitando el patron y ESCRIBE la llamada como texto en vez de emitirla, con
+  // lo que el agente se detiene a mitad de tarea. Empeora cuanto mas larga es
+  // la conversacion (0/12 con 3 rondas, 1/12 con 8). Con esta redaccion:
+  // 0 de 34 muestras narraron, y el contenido se conserva igual de bien.
   for (let i = 0; i < filtered.length; i++) {
     const t = filtered[i];
     if (!t.hasFnCall) continue;
@@ -1635,9 +1642,10 @@ function toGeminiAgentContents(messages) {
       if (!p.functionCall) return '';
       let args = '';
       try { args = JSON.stringify(p.functionCall.args || {}); } catch (e) { args = '{}'; }
-      return 'Llamé a la herramienta ' + p.functionCall.name + ' con ' + args.slice(0, 2000) + '.';
+      return '[registro de la sesion] Se ejecuto la herramienta ' + p.functionCall.name +
+        ' con los argumentos ' + args.slice(0, 2000);
     }).filter(Boolean).join('\n');
-    t.parts = [{ text: descripcion || 'Llamé a una herramienta.' }];
+    t.parts = [{ text: descripcion || '[registro de la sesion] Se ejecuto una herramienta.' }];
     t.hasFnCall = false;
     const sig = filtered[i + 1];
     if (!sig || !sig.fromTool) continue;
@@ -1645,9 +1653,10 @@ function toGeminiAgentContents(messages) {
       if (p.text) return String(p.text);
       if (!p.functionResponse) return '';
       const r = p.functionResponse.response || {};
-      return 'Resultado de ' + p.functionResponse.name + ':\n' + String(r.output == null ? '' : r.output);
+      return '[registro de la sesion] Salida de ' + p.functionResponse.name + ':\n' +
+        String(r.output == null ? '' : r.output);
     }).filter(Boolean).join('\n\n');
-    sig.parts = [{ text: resultados || '(sin resultado)' }];
+    sig.parts = [{ text: resultados || '[registro de la sesion] (sin resultado)' }];
     sig.fromTool = false;
   }
   // Al degradar pueden quedar dos turnos seguidos del mismo rol; Gemini lo
@@ -1763,11 +1772,15 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
         if (p.functionCall) {
           let args = '';
           try { args = JSON.stringify(p.functionCall.args || {}); } catch (e) { args = '{}'; }
-          return { text: 'Llamé a la herramienta ' + p.functionCall.name + ' con ' + args.slice(0, 2000) + '.' };
+          // Misma redaccion en tercera persona que en toGeminiAgentContents: en
+          // primera persona el modelo imita el patron y narra la llamada.
+          return { text: '[registro de la sesion] Se ejecuto la herramienta ' + p.functionCall.name +
+            ' con los argumentos ' + args.slice(0, 2000) };
         }
         if (p.functionResponse) {
           const r = p.functionResponse.response || {};
-          return { text: 'Resultado de ' + p.functionResponse.name + ':\n' + String(r.output == null ? '' : r.output) };
+          return { text: '[registro de la sesion] Salida de ' + p.functionResponse.name + ':\n' +
+            String(r.output == null ? '' : r.output) };
         }
         return p;
       });
