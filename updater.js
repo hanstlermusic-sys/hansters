@@ -285,13 +285,18 @@ function writeApplyScript(repo, setupExe, expectedVersion) {
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
   const logFile = path.join(dir, 'update-apply.log');
   const scriptPath = path.join(dir, 'apply-update.ps1');
+  // Marca de vida: el script la escribe nada mas arrancar. Sirve para saber si
+  // llego a ejecutarse, en vez de dar por hecho que si.
+  const aliveFile = path.join(dir, 'apply-alive.txt');
   // Se borra el resultado anterior para no confundir un update viejo con este.
   try { fs.unlinkSync(RESULT_FILE); } catch (e) {}
+  try { fs.unlinkSync(aliveFile); } catch (e) {}
   const ps = [
     '$ErrorActionPreference = "SilentlyContinue"',
     '$log = ' + JSON.stringify(logFile),
     '$esperada = ' + JSON.stringify(expectedVersion || ''),
     'function W($m){ "$(Get-Date -Format o)  $m" | Out-File -FilePath $log -Append -Encoding utf8 }',
+    '[System.IO.File]::WriteAllText(' + JSON.stringify(aliveFile) + ', (Get-Date).ToString("o"))',
     'W "Esperando a que HanstlerS cierre..."',
     'for ($i = 0; $i -lt 60; $i++) {',
     '  if (-not (Get-Process -Name HanstlerS -ErrorAction SilentlyContinue)) { break }',
@@ -321,14 +326,59 @@ function writeApplyScript(repo, setupExe, expectedVersion) {
     'if (Test-Path $exe) { W "Relanzando"; Start-Process $exe } else { W "No encontre HanstlerS.exe" }'
   ].join('\r\n');
   fs.writeFileSync(scriptPath, ps, 'utf8');
-  return { scriptPath, logFile };
+  return { scriptPath, logFile, aliveFile };
 }
 
-function launchApply(scriptPath) {
-  const child = spawn('powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', scriptPath],
-    { detached: true, stdio: 'ignore', windowsHide: true });
+// El instalador corre FUERA de HanstlerS, porque tiene que cerrar la app para
+// sustituir sus archivos. Como lanzarlo es justo el paso que fallaba en
+// silencio, aqui se hacen dos cosas: usar una forma de lanzar que de verdad
+// arranca y sobrevive, y comprobar despues que arranco.
+//
+// Medido en esta maquina (5 intentos por variante):
+//   spawn(..., { detached: true })  -> 0/5 arrancaron  <- lo que se usaba antes
+//   spawn(..., sin detached)        -> 5/5 arrancaron, pero mueren con la app
+//                                      (Electron mete a sus hijos en un Job Object)
+//   cmd /c start ...                -> arranca y sobrevive
+//   powershell -Command Start-Process-> arranca y sobrevive
+// Con detached el script no llegaba a ejecutarse nunca: la actualizacion hacia
+// pull, npm install y compilaba durante minutos y luego no instalaba nada, asi
+// que al reabrir la app seguia en la version anterior.
+function lanzarViaCmd(scriptPath) {
+  const child = spawn('cmd.exe',
+    ['/c', 'start', '""', '/min', 'powershell.exe', '-NoProfile', '-NonInteractive',
+      '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', scriptPath],
+    { stdio: 'ignore', windowsHide: true });
   child.unref();
+}
+
+function lanzarViaStartProcess(scriptPath) {
+  const inner = "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File'," +
+    JSON.stringify(scriptPath).replace(/"/g, "'");
+  const child = spawn('powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', inner],
+    { stdio: 'ignore', windowsHide: true });
+  child.unref();
+}
+
+// Devuelve una promesa: true si el script dio senales de vida.
+function launchApply(scriptPath, aliveFile) {
+  return new Promise((resolve) => {
+    const arranco = () => { try { return fs.existsSync(aliveFile); } catch (e) { return false; } };
+    let usadoFallback = false;
+    try { lanzarViaCmd(scriptPath); } catch (e) {}
+    const t0 = Date.now();
+    const timer = setInterval(() => {
+      if (arranco()) { clearInterval(timer); return resolve(true); }
+      const pasado = Date.now() - t0;
+      // Si en 6 segundos no dio senales, probar la segunda forma antes de rendirse.
+      if (!usadoFallback && pasado > 6000) {
+        usadoFallback = true;
+        pushLog('El instalador no arranco a la primera; probando otra via.');
+        try { lanzarViaStartProcess(scriptPath); } catch (e) {}
+      }
+      if (pasado > 15000) { clearInterval(timer); return resolve(arranco()); }
+    }, 500);
+  });
 }
 
 // ===== El ciclo completo =====
@@ -469,8 +519,13 @@ async function runUpdate(options, onFinish) {
 
       // 6. Instalar y relanzar desde fuera del proceso
       setStep('Instalando y reiniciando');
-      const { scriptPath } = writeApplyScript(repo, setupExe, expectedVersion);
-      launchApply(scriptPath);
+      const { scriptPath, aliveFile } = writeApplyScript(repo, setupExe, expectedVersion);
+      const arranco = await launchApply(scriptPath, aliveFile);
+      if (!arranco) {
+        throw new Error('No se pudo arrancar el instalador (' + path.basename(scriptPath) +
+          '). El equipo puede estar bloqueando PowerShell. La version compilada esta lista en ' +
+          setupExe + ': puedes instalarla a mano haciendo doble clic.');
+      }
       job.restarting = true;
       job.ok = true;
       job.expectedVersion = expectedVersion;

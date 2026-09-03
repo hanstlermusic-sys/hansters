@@ -75,10 +75,15 @@ t('el script de instalacion espera, instala en silencio y relanza', () => {
 
 t('el instalador se lanza desacoplado del proceso actual', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
-  const from = src.indexOf('function launchApply(');
+  const from = src.indexOf('function lanzarViaCmd(');
   const to = src.indexOf('async function runUpdate(');
   const body = src.slice(from, to);
-  ok(/detached:\s*true/.test(body), 'debe ser detached para sobrevivir al cierre');
+  // La intencion sigue siendo la misma: el instalador tiene que sobrevivir al
+  // cierre de la app. Lo que cambia es como se consigue. Este test pedia
+  // "detached: true", y precisamente con detached el script no llegaba a
+  // arrancar en esta maquina (0 de 5 intentos), asi que la actualizacion nunca
+  // se aplicaba. Se logra igual, y de verdad, lanzandolo por cmd /c start.
+  ok(/'cmd\.exe'/.test(body), 'debe lanzarse por una via que sobreviva al cierre');
   ok(/\.unref\(\)/.test(body), 'debe hacer unref para no bloquear la salida');
   ok(/ExecutionPolicy['"]?,\s*['"]Bypass/.test(body), 'debe saltar la politica de ejecucion');
 });
@@ -384,6 +389,68 @@ t('pero no alarma si la version en uso ya es la del repo', () => {
   const ui = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
   ok(/alDia/.test(ui),
     'mostraria fallos viejos ya resueltos cada vez que se abre la ventana');
+});
+
+console.log('\n--- el instalador arranca de verdad ---');
+
+// El paso final de la actualizacion (cerrar la app, instalar y relanzar) corre
+// en un script aparte. Se lanzaba con spawn({ detached: true }) y en esta
+// maquina eso NO arranca nunca: medido 0 de 5 intentos, frente a 5 de 5 sin
+// detached. El sintoma era que la actualizacion hacia pull, npm install y
+// compilaba durante minutos y despues no instalaba nada, asi que al reabrirse
+// HanstlerS seguia en la version anterior.
+//
+// Sin detached el script si arranca, pero muere junto con la app (Electron mete
+// a sus hijos en un Job Object) justo cuando tiene que sobrevivirla. Por eso se
+// lanza a traves de cmd /c start, que arranca y sobrevive.
+
+t('el instalador no se lanza con detached, que no arrancaba', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const i = src.indexOf('function lanzarViaCmd(');
+  const f = src.indexOf('// ===== El ciclo completo =====');
+  ok(i !== -1, 'no encuentro las funciones de lanzamiento');
+  const trozo = src.slice(i, f);
+  ok(trozo.indexOf('detached: true') === -1 && trozo.indexOf('detached:true') === -1,
+    'vuelve a lanzarse con detached: no llegaria a arrancar');
+});
+
+t('se lanza por una via que sobrevive al cierre de la app', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(/spawn\(\s*'cmd\.exe'\s*,\s*\[\s*'\/c'\s*,\s*'start'/.test(src),
+    'no se usa cmd /c start: el script moriria con la app antes de instalar');
+  ok(src.indexOf('lanzarViaStartProcess') !== -1, 'no hay segunda via de reserva');
+});
+
+t('el script deja una marca al arrancar, para poder comprobarlo', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(src.indexOf('apply-alive.txt') !== -1, 'no hay marca de vida');
+  const i = src.indexOf('const ps = [');
+  const f = src.indexOf('W "Esperando a que HanstlerS cierre..."', i);
+  ok(i !== -1 && f !== -1 && f > i, 'no encuentro el cuerpo del script');
+  ok(src.slice(i, f).indexOf('WriteAllText') !== -1,
+    'la marca no se escribe antes de esperar: no distinguiria "no arranco" de "esta esperando"');
+});
+
+t('si el instalador no arranca, la actualizacion falla en vez de mentir', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(src.indexOf('const arranco = await launchApply(') !== -1,
+    'no se espera a saber si arranco');
+  const i = src.indexOf('const arranco = await launchApply(');
+  const trozo = src.slice(i, i + 500);
+  ok(trozo.indexOf('if (!arranco)') !== -1 && trozo.indexOf('throw new Error') !== -1,
+    'se sigue dando la actualizacion por buena aunque el instalador no arranque');
+  ok(trozo.indexOf('a mano') !== -1,
+    'no se le dice al usuario que puede instalarlo a mano');
+});
+
+t('launchApply devuelve una promesa', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const i = src.indexOf('function launchApply(');
+  ok(i !== -1, 'no encuentro launchApply');
+  ok(src.slice(i, i + 200).indexOf('new Promise') !== -1,
+    'launchApply no espera: se volveria a lanzar y olvidar');
+  ok(/function launchApply\(scriptPath, aliveFile\)/.test(src),
+    'launchApply no recibe la marca de vida que debe vigilar');
 });
 
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
