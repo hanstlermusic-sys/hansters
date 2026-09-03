@@ -509,5 +509,63 @@ t('la red de seguridad usa la misma redaccion', () => {
   ok(/registro de la sesion/.test(bloque), 'el reintento no marca el texto como registro');
 });
 
+console.log('\n--- el ruido interno nunca llega a la pantalla ---');
+
+// El historial sin thoughtSignature se degrada a un texto con formato interno
+// ("[registro de la sesion] ..."). Con conversaciones largas el modelo acaba
+// copiando ese formato y lo escribe como respuesta: en pantalla parecia que
+// HanstlerS narraba lo que iba a hacer en vez de hacerlo. Cambiar la redaccion
+// reduce la imitacion pero no la garantiza, asi que ademas se recorta siempre.
+(function () {
+  const vm2 = require('vm');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = src.indexOf('const REGISTRO_INTERNO_RE');
+  const f = src.indexOf('function geminiChatWithTools(');
+  if (i === -1 || f === -1) throw new Error('no encuentro limpiarRegistroInterno en server.js');
+  const ctx = { module: {}, String: String, console: console, RegExp: RegExp };
+  vm2.runInNewContext(src.slice(i, f) + '\nmodule.exports = limpiarRegistroInterno;', ctx);
+  const limpiar = ctx.module.exports;
+
+  t('se recorta el registro que el modelo copio (formato actual)', () => {
+    const capturado = '[registro de la sesion] Se ejecuto la herramienta run_command con los argumentos {"command":"dir"}';
+    eq(limpiar(capturado), '', 'ese texto acabaria en pantalla');
+  });
+
+  t('y tambien el formato viejo, por si viene de un transcript antiguo', () => {
+    eq(limpiar('Llamé a la herramienta run_command con {"command":"dir"}.'), '');
+  });
+
+  t('de una respuesta mixta solo se quita el registro', () => {
+    const r = limpiar('Ya revise el archivo.\n\n' +
+      '[registro de la sesion] Se ejecuto la herramienta run_command con los argumentos {"command":"dir"}\n' +
+      '[registro de la sesion] Salida de run_command:\nlinea uno\nlinea dos\n\n' +
+      'Subo fillLight a 0.8.');
+    ok(r.indexOf('registro de la sesion') === -1, 'queda ruido interno');
+    ok(r.indexOf('linea uno') === -1, 'queda la salida cruda de la herramienta');
+    ok(r.indexOf('Ya revise el archivo.') !== -1, 'se perdio texto real del asistente');
+    ok(r.indexOf('Subo fillLight a 0.8.') !== -1, 'se perdio la conclusion');
+  });
+
+  t('una respuesta normal no se toca', () => {
+    const normal = 'Listo. Corregi la iluminacion: subi fillLight a 0.8 y ajuste la camara.';
+    eq(limpiar(normal), normal);
+    const conCodigo = 'Te explico:\n\n\u0060\u0060\u0060js\nconst x = 1;\n\u0060\u0060\u0060\n\nEso es todo.';
+    eq(limpiar(conCodigo), conCodigo, 'un bloque de codigo no debe mutilarse');
+  });
+
+  t('mencionar una herramienta en una frase no cuenta como registro', () => {
+    const frase = 'No te preocupes, el resultado de run_command fue correcto.';
+    eq(limpiar(frase), frase, 'se recorta texto legitimo del asistente');
+  });
+
+  t('el filtro se aplica antes de enviar el texto a la interfaz', () => {
+    const src2 = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const i2 = src2.indexOf('if (texto && onChunk) onChunk(texto);');
+    ok(i2 !== -1, 'no encuentro el envio del texto a la UI');
+    ok(src2.slice(i2 - 200, i2).indexOf('limpiarRegistroInterno') !== -1,
+      'el texto se manda a la pantalla sin limpiar');
+  });
+})();
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

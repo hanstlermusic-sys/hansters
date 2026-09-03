@@ -1734,6 +1734,32 @@ function geminiErrorDeHistorial(raw) {
   return /thought_signature|function response turn|function call turn/i.test(msg);
 }
 
+// El historial que no tiene thoughtSignature se degrada a texto con un formato
+// interno ("[registro de la sesion] ..."). Ese texto es andamiaje NUESTRO, no
+// una respuesta: si el modelo acaba copiandolo -y con conversaciones largas
+// ocurre- aparece en pantalla como si HanstlerS estuviera narrando lo que hace
+// en vez de hacerlo. Aqui se recorta pase lo que pase, para que ese ruido no
+// llegue nunca al usuario.
+const REGISTRO_INTERNO_RE =
+  /^\s*(?:\[registro de la sesion\][^\n]*|Llam[\u00e9e] a la herramienta [^\n]*|Resultado de [A-Za-z0-9_]+:[^\n]*)$/;
+
+function limpiarRegistroInterno(texto) {
+  if (!texto || texto.indexOf('registro de la sesion') === -1 &&
+      texto.indexOf('Llamé a la herramienta') === -1 &&
+      texto.indexOf('Llame a la herramienta') === -1) return texto;
+  const lineas = String(texto).split('\n');
+  const limpias = [];
+  let dentro = false;
+  lineas.forEach((l) => {
+    if (REGISTRO_INTERNO_RE.test(l)) { dentro = true; return; }
+    // La salida de una herramienta ocupa varias lineas; se descarta el bloque
+    // entero hasta la siguiente linea en blanco.
+    if (dentro) { if (!l.trim()) dentro = false; return; }
+    limpias.push(l);
+  });
+  return limpias.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
   const conv = toGeminiAgentContents(messages);
   const body = {
@@ -1881,6 +1907,7 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
           }
           return terminar(new Error(summarizeGeminiNoContent(fin)));
         }
+        texto = limpiarRegistroInterno(texto);
         if (texto && onChunk) onChunk(texto);
         const msg = { role: 'assistant', content: texto || null };
         if (tool_calls.length) msg.tool_calls = tool_calls;
