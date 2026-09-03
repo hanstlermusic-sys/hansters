@@ -2126,7 +2126,24 @@ function buildAgentMessages(convId, history, preamble) {
 // El modelo suele ANUNCIAR lo que hara y devolver el turno sin llamar a ninguna
 // herramienta ("Voy a revisar los archivos..."). El bucle lo tomaba por respuesta
 // final y cerraba el trabajo ahi: de ahi los "jobs muy cortos que no ejecutan nada".
-const ANNOUNCE_RE = /(voy a |vamos a |procedo a |procedere|ahora (voy|procedo|revis|le|cre|ejecut|busc)|dejame |permiteme |empezare|empiezo por|comenzare|primero (voy|le|revis)|a continuacion (voy|le)|revisare|leere|creare|escribire|ejecutare|buscare|manos a la obra|I'll |let me |I will |I'm going to |next,? I)/i;
+//
+// El texto se compara SIN acentos. La lista se escribio sin ellos pero el modelo
+// responde con ellos, asi que "procedere" no casaba con "procedere" acentuado y
+// 12 de cada 15 anuncios reales se colaban: el trabajo se cerraba a medias y
+// habia que escribir "sigue" a mano en cada paso.
+function sinAcentos(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+const ANNOUNCE_RE = /(voy a |vamos a |ire a |paso a |procedo a |procedere|ahora (voy|vamos|procedo|revis|le|cre|edit|modific|ejecut|busc|analiz|verific|corri|actualiz)|dejame |permiteme |empezare|empiezo por|comenzare|comienzo por|primero (voy|vamos|le|revis|analiz|verific)|a continuacion|acto seguido|enseguida (lo|le|revis|voy)|revisare|leere|creare|escribire|ejecutare|buscare|analizare|verificare|corregire|editare|modificare|actualizare|aplicare|comprobare|abrire|generare|anadire|instalare|probare|mirare|manos a la obra|un momento|dame un segundo|I'll |let me |I will |I'm going to |I am going to |next,? I|first,? I|now I('ll| will))/i;
+
+// Un anuncio solo cuenta si el turno NO trae ya trabajo hecho: si el modelo
+// escribio un bloque de codigo o un resumen largo, es una respuesta de verdad.
+function soloAnuncia(texto) {
+  const t = String(texto || '').trim();
+  if (!t) return true;
+  if (t.indexOf('\u0060\u0060\u0060') !== -1) return false;
+  return ANNOUNCE_RE.test(sinAcentos(t));
+}
 
 function runAzureAgent(message, history, historySummary, send, onDone, onAbort, images, convId, brain) {
   // `brain` = cerebro del modelo (Azure o Vertex). Si no se pasa, se usa Azure:
@@ -2157,7 +2174,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
   let steps = 0;
   let nudges = 0;
   const MAX_STEPS = 40;
-  const MAX_NUDGES = 2;
+  const MAX_NUDGES = 6;
   const saveTranscript = () => {
     if (!convId) return;
     state.convAgentMessages = state.convAgentMessages || {};
@@ -2303,7 +2320,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
         const text = (msg.content || '').trim();
         // Si solo ANUNCIO una accion (o devolvio un turno vacio) sin ejecutar nada,
         // el trabajo NO ha terminado: empujalo a actuar en vez de cerrar el job.
-        if (nudges < MAX_NUDGES && (!text || ANNOUNCE_RE.test(text))) {
+        if (nudges < MAX_NUDGES && soloAnuncia(text)) {
           nudges++;
           messages.push({ role: 'user', content: 'No ejecutaste ninguna herramienta en este turno: solo anunciaste lo que ibas a hacer. Si la tarea NO esta terminada, HAZLA AHORA llamando a las herramientas en este mismo turno (no vuelvas a anunciarla). Si ya esta completamente terminada, responde solo con el resumen final, sin anunciar acciones futuras.' });
           send('status', 'Continuando...');
