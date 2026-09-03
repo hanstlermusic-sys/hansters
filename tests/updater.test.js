@@ -215,5 +215,21 @@ t('el script reparador aplica el mismo criterio', () => {
     'repair-update.ps1 se bloquearia con las mismas carpetas ajenas');
 });
 
+console.log('\n--- los manifiestos no llevan BOM ---');
+
+// Un BOM en package.json rompe el build entero con un error ilegible:
+// "readObjectStart: expect { or n, but found \ufeff". Es facil de introducir sin
+// querer: Set-Content -Encoding utf8 de PowerShell 5.1 lo mete siempre.
+['package.json', 'package-lock.json'].forEach((nombre) => {
+  t('sin BOM: ' + nombre, () => {
+    const f = path.join(__dirname, '..', nombre);
+    if (!fs.existsSync(f)) return;
+    const b = fs.readFileSync(f);
+    ok(!(b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf),
+      nombre + ' empieza por BOM: electron-builder no podra leerlo');
+    JSON.parse(b.toString('utf8'));
+  });
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);
