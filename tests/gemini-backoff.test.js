@@ -135,8 +135,14 @@ test('el reintento por socket reenvia el mismo payload', () => {
   const llamadas = cuerpo.match(/lanzar\(endpoint, authHeader, sinTools, modelUsed[^)]*\)/g) || [];
   assert.ok(llamadas.length > 0, 'no encuentro las llamadas de reintento');
   for (const c of llamadas) {
-    assert.ok(c.includes('payloadOverride'), `un reintento pierde el payload: ${c}`);
+    // El reintento degradado manda OTRO payload a proposito: es el que convierte
+    // el historial a texto plano cuando Gemini rechaza la estructura de las
+    // herramientas. Los demas reintentos si deben reenviar el mismo.
+    if (c.includes('payloadDegradado()')) continue;
+    assert.ok(c.includes('payloadOverride'), 'un reintento pierde el payload: ' + c);
   }
+  assert.ok(llamadas.some((c) => c.includes('payloadDegradado()')),
+    'falta el reintento que degrada el historial cuando Gemini rechaza la estructura');
 });
 
 // Un Retry-After de 0 es una pista valida ("reintenta ya"), no ausencia de

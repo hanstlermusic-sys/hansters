@@ -1606,14 +1606,12 @@ function toGeminiAgentContents(messages) {
   // come immediately after a function call turn". Hay que sanear hasta punto
   // fijo: cada vez que se descarta un turno del inicio, el que queda expuesto
   // se vuelve a validar.
-  while (filtered.length) {
-    const primero = filtered[0];
-    if (primero.role !== 'user' || primero.fromTool) { filtered.shift(); continue; }
-    break;
-  }
-  // Medido contra la API real (gemini-3.8-flash): Gemini TOLERA que el numero de
-  // functionResponse no cuadre con el de functionCall, y tolera respuestas
-  // separadas de su llamada. Solo rechaza dos formas, y las dos se corrigen aqui:
+  // Medido contra la API real: Gemini ACEPTA que el historial empiece por un
+  // turno 'model' (200). Lo unico que rechaza es que empiece por un
+  // functionResponse, porque no tiene delante su functionCall. Por eso aqui se
+  // descarta solo eso: quitar tambien los 'model' iniciales tiraba, en un
+  // historial recortado, justo el tramo con lo que el agente acababa de leer.
+  while (filtered.length && filtered[0].fromTool) filtered.shift();
   //   - que el historial empiece por un functionResponse (lo cubre el bucle de arriba)
   //   - que TERMINE en un functionCall sin responder -> 400 exigiendo thought_signature
   // Por eso NO se recortan los descuadres intermedios: seria tirar contexto util.
@@ -1626,6 +1624,49 @@ function toGeminiAgentContents(messages) {
     const primero = filtered[0];
     if (primero.role !== 'user' || primero.fromTool) { filtered.shift(); continue; }
     break;
+  }
+  // Gemini 3.x exige la thoughtSignature de cada functionCall. Cuando NO la
+  // tenemos (conversacion que venia de Copilot/Azure, o transcript guardado por
+  // una version anterior) reconstruir la part desde {name,args} da un 400 en
+  // cuanto el historial termina en la respuesta de la herramienta, que es
+  // justo como queda el bucle del agente tras ejecutar algo. Verificado contra
+  // la API real: con firma 200, sin firma 400.
+  // En vez de tirar ese tramo del historial, se degrada a texto plano: el
+  // modelo pierde la estructura de la llamada pero conserva lo que se ejecuto y
+  // lo que devolvio, que es lo que de verdad importa para seguir la tarea.
+  for (let i = 0; i < filtered.length; i++) {
+    const t = filtered[i];
+    if (!t.hasFnCall) continue;
+    if (t.parts.some((p) => p.functionCall && p.thoughtSignature)) continue;
+    const descripcion = t.parts.map((p) => {
+      if (p.text) return String(p.text);
+      if (!p.functionCall) return '';
+      let args = '';
+      try { args = JSON.stringify(p.functionCall.args || {}); } catch (e) { args = '{}'; }
+      return 'Llamé a la herramienta ' + p.functionCall.name + ' con ' + args.slice(0, 2000) + '.';
+    }).filter(Boolean).join('\n');
+    t.parts = [{ text: descripcion || 'Llamé a una herramienta.' }];
+    t.hasFnCall = false;
+    const sig = filtered[i + 1];
+    if (!sig || !sig.fromTool) continue;
+    const resultados = sig.parts.map((p) => {
+      if (p.text) return String(p.text);
+      if (!p.functionResponse) return '';
+      const r = p.functionResponse.response || {};
+      return 'Resultado de ' + p.functionResponse.name + ':\n' + String(r.output == null ? '' : r.output);
+    }).filter(Boolean).join('\n\n');
+    sig.parts = [{ text: resultados || '(sin resultado)' }];
+    sig.fromTool = false;
+  }
+  // Al degradar pueden quedar dos turnos seguidos del mismo rol; Gemini lo
+  // acepta, pero fusionarlos deja un historial mas limpio y barato.
+  for (let i = filtered.length - 1; i > 0; i--) {
+    const a = filtered[i - 1];
+    const b = filtered[i];
+    if (a.role !== b.role || a.hasFnCall || b.hasFnCall || b.fromTool || a.fromTool) continue;
+    if (!a.parts.every((p) => p.text) || !b.parts.every((p) => p.text)) continue;
+    a.parts = [{ text: a.parts.map((p) => p.text).join('\n') + '\n' + b.parts.map((p) => p.text).join('\n') }];
+    filtered.splice(i, 1);
   }
   const contents = filtered.map((t) => ({ role: t.role, parts: t.parts }));
   return {
@@ -1683,6 +1724,15 @@ function geminiEsperaReintento(intento, headers, raw) {
 
 // Misma firma que azureChatStreamTools, para que el bucle de agente no note la
 // diferencia: (messages, tools, onChunk, cb) -> cb(err, {role, content, tool_calls}).
+// Mensajes con los que Gemini rechaza la ESTRUCTURA del historial de
+// herramientas. Verificados uno a uno contra la API real: son los unicos 400
+// que no se arreglan reintentando, porque el historial vuelve a ir igual.
+function geminiErrorDeHistorial(raw) {
+  let msg = '';
+  try { msg = JSON.parse(raw || '{}').error.message || ''; } catch (e) { msg = String(raw || ''); }
+  return /thought_signature|function response turn|function call turn/i.test(msg);
+}
+
 function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
   const conv = toGeminiAgentContents(messages);
   const body = {
@@ -1711,6 +1761,31 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
   let intentoPlano = false;
   let intentoFlash = false;
   let intentoReparacion = false;
+  let intentoSinHerramientas = false;
+  // Convierte todo el historial a texto plano, sin functionCall ni
+  // functionResponse: es la forma que Gemini siempre acepta.
+  const payloadDegradado = () => {
+    const planos = conv.contents.map((t) => {
+      const parts = t.parts.map((p) => {
+        if (p.text) return { text: String(p.text) };
+        if (p.functionCall) {
+          let args = '';
+          try { args = JSON.stringify(p.functionCall.args || {}); } catch (e) { args = '{}'; }
+          return { text: 'Llamé a la herramienta ' + p.functionCall.name + ' con ' + args.slice(0, 2000) + '.' };
+        }
+        if (p.functionResponse) {
+          const r = p.functionResponse.response || {};
+          return { text: 'Resultado de ' + p.functionResponse.name + ':\n' + String(r.output == null ? '' : r.output) };
+        }
+        return p;
+      });
+      return { role: t.role, parts: parts.length ? parts : [{ text: '(sin contenido)' }] };
+    });
+    const b = { contents: planos, generationConfig: { temperature: 0.2, maxOutputTokens: 8192 } };
+    if (conv.systemInstruction) b.systemInstruction = conv.systemInstruction;
+    if (decls.length) b.tools = [{ functionDeclarations: decls }];
+    return JSON.stringify(b);
+  };
   const swapEndpointModel = (endpoint, nextModel) => String(endpoint || '').replace(
     /\/models\/[^:]+:generateContent/i,
     '/models/' + encodeURIComponent(String(nextModel || '').trim()) + ':generateContent'
@@ -1742,6 +1817,16 @@ function geminiChatWithTools(cfg, model, messages, tools, onChunk, cb) {
             intento++;
             const espera = geminiEsperaReintento(intento, resp.headers, raw);
             return setTimeout(() => lanzar(endpoint, authHeader, sinTools, modelUsed, payloadOverride), espera);
+          }
+          // Red de seguridad: un 400 por la estructura de las herramientas deja
+          // la conversacion MUERTA para siempre, porque cada turno reenvia el
+          // historial entero y vuelve a fallar igual. Antes que eso, se reenvia
+          // el historial degradado a texto plano: se pierde la estructura de las
+          // llamadas pero se conserva que se ejecuto y que devolvio, y el usuario
+          // puede seguir trabajando.
+          if (resp.statusCode === 400 && !intentoSinHerramientas && geminiErrorDeHistorial(raw)) {
+            intentoSinHerramientas = true;
+            return lanzar(endpoint, authHeader, sinTools, modelUsed, payloadDegradado());
           }
           return terminar(new Error(summarizeVertexError(resp.statusCode, raw, modelUsed)));
         }
@@ -4557,8 +4642,23 @@ const server = http.createServer(async (req, res) => {
   // ===== Actualizacion desde la propia app =====
   if (req.method === 'GET' && req.url === '/api/update/check') {
     const info = await updater.checkUpdate();
+    // Si el ultimo intento dijo "listo" pero en disco quedo otra version, hay
+    // que decirlo: si no, la app arranca vieja y el usuario cree que actualizo.
+    const aplicado = updater.lastApplyResult();
+    const extra = { installedVersion: APP_VERSION };
+    if (aplicado && aplicado.ok === false) {
+      extra.lastApplyFailed = true;
+      extra.lastApplyDetail = 'La ultima actualizacion no se aplico: esperaba ' +
+        (aplicado.expected || '?') + ' y quedo ' + (aplicado.installed || 'nada') +
+        ' (instalador: codigo ' + aplicado.exitCode + '). Cierra HanstlerS del todo y vuelve a pulsar actualizar.';
+    } else if (aplicado && aplicado.ok && aplicado.expected && aplicado.expected !== APP_VERSION) {
+      // Se instalo la version esperada pero corre otra: hay una copia vieja abierta.
+      extra.lastApplyFailed = true;
+      extra.lastApplyDetail = 'Se instalo la ' + aplicado.expected + ' pero estas ejecutando la ' +
+        APP_VERSION + '. Cierra todas las ventanas de HanstlerS y vuelve a abrirla.';
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(Object.assign({ installedVersion: APP_VERSION }, info)));
+    return res.end(JSON.stringify(Object.assign(extra, info)));
   }
   if (req.method === 'GET' && req.url.startsWith('/api/update/status')) {
     const since = Number(new URL(req.url, 'http://x').searchParams.get('since') || 0);

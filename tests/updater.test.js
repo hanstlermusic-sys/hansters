@@ -111,5 +111,79 @@ t('la interfaz tiene el boton y el panel de actualizacion', () => {
   ok(app.indexOf('/api/update/status') > 0, 'app.js debe sondear /api/update/status');
 });
 
+// ===== la actualizacion no puede mentir (regresion 1.0.9) =====
+// Sintoma real: se pulsa actualizar, la app se reinicia, dice que todo fue bien
+// y sigue en la version anterior. Dos causas, las dos cubiertas aqui.
+console.log('\n--- instalar la version correcta, o ninguna ---');
+
+function repoConSetups(lista) {
+  const dir = path.join(os.tmpdir(), 'hs_setups_' + Math.random().toString(36).slice(2));
+  fs.mkdirSync(path.join(dir, 'dist-electron'), { recursive: true });
+  lista.forEach(([nombre, edadSeg]) => {
+    const f = path.join(dir, 'dist-electron', nombre);
+    fs.writeFileSync(f, 'x');
+    const s = Date.now() / 1000 - edadSeg;
+    fs.utimesSync(f, s, s);
+  });
+  return dir;
+}
+
+t('no reinstala un build viejo aunque su archivo sea el mas reciente', () => {
+  // En dist-electron se acumulan todos los builds. Elegir por fecha puede
+  // reinstalar una version anterior y dejar creer que se actualizo.
+  const repo = repoConSetups([['HanstlerS Setup 1.0.8.exe', 500], ['HanstlerS Setup 1.0.6.exe', 10]]);
+  const elegido = updater.findLatestSetup(repo, '1.0.8');
+  eq(path.basename(elegido), 'HanstlerS Setup 1.0.8.exe', 'eligio un build que no es el esperado:');
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+t('si falta el build de la version esperada, aborta en vez de instalar otra', () => {
+  const repo = repoConSetups([['HanstlerS Setup 1.0.6.exe', 10]]);
+  ok(updater.findLatestSetup(repo, '1.0.8') === null,
+    'devolvio un instalador de otra version: instalaria la equivocada');
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+t('sin version esperada mantiene el comportamiento por fecha', () => {
+  const repo = repoConSetups([['HanstlerS Setup 1.0.6.exe', 500], ['HanstlerS Setup 1.0.8.exe', 10]]);
+  eq(path.basename(updater.findLatestSetup(repo, null)), 'HanstlerS Setup 1.0.8.exe');
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+console.log('\n--- verificar que la instalacion de verdad ocurrio ---');
+
+t('el script comprueba la version que quedo en disco', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const i = src.indexOf('function writeApplyScript(');
+  const cuerpo = src.slice(i, src.indexOf('\nfunction ', i + 10));
+  ok(cuerpo.indexOf('VersionInfo.ProductVersion') !== -1,
+    'no lee la version instalada: no puede saber si el instalador hizo algo');
+  ok(cuerpo.indexOf('$esperada') !== -1, 'no compara contra la version esperada');
+  ok(cuerpo.indexOf('update-result.json') !== -1 || cuerpo.indexOf('RESULT_FILE') !== -1,
+    'no deja constancia del resultado para que la app pueda avisar');
+});
+
+t('un instalador que devuelve 0 sin instalar nada NO se da por bueno', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const i = src.indexOf('function writeApplyScript(');
+  const cuerpo = src.slice(i, src.indexOf('\nfunction ', i + 10));
+  // El ok debe exigir AMBAS cosas: codigo 0 y version en disco correcta.
+  ok(/\$ok = \(\$code -eq 0\) -and/.test(cuerpo),
+    'basta con que el instalador devuelva 0: asi es como paso desapercibido');
+});
+
+t('el estado del updater expone el resultado de la ultima instalacion', () => {
+  const s = updater.status(0);
+  ok(Object.prototype.hasOwnProperty.call(s, 'lastApply'),
+    'status() no expone lastApply: la app no puede avisar de un update fallido');
+});
+
+t('la app avisa cuando la version instalada no es la esperada', () => {
+  const srv = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = srv.indexOf("req.url === '/api/update/check'");
+  const bloque = srv.slice(i, i + 1600);
+  ok(bloque.indexOf('lastApplyFailed') !== -1,
+    '/api/update/check no reporta que la ultima actualizacion no se aplico');
+});
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

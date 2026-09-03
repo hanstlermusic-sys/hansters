@@ -204,29 +204,61 @@ function primeWinCodeSignCache(onLine) {
   }
 }
 
-function findLatestSetup(repo) {
+// Elegir el instalador POR VERSION, no por fecha: en dist-electron se acumulan
+// los builds viejos, y quedarse con el mtime mas reciente puede reinstalar una
+// version anterior (o dejar creer que se actualizo cuando no). Si el build de la
+// version esperada no esta, es un fallo: mejor abortar que instalar otra cosa.
+function findLatestSetup(repo, expectedVersion) {
   const dir = path.join(repo, 'dist-electron');
   if (!fs.existsSync(dir)) return null;
   const found = fs.readdirSync(dir)
     .filter((n) => /^HanstlerS Setup .*\.exe$/i.test(n))
     .map((n) => {
       const full = path.join(dir, n);
-      return { full, mtime: fs.statSync(full).mtimeMs };
-    })
-    .sort((a, b) => b.mtime - a.mtime);
-  return found.length ? found[0].full : null;
+      const m = n.match(/^HanstlerS Setup (.+)\.exe$/i);
+      return { full, version: m ? m[1] : '', mtime: fs.statSync(full).mtimeMs };
+    });
+  if (!found.length) return null;
+  if (expectedVersion) {
+    const exacto = found.filter((f) => f.version === expectedVersion);
+    if (!exacto.length) return null;
+    return exacto.sort((a, b) => b.mtime - a.mtime)[0].full;
+  }
+  return found.sort((a, b) => b.mtime - a.mtime)[0].full;
+}
+
+function readRepoVersion(repo) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
+    return (pkg && pkg.version) || '';
+  } catch (e) { return ''; }
+}
+
+const RESULT_FILE = path.join(HOME, '.hanstlers', 'update-result.json');
+
+// El resultado que dejo el script externo la ultima vez. Sin esto, si el
+// instalador falla la app se relanza en la version vieja y el usuario cree que
+// ya actualizo: exactamente el caso de quedarse en 1.0.6 sin enterarse.
+function lastApplyResult() {
+  try {
+    const r = JSON.parse(fs.readFileSync(RESULT_FILE, 'utf8').replace(/^\uFEFF/, ''));
+    return r && typeof r === 'object' ? r : null;
+  } catch (e) { return null; }
 }
 
 // ===== Script que cierra, instala y relanza =====
 // Se lanza detached: sobrevive al cierre de HanstlerS y lo vuelve a abrir.
-function writeApplyScript(repo, setupExe) {
+function writeApplyScript(repo, setupExe, expectedVersion) {
   const dir = path.join(HOME, '.hanstlers');
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
   const logFile = path.join(dir, 'update-apply.log');
   const scriptPath = path.join(dir, 'apply-update.ps1');
+  // Se borra el resultado anterior para no confundir un update viejo con este.
+  try { fs.unlinkSync(RESULT_FILE); } catch (e) {}
   const ps = [
     '$ErrorActionPreference = "SilentlyContinue"',
     '$log = ' + JSON.stringify(logFile),
+    '$esperada = ' + JSON.stringify(expectedVersion || ''),
     'function W($m){ "$(Get-Date -Format o)  $m" | Out-File -FilePath $log -Append -Encoding utf8 }',
     'W "Esperando a que HanstlerS cierre..."',
     'for ($i = 0; $i -lt 60; $i++) {',
@@ -237,9 +269,23 @@ function writeApplyScript(repo, setupExe) {
     'Start-Sleep -Seconds 2',
     'W "Instalando ' + setupExe.replace(/"/g, '') + '"',
     '$p = Start-Process -FilePath ' + JSON.stringify(setupExe) + ' -ArgumentList "/S" -Wait -PassThru',
-    'W "Instalador termino con codigo $($p.ExitCode)"',
+    '$code = $p.ExitCode',
+    'W "Instalador termino con codigo $code"',
     'Start-Sleep -Seconds 2',
     '$exe = Join-Path $env:LOCALAPPDATA "Programs\\HanstlerS\\HanstlerS.exe"',
+    // Verificar de verdad que en disco quedo la version esperada. El instalador
+    // puede devolver 0 y no haber sustituido nada (app abierta, permisos, etc.).
+    '$instalada = ""',
+    'if (Test-Path $exe) { $instalada = (Get-Item $exe).VersionInfo.ProductVersion }',
+    'if ($instalada) { $instalada = ($instalada -split "\\+")[0].Trim() }',
+    '$corta = $instalada',
+    'if ($corta -match "^(\\d+\\.\\d+\\.\\d+)") { $corta = $Matches[1] }',
+    '$ok = ($code -eq 0) -and ($esperada -eq "" -or $corta -eq $esperada)',
+    'W "Version en disco: $instalada (esperaba $esperada) -> ok=$ok"',
+    '$res = [ordered]@{ ok = $ok; expected = $esperada; installed = $corta; exitCode = $code; at = (Get-Date).ToString("o") }',
+    '$json = $res | ConvertTo-Json -Compress',
+    '[System.IO.File]::WriteAllText(' + JSON.stringify(RESULT_FILE) + ', $json, (New-Object System.Text.UTF8Encoding($false)))',
+    'if (-not $ok) { W "AVISO: la actualizacion NO se aplico. La app seguira en la version anterior." }',
     'if (Test-Path $exe) { W "Relanzando"; Start-Process $exe } else { W "No encontre HanstlerS.exe" }'
   ].join('\r\n');
   fs.writeFileSync(scriptPath, ps, 'utf8');
@@ -328,16 +374,26 @@ async function runUpdate(options, onFinish) {
         { env: { CSC_IDENTITY_AUTO_DISCOVERY: 'false' } });
       if (dist.code !== 0) throw new Error('La compilacion fallo. Revisa el log.');
 
-      const setupExe = findLatestSetup(repo);
-      if (!setupExe) throw new Error('La compilacion no genero instalador en dist-electron.');
+      // La version que acabamos de traer con el pull: es la que DEBE quedar
+      // instalada. Buscar por nombre evita reinstalar un build viejo que siga
+      // en dist-electron.
+      const expectedVersion = readRepoVersion(repo);
+      const setupExe = findLatestSetup(repo, expectedVersion);
+      if (!setupExe) {
+        throw new Error(expectedVersion
+          ? 'La compilacion no genero el instalador de la version ' + expectedVersion + '. No instalo una version distinta.'
+          : 'La compilacion no genero instalador en dist-electron.');
+      }
 
       // 6. Instalar y relanzar desde fuera del proceso
       setStep('Instalando y reiniciando');
-      const { scriptPath } = writeApplyScript(repo, setupExe);
+      const { scriptPath } = writeApplyScript(repo, setupExe, expectedVersion);
       launchApply(scriptPath);
       job.restarting = true;
       job.ok = true;
+      job.expectedVersion = expectedVersion;
       pushLog('Instalador lanzado: ' + path.basename(setupExe));
+      pushLog('Al reabrirse, HanstlerS comprobara que quedo en la version ' + (expectedVersion || 'nueva') + '.');
       pushLog('HanstlerS se cerrara y volvera a abrir solo en unos segundos.');
     } catch (e) {
       job.ok = false;
@@ -373,8 +429,9 @@ function status(since) {
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     nextCursor: job.log.length,
-    lines: job.log.slice(from)
+    lines: job.log.slice(from),
+    lastApply: lastApplyResult()
   };
 }
 
-module.exports = { findRepoRoot, checkUpdate, runUpdate, status };
+module.exports = { findRepoRoot, checkUpdate, runUpdate, status, findLatestSetup, lastApplyResult, RESULT_FILE };

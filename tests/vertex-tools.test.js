@@ -93,10 +93,11 @@ t('los system van a systemInstruction, no a contents', () => {
 t('assistant con tool_calls -> turno model con functionCall', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'suma' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'run_command', arguments: '{"command":"ls"}' } }] },
+    asisFirmado([{ id: 'a1', name: 'run_command', args: '{"command":"ls"}' }]),
     { role: 'tool', tool_call_id: 'a1', content: 'ok' }
   ]);
-  eq(r.contents[1], { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { command: 'ls' } } }] });
+  eq(r.contents[1].parts[0].functionCall, { name: 'run_command', args: { command: 'ls' } });
+  ok(r.contents[1].parts[0].thoughtSignature === 'FIRMA_a1', 'se perdio la firma');
 });
 
 // Esta es la regresion que costo un HTTP 400: Gemini 3.x firma cada part con un
@@ -112,10 +113,21 @@ t('reenvia las parts crudas del modelo, conservando thoughtSignature', () => {
   ok(JSON.stringify(r.contents).indexOf('FIRMA') !== -1, 'se perdio el thoughtSignature');
 });
 
+// Tal y como Vertex guarda un turno con herramientas: parts crudas CON firma.
+// Sin firma, Gemini devuelve 400 en cuanto el historial termina en la respuesta
+// de la herramienta, asi que ese caso se degrada a texto (ver mas abajo).
+function asisFirmado(llamadas) {
+  return {
+    role: 'assistant', content: null,
+    tool_calls: llamadas.map((l) => ({ id: l.id, _geminiId: l.gid || null, type: 'function', function: { name: l.name, arguments: l.args || '{}' } })),
+    _geminiParts: llamadas.map((l) => ({ functionCall: Object.assign({ name: l.name, args: JSON.parse(l.args || '{}') }, l.gid ? { id: l.gid } : {}), thoughtSignature: 'FIRMA_' + l.id }))
+  };
+}
+
 t('el resultado de la herramienta vuelve como functionResponse con su nombre', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'x' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'read_file', arguments: '{}' } }] },
+    asisFirmado([{ id: 'a1', name: 'read_file' }]),
     { role: 'tool', tool_call_id: 'a1', content: 'contenido' }
   ]);
   eq(r.contents[2], { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { output: 'contenido' } } }] });
@@ -124,7 +136,7 @@ t('el resultado de la herramienta vuelve como functionResponse con su nombre', (
 t('devuelve el id que asigno el modelo cuando existe', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'x' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'call_9', _geminiId: 'call_9', type: 'function', function: { name: 'read_file', arguments: '{}' } }] },
+    asisFirmado([{ id: 'call_9', gid: 'call_9', name: 'read_file' }]),
     { role: 'tool', tool_call_id: 'call_9', content: 'ok' }
   ]);
   eq(r.contents[2].parts[0].functionResponse.id, 'call_9');
@@ -135,10 +147,7 @@ t('devuelve el id que asigno el modelo cuando existe', () => {
 t('agrupa los resultados en paralelo en UN solo turno', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'x' },
-    { role: 'assistant', content: null, tool_calls: [
-      { id: 'a1', type: 'function', function: { name: 'read_file', arguments: '{}' } },
-      { id: 'a2', type: 'function', function: { name: 'list_dir', arguments: '{}' } }
-    ] },
+    asisFirmado([{ id: 'a1', name: 'read_file' }, { id: 'a2', name: 'list_dir' }]),
     { role: 'tool', tool_call_id: 'a1', content: 'uno' },
     { role: 'tool', tool_call_id: 'a2', content: 'dos' }
   ]);
@@ -158,7 +167,7 @@ t('el historial nunca empieza por un turno de model', () => {
 t('tolera argumentos JSON corruptos sin reventar', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'x' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'f', arguments: '{no es json' } }] },
+    { role: 'assistant', content: null, _geminiParts: [{ functionCall: { name: 'f', args: {} }, thoughtSignature: 'F' }], tool_calls: [{ id: 'a1', type: 'function', function: { name: 'f', arguments: '{no es json' } }] },
     { role: 'tool', tool_call_id: 'a1', content: 'ok' }
   ]);
   eq(r.contents[1].parts[0].functionCall.args, {});
@@ -351,5 +360,90 @@ t('el bucle del agente ignora la segunda respuesta y rellena los huecos', () => 
   ok(bloque.indexOf('if (orderedToolResults[i]) messages.push') === -1,
     'sigue saltandose los huecos en vez de rellenarlos');
 });
+// ===== historial sin thoughtSignature (regresion 1.0.9) =====
+// Medido contra la API real: si un functionCall no lleva su thoughtSignature y
+// el historial TERMINA en la respuesta de la herramienta -que es justo como
+// queda el bucle del agente tras ejecutar algo- Gemini devuelve 400
+// ("Function call is missing a thought_signature") y la conversacion queda
+// muerta. Pasa con conversaciones que venian de Copilot/Azure. Se degradan a
+// texto plano: se pierde la estructura, se conserva el contenido.
+const sinFirma = [
+  { role: 'user', content: 'lee el archivo' },
+  { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'read_file', arguments: '{"path":"s.txt"}' } }] },
+  { role: 'tool', tool_call_id: 'a1', content: 'la clave es ZORRO7' }
+];
+
+t('sin thoughtSignature no se emite ningun functionCall', () => {
+  const c = toGeminiAgentContents(sinFirma).contents;
+  const crudo = JSON.stringify(c);
+  ok(crudo.indexOf('functionCall') === -1, 'se emitio un functionCall sin firma: HTTP 400');
+  ok(crudo.indexOf('functionResponse') === -1, 'quedo un functionResponse suelto');
+});
+
+t('al degradar NO se pierde lo que devolvio la herramienta', () => {
+  const crudo = JSON.stringify(toGeminiAgentContents(sinFirma).contents);
+  ok(crudo.indexOf('ZORRO7') !== -1, 'se perdio el resultado de la herramienta');
+  ok(crudo.indexOf('read_file') !== -1, 'se perdio el nombre de la herramienta');
+});
+
+t('con thoughtSignature SI se conserva la estructura de la llamada', () => {
+  const c = toGeminiAgentContents([
+    { role: 'user', content: 'lee' },
+    asisFirmado([{ id: 'a1', name: 'read_file' }]),
+    { role: 'tool', tool_call_id: 'a1', content: 'ok' }
+  ]).contents;
+  ok(c.some((x) => x.parts.some((q) => q.functionCall)), 'se degrado un historial que SI tenia firma');
+  ok(JSON.stringify(c).indexOf('FIRMA_a1') !== -1, 'se perdio la firma');
+});
+
+t('un historial mixto degrada solo el tramo sin firma', () => {
+  const c = toGeminiAgentContents([
+    { role: 'user', content: 'uno' },
+    asisFirmado([{ id: 'f1', name: 'read_file' }]),
+    { role: 'tool', tool_call_id: 'f1', content: 'CON_FIRMA' },
+    { role: 'user', content: 'dos' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 's1', type: 'function', function: { name: 'list_dir', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 's1', content: 'SIN_FIRMA' }
+  ]).contents;
+  const crudo = JSON.stringify(c);
+  ok(crudo.indexOf('FIRMA_f1') !== -1, 'se degrado el tramo que si tenia firma');
+  ok(crudo.indexOf('CON_FIRMA') !== -1 && crudo.indexOf('SIN_FIRMA') !== -1, 'se perdio contenido');
+  const calls = c.filter((x) => x.parts.some((q) => q.functionCall));
+  eq(calls.length, 1, 'solo debe quedar la llamada firmada:');
+});
+
+// Red de seguridad en runtime: los 400 que NO se arreglan reintentando igual.
+const detectar = (function () {
+  const i = srvSrc.indexOf('function geminiErrorDeHistorial(');
+  const j = srvSrc.indexOf('\n}', i);
+  const sandbox = { JSON: JSON, String: String };
+  require('vm').createContext(sandbox);
+  require('vm').runInContext(srvSrc.slice(i, j + 2) + '\nthis.f = geminiErrorDeHistorial;', sandbox);
+  return sandbox.f;
+})();
+
+t('detecta los 400 de estructura que dejan la conversacion muerta', () => {
+  const casos = [
+    'Function call is missing a thought_signature in functionCall parts.',
+    "Please ensure that function response turn comes immediately after a function call turn. Got function response with name 'read_file'.",
+    'Please ensure that function call turn comes immediately after a user turn or after a function response turn.'
+  ];
+  casos.forEach((m) => {
+    ok(detectar(JSON.stringify({ error: { message: m } })), 'no detectado: ' + m.slice(0, 45));
+  });
+});
+
+t('no confunde un 400 normal con uno de estructura', () => {
+  ok(!detectar(JSON.stringify({ error: { message: 'API key not valid. Please pass a valid API key.' } })), 'falso positivo con la api key');
+  ok(!detectar(JSON.stringify({ error: { message: 'Quota exceeded for model' } })), 'falso positivo con la cuota');
+  ok(!detectar('respuesta que no es json'), 'falso positivo con basura');
+});
+
+t('el reintento degradado esta cableado en la llamada a Gemini', () => {
+  ok(srvSrc.indexOf('intentoSinHerramientas') !== -1, 'no existe la bandera del reintento');
+  ok(srvSrc.indexOf('payloadDegradado()') !== -1, 'el reintento no usa el payload degradado');
+  ok(/geminiErrorDeHistorial\(raw\)/.test(srvSrc), 'el 400 de estructura no dispara el reintento');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);
