@@ -453,5 +453,51 @@ t('launchApply devuelve una promesa', () => {
     'launchApply no recibe la marca de vida que debe vigilar');
 });
 
+console.log('\n--- la app no se apaga para nada ---');
+
+// El peor sintoma de todos: la app se cerraba, el instalador no llegaba a
+// ejecutarse y nadie volvia a abrirla. Desde fuera se veia como "se reinicia
+// antes de lograr instalar la actualizacion". Cerrarse es lo ultimo que debe
+// hacer, y solo si el instalador ya esta corriendo de verdad.
+
+t('solo se cierra la app si el instalador dio senales de vida', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = src.indexOf('function quitForUpdate(');
+  ok(i !== -1, 'no encuentro quitForUpdate');
+  const cuerpo = src.slice(i, src.indexOf('\n}', i));
+  ok(cuerpo.indexOf('apply-alive.txt') !== -1,
+    'se cierra sin comprobar que el instalador arranco');
+  const m = cuerpo.indexOf('apply-alive.txt');
+  const q = cuerpo.indexOf('app.quit()');
+  ok(m !== -1 && q !== -1 && m < q,
+    'la comprobacion va despues de cerrar: no sirve de nada');
+  ok(/existsSync\(marca\)/.test(cuerpo), 'no se comprueba la marca en disco');
+});
+
+t('sin marca de vida se sale sin apagar nada', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = src.indexOf('function quitForUpdate(');
+  const cuerpo = src.slice(i, src.indexOf('\n}', i));
+  const j = cuerpo.indexOf('if (!fs.existsSync(marca))');
+  ok(j !== -1, 'no hay guardia por marca ausente');
+  const rama = cuerpo.slice(j, j + 220);
+  ok(rama.indexOf('return;') !== -1,
+    'sin return la app se cerraria igual y se quedaria apagada');
+});
+
+t('hay un rescate para un PC que se quedo atras', () => {
+  const rescate = path.join(__dirname, '..', 'tools', 'rescate.ps1');
+  ok(fs.existsSync(rescate), 'falta tools/rescate.ps1');
+  const s = fs.readFileSync(rescate, 'utf8');
+  // Un PC afectado no puede arreglarse con el boton, porque el fallo esta en el
+  // codigo que ejecuta el boton. El rescate instala un binario ya compilado.
+  ok(s.indexOf('releases/download') !== -1, 'el rescate no descarga el instalador ya hecho');
+  ok(s.indexOf('npm run dist') === -1, 'el rescate no deberia compilar: es justo lo que falla');
+  ok(/ProductVersion/.test(s), 'el rescate no comprueba que la instalacion cuajo');
+  ok(/healthz/.test(s), 'el rescate no comprueba que la app responde');
+  ok(!/[\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1\u00c1\u00c9\u00cd\u00d3\u00da\u00d1]/.test(s),
+    'el rescate lleva acentos: en PowerShell 5.1 pueden salir mal en pantalla');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

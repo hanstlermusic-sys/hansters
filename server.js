@@ -27,9 +27,26 @@ function onModelFinding(r) {
   } catch (e) {}
 }
 
-// Cierra HanstlerS cuando el actualizador ya dejo el instalador corriendo.// El script externo espera a que el proceso muera, instala y vuelve a abrir.
+// Cierra HanstlerS cuando el actualizador ya dejo el instalador corriendo.
+// El script externo espera a que el proceso muera, instala y vuelve a abrir.
+//
+// La app SOLO se cierra si el instalador dio senales de vida. Antes se cerraba
+// en cuanto el ciclo terminaba, y como el script se lanzaba de una forma que no
+// llegaba a arrancar (spawn detached: medido 0 de 5 veces), el resultado era el
+// peor posible: la app se cerraba, nadie instalaba nada y nadie la volvia a
+// abrir. Se veia como "se reinicia antes de instalar la actualizacion".
 function quitForUpdate(j) {
   if (!j || !j.restarting) return;
+  // Segunda red: comprobar en disco que el script arranco de verdad. Si no hay
+  // marca, no se cierra la app: mejor seguir trabajando en la version vieja que
+  // apagarse para nada.
+  try {
+    const marca = path.join(os.homedir(), '.hanstlers', 'apply-alive.txt');
+    if (!fs.existsSync(marca)) {
+      console.log('[updater] el instalador no dio senales de vida: no cierro la app.');
+      return;
+    }
+  } catch (e) {}
   setTimeout(() => {
     try {
       if (process.env.HANSTLERS_ELECTRON) {
