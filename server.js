@@ -1593,8 +1593,17 @@ function toGeminiAgentContents(messages) {
     }
     filtered.push(t);
   }
-  // Gemini rechaza un historial que no empiece por un turno de 'user'.
-  while (filtered.length && filtered[0].role !== 'user') filtered.shift();
+  // Gemini rechaza un historial que no empiece por un turno de 'user', pero
+  // quitar el 'model' inicial puede dejar al descubierto el functionResponse
+  // que le respondia, y entonces Gemini falla con "function response turn must
+  // come immediately after a function call turn". Hay que sanear hasta punto
+  // fijo: cada vez que se descarta un turno del inicio, el que queda expuesto
+  // se vuelve a validar.
+  while (filtered.length) {
+    const primero = filtered[0];
+    if (primero.role !== 'user' || primero.fromTool) { filtered.shift(); continue; }
+    break;
+  }
   const contents = filtered.map((t) => ({ role: t.role, parts: t.parts }));
   return {
     contents: contents,

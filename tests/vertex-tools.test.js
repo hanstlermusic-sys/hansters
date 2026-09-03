@@ -189,5 +189,88 @@ t('deja intactos los mensajes que no vienen de Gemini', () => {
   ok(sinCamposInternos(msgs)[0] === msgs[0], 'copio de mas');
 });
 
+console.log('\n--- historial recortado (regresion 1.0.7) ---');
+
+// Bug real visto en produccion: tras un job largo, trimAgentMessages recorta el
+// transcript y puede dejarlo empezando por el assistant que pidio la
+// herramienta. Al quitar ese turno 'model' para que el historial empiece por
+// 'user', quedaba expuesto su functionResponse y Gemini respondia:
+// "Please ensure that function response turn comes immediately after a
+//  function call turn. Got function response with name 'read_file'."
+// Envenenaba la conversacion: todos los turnos siguientes fallaban igual.
+function historialRecortado() {
+  return [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+      _geminiParts: [{ functionCall: { name: 'read_file', args: { path: 'a.txt' } }, thoughtSignature: 'FIRMA' }]
+    },
+    { role: 'tool', tool_call_id: 'call_1', content: 'contenido' },
+    { role: 'assistant', content: 'Listo.' },
+    { role: 'user', content: 'y ahora?' }
+  ];
+}
+
+function primerasPartes(out) {
+  return (out.contents[0] || { parts: [] }).parts;
+}
+
+t('un historial recortado no empieza por functionResponse', () => {
+  const out = toGeminiAgentContents(historialRecortado());
+  const huerfana = primerasPartes(out).find((p) => p && p.functionResponse);
+  ok(!huerfana, 'el historial empieza con functionResponse(' +
+    (huerfana && huerfana.functionResponse.name) + '), Gemini lo rechaza');
+});
+
+t('todo functionResponse va precedido de su functionCall', () => {
+  const casos = [
+    historialRecortado(),
+    // Respuesta de herramienta sin ningun assistant previo.
+    [{ role: 'tool', tool_call_id: 'x', content: 'huerfano' }, { role: 'user', content: 'hola' }],
+    // El assistant previo no pidio herramientas.
+    [{ role: 'assistant', content: 'texto' }, { role: 'tool', tool_call_id: 'y', content: 'r' }, { role: 'user', content: 'hola' }]
+  ];
+  casos.forEach((caso, n) => {
+    const c = toGeminiAgentContents(caso).contents;
+    for (let i = 0; i < c.length; i++) {
+      const tieneResp = c[i].parts.some((p) => p && p.functionResponse);
+      if (!tieneResp) continue;
+      const prev = c[i - 1];
+      ok(prev && prev.role === 'model' && prev.parts.some((p) => p && p.functionCall),
+        'caso ' + n + ': el turno ' + i + ' responde a una llamada inexistente');
+    }
+  });
+});
+
+t('el historial siempre empieza por un turno user', () => {
+  const out = toGeminiAgentContents(historialRecortado());
+  if (out.contents.length) eq(out.contents[0].role, 'user', 'primer turno');
+});
+
+t('un historial que ya es valido no se toca', () => {
+  const bueno = [
+    { role: 'user', content: 'lee a.txt' },
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'c1', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+      _geminiParts: [{ functionCall: { name: 'read_file', args: { path: 'a.txt' } }, thoughtSignature: 'S' }]
+    },
+    { role: 'tool', tool_call_id: 'c1', content: 'hola' },
+    { role: 'assistant', content: 'dice hola' }
+  ];
+  const c = toGeminiAgentContents(bueno).contents;
+  eq(c.length, 4, 'no debe descartar turnos validos');
+  ok(c[1].parts.some((p) => p.functionCall), 'se pierde el functionCall');
+  ok(c[2].parts.some((p) => p.functionResponse), 'se pierde el functionResponse');
+  // thoughtSignature debe viajar intacta o Gemini 3.x devuelve 400.
+  ok(c[1].parts[0].thoughtSignature === 'S', 'se perdio la thoughtSignature');
+});
+
+t('el recorte no deja el historial vacio si hay turnos utiles', () => {
+  const out = toGeminiAgentContents(historialRecortado());
+  ok(out.contents.length > 0, 'se descarto todo el historial');
+});
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);
