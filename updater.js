@@ -385,6 +385,17 @@ async function runUpdate(options, onFinish) {
         setStep('Instalando dependencias');
         const inst = await runCmd('npm', ['install', '--no-audit', '--no-fund'], repo, log);
         if (inst.code !== 0) throw new Error('npm install fallo.');
+
+        // npm reescribe package-lock.json aunque no cambie ninguna dependencia
+        // (reordena, normaliza campos). Eso dejaba el repo "sucio" al terminar
+        // y bloqueaba la actualizacion SIGUIENTE: cada update sembraba el
+        // bloqueo del proximo. No es trabajo del usuario, es basura que
+        // generamos nosotros, asi que se revierte.
+        const lockTrasInstall = await gitOut(repo, ['status', '--porcelain', '--', 'package-lock.json']);
+        if (lockTrasInstall.text.trim()) {
+          pushLog('npm reescribio package-lock.json; lo devuelvo a como estaba en el commit.');
+          await runCmd('git', ['checkout', '--', 'package-lock.json'], repo, log);
+        }
       } else {
         pushLog('Dependencias sin cambios, me salto npm install.');
       }

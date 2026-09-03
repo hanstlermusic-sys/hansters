@@ -195,7 +195,10 @@ t('el chequeo de repo sucio ignora los archivos sin trackear', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
   // Hay dos chequeos: el de checkUpdate (lo que muestra la pantalla) y el de
   // runUpdate (el que aborta). Los dos deben ignorar los untracked.
-  const usos = src.match(/'status', '--porcelain'[^\]]*/g) || [];
+  // Solo los chequeos generales de "repo sucio". Los que consultan un archivo
+  // concreto ('--', 'package-lock.json') no listan untracked por definicion.
+  const usos = (src.match(/'status', '--porcelain'[^\]]*/g) || [])
+    .filter((u) => u.indexOf("'--',") === -1);
   ok(usos.length >= 2, 'esperaba dos chequeos de repo sucio, encontre ' + usos.length);
   usos.forEach((u, i) => {
     ok(u.indexOf('--untracked-files=no') !== -1,
@@ -284,6 +287,21 @@ t('se puede reintentar: acabar el job libera el candado', () => {
   ok(i !== -1, 'nunca se libera job.running');
   const ctx = upSrc.slice(Math.max(0, i - 400), i + 200);
   ok(/finally/.test(ctx), 'job.running solo se libera en el camino feliz');
+});
+
+console.log('\n--- una actualizacion no siembra el bloqueo de la siguiente ---');
+
+// Medido: npm install reescribe package-lock.json aunque no cambie ninguna
+// dependencia. Como el updater ejecuta npm install, cada actualizacion dejaba
+// el repo sucio y bloqueaba la SIGUIENTE. Por eso la otra PC aparecia siempre
+// con "1 archivo con cambios sin guardar" sin que nadie hubiera tocado nada.
+t('el lock reescrito por npm se revierte tras instalar', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const i = src.indexOf("'npm install fallo.'");
+  ok(i !== -1, 'no encuentro el paso de dependencias');
+  const bloque = src.slice(i, i + 900);
+  ok(/checkout', '--', 'package-lock\.json/.test(bloque),
+    'npm install deja el lock modificado y bloquea la proxima actualizacion');
 });
 
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
