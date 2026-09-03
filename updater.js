@@ -315,6 +315,7 @@ async function runUpdate(options, onFinish) {
   job.ok = false;
   job.error = '';
   job.restarting = false;
+  job.stashed = null;
   job.step = '';
   job.steps = [];
   job.log = [];
@@ -338,14 +339,45 @@ async function runUpdate(options, onFinish) {
       // no era opcion y no habia nada que commitear.
       const dirtyRes = await gitOut(repo, ['status', '--porcelain', '--untracked-files=no']);
       const dirty = dirtyRes.text.split('\n').map((s) => s.trim()).filter(Boolean);
-      if (dirty.length && !opts.force) {
-        throw new Error('Hay cambios locales sin guardar en el repo (' + dirty.length +
-          ' archivo(s) seguidos por git): ' + dirty.slice(0, 3).join(', ') +
-          (dirty.length > 3 ? '…' : '') + '. Haz commit o descartalos antes de actualizar.');
+      // Antes esto abortaba y el boton quedaba muerto: el usuario no tiene una
+      // terminal a mano para hacer commit ni sabe que descartar. Y el caso mas
+      // comun ni siquiera es suyo -npm install reescribe package-lock.json-, asi
+      // que la actualizacion se bloqueaba sola. Ahora se aparta con git stash:
+      // el pull pasa limpio y nada se pierde, queda recuperable con git stash pop.
+      let stashed = false;
+      if (dirty.length) {
+        setStep('Apartando cambios locales');
+        pushLog('Cambios locales seguidos por git: ' + dirty.join(', '));
+        const st = await runCmd('git',
+          ['stash', 'push', '--quiet', '-m', 'hanstlers-auto-update ' + new Date().toISOString()],
+          repo, log);
+        if (st.code !== 0) {
+          throw new Error('No pude apartar los cambios locales con git stash. ' +
+            'Archivos: ' + dirty.slice(0, 3).join(', ') + '. Revisa el log.');
+        }
+        stashed = true;
+        job.stashed = dirty.slice();
+        pushLog('Guardados en el stash. Para recuperarlos: git stash pop');
       }
+
       const lockBefore = safeRead(path.join(repo, 'package-lock.json'));
+      setStep('Descargando cambios');
       const pull = await runCmd('git', ['pull', '--ff-only', 'origin', branch], repo, log);
-      if (pull.code !== 0) throw new Error('git pull fallo. Revisa el log.');
+      if (pull.code !== 0) {
+        // Si el pull no entra, devolvemos el repo como estaba antes de tocarlo.
+        if (stashed) {
+          pushLog('El pull fallo: devuelvo los cambios locales a su sitio.');
+          await runCmd('git', ['stash', 'pop'], repo, log);
+          job.stashed = null;
+        }
+        const salida = (pull.out || '').toLowerCase();
+        if (salida.indexOf('non-fast-forward') !== -1 || salida.indexOf('diverge') !== -1) {
+          throw new Error('Tu copia del repo tiene commits que no estan en origin, ' +
+            'asi que el pull no puede avanzar sin reescribir historia. ' +
+            'Esto hay que resolverlo a mano: git log origin/' + branch + '..HEAD');
+        }
+        throw new Error('git pull fallo. Revisa el log.');
+      }
 
       // 2. Dependencias, solo si cambiaron
       const lockAfter = safeRead(path.join(repo, 'package-lock.json'));
@@ -436,6 +468,7 @@ function status(since) {
     steps: job.steps,
     error: job.error,
     restarting: job.restarting,
+    stashed: job.stashed || null,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     nextCursor: job.log.length,

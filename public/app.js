@@ -1537,8 +1537,10 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
       h += '<div class="upd-warn">⚠️ No pude contactar GitHub. Muestro el estado local.</div>';
     }
     if(info.dirty && info.dirty.length){
-      h += '<div class="upd-warn">⚠️ Hay '+info.dirty.length+' archivo(s) con cambios sin guardar en el repo. '+
-           'Haz commit antes de actualizar.</div>';
+      h += '<div class="upd-warn">⚠️ Hay '+info.dirty.length+' archivo(s) del proyecto con cambios sin guardar: '+
+           '<code>'+esc(info.dirty.slice(0,4).join(', '))+'</code>'+(info.dirty.length>4?' …':'')+'<br>'+
+           'Los aparto con <code>git stash</code> antes de actualizar; no se pierden y los recuperas con '+
+           '<code>git stash pop</code>.</div>';
     }
     if(info.updateAvailable){
       h += '<div class="upd-good" style="margin-top:10px">⬇️ Hay '+info.behind+' cambio(s) nuevos ('+
@@ -1547,7 +1549,9 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
       h += '</ul>';
       h += '<div style="margin-top:12px;color:var(--muted)">Al actualizar haré: traer cambios → dependencias → '+
            'pruebas → compilar → instalar → reiniciar. Tarda unos minutos.</div>';
-      goBtn.hidden = false; goBtn.disabled = !!(info.dirty && info.dirty.length);
+      // Nunca se desactiva: antes bastaba un package-lock.json tocado por npm
+      // install para dejar el boton gris y sin forma de arreglarlo desde la app.
+      goBtn.hidden = false; goBtn.disabled = false;
       goBtn.textContent = 'Actualizar ahora';
       optsEl.hidden = false;
     } else {
@@ -1586,6 +1590,11 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
       const ico = (!last || st.done) ? (st.ok||!last ? '✅' : '❌') : '⏳';
       h += '<div class="upd-step"><span class="ico">'+ico+'</span><span>'+esc(s.name)+'</span></div>';
     });
+    if(st.stashed && st.stashed.length){
+      h += '<div class="upd-warn" style="margin-top:12px">📦 Aparté '+st.stashed.length+
+           ' archivo(s) con cambios locales: <code>'+esc(st.stashed.slice(0,4).join(', '))+'</code>'+
+           (st.stashed.length>4?' …':'')+'<br>Recupéralos con <code>git stash pop</code> en el repo.</div>';
+    }
     if(st.done && st.error){
       h += '<div class="upd-bad" style="margin-top:12px">❌ '+esc(st.error)+'</div>';
     } else if(st.done && st.restarting){

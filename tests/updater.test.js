@@ -203,10 +203,17 @@ t('el chequeo de repo sucio ignora los archivos sin trackear', () => {
   });
 });
 
-t('pero sigue bloqueando si hay cambios de verdad', () => {
+t('pero los cambios de verdad se protegen, no se pisan', () => {
+  // La proteccion original era correcta en el fondo -un pull no debe
+  // sobreescribir trabajo- pero se cobraba el boton entero. Ahora se cumple el
+  // mismo objetivo sin dejar al usuario sin salida: se apartan.
   const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
-  ok(/if \(dirty\.length && !opts\.force\)/.test(src),
-    'ya no aborta ante cambios locales reales: el pull los sobreescribiria');
+  const i = src.indexOf('if (dirty.length)');
+  ok(i !== -1, 'ya no se mira si hay cambios locales: el pull los sobreescribiria');
+  const bloque = src.slice(i, i + 700);
+  ok(/stash', 'push'/.test(bloque), 'se detectan pero no se ponen a salvo');
+  ok(/pull --ff-only|'pull', '--ff-only'/.test(src),
+    'el pull deberia seguir siendo --ff-only: nunca reescribe historia local');
 });
 
 t('el script reparador aplica el mismo criterio', () => {
@@ -229,6 +236,54 @@ console.log('\n--- los manifiestos no llevan BOM ---');
       nombre + ' empieza por BOM: electron-builder no podra leerlo');
     JSON.parse(b.toString('utf8'));
   });
+});
+
+console.log('\n--- el boton de actualizar nunca se queda sin salida ---');
+
+// El usuario solo tiene el boton. Cualquier estado que lo deje muerto sin una
+// accion posible desde la app es un bug, por muy defensivo que parezca.
+const upSrc = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+const uiSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+
+t('la UI no desactiva el boton por tener cambios locales', () => {
+  ok(!/goBtn\.disabled\s*=\s*!!\(info\.dirty/.test(uiSrc),
+    'el boton se pone gris por dirty: no hay forma de actualizar desde la app');
+  ok(!/disabled\s*=\s*[^;]*\bdirty\b/.test(uiSrc),
+    'algo sigue atando el estado del boton a dirty');
+});
+
+t('los cambios locales se apartan con stash, no abortan', () => {
+  ok(/stash', 'push'/.test(upSrc), 'no hay git stash push antes del pull');
+  ok(!/Haz commit o descartalos antes de actualizar/.test(upSrc),
+    'sigue abortando y mandando al usuario a una terminal que no tiene');
+});
+
+t('si el pull falla, los cambios apartados vuelven a su sitio', () => {
+  const i = upSrc.indexOf('if (pull.code !== 0)');
+  ok(i !== -1, 'no encuentro el manejo del pull fallido');
+  const bloque = upSrc.slice(i, i + 900);
+  ok(/stash', 'pop'/.test(bloque),
+    'el pull falla y el trabajo del usuario se queda en el stash sin avisar');
+});
+
+t('el stash se anuncia en pantalla, no solo en el log', () => {
+  ok(/stashed: job\.stashed/.test(upSrc), 'status() no expone stashed');
+  ok(/st\.stashed/.test(uiSrc), 'la UI no muestra que se aparto trabajo');
+  ok(/stash pop/.test(uiSrc), 'la UI no dice como recuperarlo');
+});
+
+t('una divergencia de historia se explica en vez de decir solo "fallo"', () => {
+  ok(/non-fast-forward|diverge/.test(upSrc),
+    'un repo divergido daria "git pull fallo" sin decir que hacer');
+});
+
+t('se puede reintentar: acabar el job libera el candado', () => {
+  // job.running que se quedara en true dejaria el boton respondiendo
+  // "ya hay una actualizacion en curso" para siempre.
+  const i = upSrc.indexOf("job.running = false");
+  ok(i !== -1, 'nunca se libera job.running');
+  const ctx = upSrc.slice(Math.max(0, i - 400), i + 200);
+  ok(/finally/.test(ctx), 'job.running solo se libera en el camino feliz');
 });
 
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
