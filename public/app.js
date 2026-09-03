@@ -1536,6 +1536,32 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
     if(info.offline){
       h += '<div class="upd-warn">⚠️ No pude contactar GitHub. Muestro el estado local.</div>';
     }
+    // El intento anterior quedo registrado en disco. Si fallo, o si lanzo el
+    // instalador y la version en uso no cambio, hay que decirlo: antes ese
+    // fallo se perdia al reiniciar y la pantalla daba el visto bueno.
+    var lr = info.lastRun;
+    var alDia = info.repoVersion && info.installedVersion && info.repoVersion === info.installedVersion;
+    if(lr && !alDia){
+      if(lr.ok === false){
+        h += '<div class="upd-bad" style="margin-top:10px">❌ El último intento de actualizar falló'+
+             (lr.step ? ' en el paso «'+esc(lr.step)+'»' : '')+':<br><code>'+esc(lr.error||'sin detalle')+'</code>'+
+             (lr.logTail && lr.logTail.length
+               ? '<details style="margin-top:8px"><summary>Ver las últimas líneas del log</summary>'+
+                 '<pre style="white-space:pre-wrap;max-height:180px;overflow:auto">'+
+                 esc(lr.logTail.join('\n'))+'</pre></details>'
+               : '')+'</div>';
+      } else if(lr.pendiente){
+        h += '<div class="upd-warn" style="margin-top:10px">⚠️ Se lanzó el instalador de la '+
+             '<code>'+esc(lr.expectedVersion||'?')+'</code> pero sigues ejecutando la '+
+             '<code>'+esc(info.installedVersion||'?')+'</code>: no llegó a aplicarse. '+
+             'Cierra HanstlerS del todo y vuelve a pulsar el botón.</div>';
+      }
+    }
+    if(info.lastApply && info.lastApply.ok === false && !alDia){
+      h += '<div class="upd-bad" style="margin-top:10px">❌ El instalador terminó con código '+
+           esc(info.lastApply.exitCode)+' pero en disco quedó la <code>'+esc(info.lastApply.installed||'?')+
+           '</code> en vez de la <code>'+esc(info.lastApply.expected||'?')+'</code>.</div>';
+    }
     if(info.dirty && info.dirty.length){
       h += '<div class="upd-warn">⚠️ Hay '+info.dirty.length+' archivo(s) del proyecto con cambios sin guardar: '+
            '<code>'+esc(info.dirty.slice(0,4).join(', '))+'</code>'+(info.dirty.length>4?' …':'')+'<br>'+

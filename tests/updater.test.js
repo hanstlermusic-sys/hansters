@@ -345,5 +345,46 @@ t('checkUpdate expone la version del repo para poder compararla', () => {
     'checkUpdate no expone repoVersion: la UI no puede detectar el desfase');
 });
 
+console.log('\n--- un fallo de actualizacion no se evapora al reiniciar ---');
+
+// El caso que dejaba una PC clavada en una version vieja: el git pull entra,
+// un paso posterior falla, y el error vive SOLO en job.error (memoria). Al
+// reabrir la app el repo ya esta al dia -behind = 0- y la pantalla decia
+// "estas en la ultima version". El fallo desaparecia sin rastro.
+t('el resultado del ciclo se guarda en disco', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(/update-job\.json/.test(src), 'no hay archivo donde persistir el intento');
+  const i = src.indexOf('job.error = e && e.message');
+  ok(i !== -1, 'no encuentro el catch del ciclo');
+  ok(/saveJobResult/.test(src.slice(i, i + 500)),
+    'el catch no persiste el fallo: se pierde al reiniciar');
+});
+
+t('checkUpdate lo devuelve para que la pantalla pueda avisar', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(/lastRun: lastJobResult\(\)/.test(src), 'checkUpdate no expone lastRun');
+});
+
+t('lanzar el instalador se registra como pendiente hasta confirmarse', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  const i = src.indexOf('job.expectedVersion = expectedVersion');
+  ok(i !== -1, 'no encuentro el lanzamiento del instalador');
+  ok(/pendiente: true/.test(src.slice(i, i + 400)),
+    'si el instalador no se aplica, al reabrir no queda constancia');
+});
+
+t('la pantalla muestra el fallo persistido, con el paso y el log', () => {
+  const ui = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  ok(/info\.lastRun/.test(ui), 'la UI ignora el intento anterior');
+  ok(/lr\.step/.test(ui), 'no dice en que paso fallo');
+  ok(/lr\.logTail/.test(ui), 'no ofrece el log: el usuario no puede saber por que');
+});
+
+t('pero no alarma si la version en uso ya es la del repo', () => {
+  const ui = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  ok(/alDia/.test(ui),
+    'mostraria fallos viejos ya resueltos cada vez que se abre la ventana');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

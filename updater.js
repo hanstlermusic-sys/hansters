@@ -183,6 +183,10 @@ async function checkUpdate() {
     // estas en la ultima version" mirando solo los commits, mientras el
     // usuario seguia ejecutando el binario anterior sin enterarse.
     repoVersion: readVersion(repo),
+    // Ultimo intento de actualizar, leido de disco: sobrevive al reinicio de la
+    // app, que es justo cuando se perdia.
+    lastRun: lastJobResult(),
+    lastApply: lastApplyResult(),
     offline: fetched.code !== 0,
     commits
   };
@@ -243,6 +247,26 @@ function readRepoVersion(repo) {
 }
 
 const RESULT_FILE = path.join(HOME, '.hanstlers', 'update-result.json');
+// Resultado del ciclo COMPLETO (no solo del instalador). Sin esto, cuando algo
+// fallaba despues del git pull el error vivia solo en memoria: al reabrir la
+// app el repo ya estaba al dia, la pantalla decia "estas en la ultima version"
+// y el fallo desaparecia sin dejar rastro. Es exactamente como una PC se queda
+// clavada en una version vieja creyendo que todo va bien.
+const JOB_FILE = path.join(HOME, '.hanstlers', 'update-job.json');
+
+function saveJobResult(datos) {
+  try {
+    fs.mkdirSync(path.dirname(JOB_FILE), { recursive: true });
+    fs.writeFileSync(JOB_FILE, JSON.stringify(datos), 'utf8');
+  } catch (e) {}
+}
+
+function lastJobResult() {
+  try {
+    const r = JSON.parse(fs.readFileSync(JOB_FILE, 'utf8').replace(/^\uFEFF/, ''));
+    return r && typeof r === 'object' ? r : null;
+  } catch (e) { return null; }
+}
 
 // El resultado que dejo el script externo la ultima vez. Sin esto, si el
 // instalador falla la app se relanza en la version vieja y el usuario cree que
@@ -450,6 +474,15 @@ async function runUpdate(options, onFinish) {
       job.restarting = true;
       job.ok = true;
       job.expectedVersion = expectedVersion;
+      // Se registra como "en curso": si el instalador no llega a aplicarse, al
+      // reabrir la app seguira aqui y la pantalla podra decirlo.
+      saveJobResult({
+        ok: true,
+        pendiente: true,
+        expectedVersion: expectedVersion || '',
+        at: new Date().toISOString(),
+        logTail: job.log.slice(-10)
+      });
       pushLog('Instalador lanzado: ' + path.basename(setupExe));
       pushLog('Al reabrirse, HanstlerS comprobara que quedo en la version ' + (expectedVersion || 'nueva') + '.');
       pushLog('HanstlerS se cerrara y volvera a abrir solo en unos segundos.');
@@ -457,6 +490,14 @@ async function runUpdate(options, onFinish) {
       job.ok = false;
       job.error = e && e.message ? e.message : String(e);
       pushLog('ERROR: ' + job.error);
+      saveJobResult({
+        ok: false,
+        error: job.error,
+        step: job.step,
+        expectedVersion: readRepoVersion(repo) || '',
+        at: new Date().toISOString(),
+        logTail: job.log.slice(-25)
+      });
     } finally {
       job.running = false;
       job.done = true;
