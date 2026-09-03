@@ -283,12 +283,234 @@ body{
 
 /* ===== Temas ===== */
 body[data-theme="ocean"]{ --bg:#0a1420; --panel:#0f2036; --neon:#26a0ff; --neon2:#26e0ff; --border:#1c3550; }
-body[data-theme="light"]{ --bg:#f4f6fb; --panel:#ffffff; --neon:#7c3aed; --neon2:#0aa5c9; --text:#1a1a28; --muted:#5a5a70; --border:#d6d9e6; }
-body[data-theme="light"] .bubble{ background:#ffffff; }
-body[data-theme="light"] .msg.user .bubble{ background:#e8ecf8; border-color:#c8d0ea; }
-body[data-theme="light"] #chat{ background:#eef1f8; }
-body[data-theme="light"] #conv-search, body[data-theme="light"] #input{ background:#ffffff; }
-body[data-theme="light"] .bubble strong{ color:#000; }
+/* ===== Tema claro (estilo VS Code Light Modern) ===== */
+body[data-theme="light"]{
+  --bg:#ffffff; --panel:#ffffff; --neon:#005fb8; --neon2:#0078d4;
+  --text:#3b3b3b; --muted:#616161; --border:#e5e5e5; --user:#005fb8;
+  --surface:#ffffff; --surface-2:#f8f8f8; --surface-3:#e4e6f1;
+  --chrome:#f8f8f8; --border-strong:#cecece;
+  --ring:rgba(0,95,184,.28);
+  --shadow:0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.06);
+  background:#ffffff; color-scheme:light;
+  font-family:-apple-system,'Segoe UI',system-ui,sans-serif;
+}
+
+/* ---- Sidebar (Side Bar de VS Code) ---- */
+body[data-theme="light"] #sidebar{ background:var(--chrome); border-right:1px solid var(--border); }
+body[data-theme="light"] #btn-newconv{
+  border-radius:4px; border:1px solid rgba(0,0,0,.06);
+  background:var(--neon); color:#fff; box-shadow:none; font-weight:600;
+}
+body[data-theme="light"] #btn-newconv:hover{ background:#0258a8; box-shadow:none; }
+body[data-theme="light"] .side-tab{
+  border-radius:4px; background:transparent; color:var(--muted); border-color:transparent;
+}
+body[data-theme="light"] .side-tab:hover{ background:rgba(0,0,0,.045); color:var(--text); border-color:transparent; }
+body[data-theme="light"] .side-tab.active{
+  background:transparent; color:#005fb8; border-color:transparent;
+  border-bottom:1px solid #005fb8; border-radius:4px 4px 0 0; font-weight:600;
+}
+body[data-theme="light"] #conv-search{
+  border-radius:2px; background:#fff; color:var(--text); border:1px solid var(--border-strong);
+}
+body[data-theme="light"] #conv-search:focus{ border-color:var(--neon); box-shadow:0 0 0 1px var(--neon); }
+body[data-theme="light"] .side-list::-webkit-scrollbar-thumb,
+body[data-theme="light"] #chat::-webkit-scrollbar-thumb{ background:rgba(100,100,100,.25); border-radius:0; }
+body[data-theme="light"] .side-list::-webkit-scrollbar-thumb:hover,
+body[data-theme="light"] #chat::-webkit-scrollbar-thumb:hover{ background:rgba(100,100,100,.4); }
+
+body[data-theme="light"] .conv-item{ color:var(--text); border-radius:4px; }
+body[data-theme="light"] .conv-item:hover{ background:rgba(0,0,0,.045); color:var(--text); }
+body[data-theme="light"] .conv-item.active{ background:#e4e6f1; color:var(--text); border-color:transparent; }
+body[data-theme="light"] .conversation-item{
+  background:transparent; border-color:transparent; box-shadow:none; border-radius:4px;
+}
+body[data-theme="light"] .conversation-item:hover{ background:rgba(0,0,0,.045); border-color:transparent; }
+body[data-theme="light"] .conversation-item.active{
+  background:#e4e6f1; border-color:transparent; box-shadow:none;
+}
+body[data-theme="light"] .conversation-item .t,
+body[data-theme="light"] .repo-item .t{ color:var(--text); font-weight:400; }
+body[data-theme="light"] .conversation-item.active .t{ font-weight:600; }
+body[data-theme="light"] .conversation-item .conv-meta,
+body[data-theme="light"] .repo-item .repo-path{ color:#767676; }
+body[data-theme="light"] .repo-item{ border-radius:4px; }
+body[data-theme="light"] .repo-item.active{ background:#e4e6f1; border-color:transparent; box-shadow:none; }
+body[data-theme="light"] .conv-item .del{ color:#c72e0f; }
+body[data-theme="light"] .conv-item .ren{ color:var(--muted); }
+body[data-theme="light"] .conv-item .ren:hover{ color:var(--neon); }
+body[data-theme="light"] .conv-item .spin{ color:var(--neon); }
+
+body[data-theme="light"] .repo-auth{
+  background:#f3f3f3; border:1px solid var(--border); border-radius:4px;
+}
+body[data-theme="light"] .repo-auth-title{ color:#005fb8; }
+body[data-theme="light"] .repo-auth-status{ color:var(--text); }
+body[data-theme="light"] .repo-auth-note,
+body[data-theme="light"] .repo-auth-sub{ color:var(--muted); }
+body[data-theme="light"] .repo-auth-sep{ background:var(--border); }
+body[data-theme="light"] .repo-auth-actions button,
+body[data-theme="light"] .gh-acct{
+  background:#fff; border:1px solid var(--border-strong); color:var(--text); border-radius:2px;
+}
+body[data-theme="light"] .repo-auth-actions button:hover{ background:#f3f3f3; border-color:var(--neon); box-shadow:none; }
+body[data-theme="light"] .gh-acct:hover:not(:disabled){ background:#f3f3f3; border-color:var(--neon); box-shadow:none; transform:none; }
+body[data-theme="light"] .gh-acct.active{ background:#eef7f1; border-color:#2a9e5c; }
+body[data-theme="light"] .gh-acct-tag{ color:var(--muted); border-color:var(--border-strong); border-radius:3px; }
+body[data-theme="light"] .gh-acct.active .gh-acct-tag{ color:#12703f; border-color:#a8ddbe; }
+
+/* ---- Topbar (Title Bar de VS Code) ---- */
+body[data-theme="light"] #topbar{
+  background:var(--chrome); border-bottom:1px solid var(--border); box-shadow:none;
+}
+body[data-theme="light"] .logo{ border-radius:4px; box-shadow:none; background:linear-gradient(135deg,#005fb8,#0078d4); }
+body[data-theme="light"] .brand-text strong{ color:#1f1f1f; font-weight:600; }
+body[data-theme="light"] .brand-text small{ color:#767676; }
+body[data-theme="light"] .cwd{
+  background:#fff; color:var(--muted); border:1px solid var(--border-strong); border-radius:4px;
+}
+body[data-theme="light"] #topbar button,
+body[data-theme="light"] #btn-toggle{
+  background:transparent; color:#3b3b3b; border:1px solid transparent; border-radius:4px; box-shadow:none;
+}
+body[data-theme="light"] #topbar button:hover,
+body[data-theme="light"] #btn-toggle:hover{
+  background:rgba(0,0,0,.06); color:#1f1f1f; border-color:transparent; box-shadow:none;
+}
+body[data-theme="light"] #topbar button:focus-visible,
+body[data-theme="light"] #btn-toggle:focus-visible{ outline:1px solid var(--neon); outline-offset:-1px; }
+body[data-theme="light"] .icon-btn{ color:#3b3b3b; }
+body[data-theme="light"] .icon-btn:hover{ color:#1f1f1f; }
+body[data-theme="light"] #btn-autostart.on{ color:#005fb8; border-color:transparent; background:rgba(0,95,184,.1); }
+body[data-theme="light"] #btn-trust.on{
+  color:#12703f; border-color:transparent; background:rgba(42,158,92,.13); box-shadow:none;
+}
+body[data-theme="light"] #usage-meter{
+  color:#3b3b3b; background:#e4e6f1; border:1px solid transparent; border-radius:4px;
+  box-shadow:none; font-weight:400;
+}
+body[data-theme="light"] #usage-meter-google{
+  color:#3b3b3b; background:#e4e6f1; border:1px solid transparent; border-radius:4px;
+  box-shadow:none; font-weight:400;
+}
+
+/* ---- Chat (Editor de VS Code) ---- */
+body[data-theme="light"] #chat{ background:#ffffff; }
+body[data-theme="light"] .bubble{
+  background:#f8f8f8; border:1px solid var(--border); color:var(--text);
+  border-radius:6px; box-shadow:none;
+}
+body[data-theme="light"] .msg.bot .bubble{ border-left:2px solid #005fb8; }
+body[data-theme="light"] .msg.user .bubble{
+  background:#005fb8; border-color:#005fb8; color:#fff; box-shadow:none; border-radius:6px;
+}
+body[data-theme="light"] .msg.user .bubble strong,
+body[data-theme="light"] .msg.user .bubble a{ color:#fff; }
+body[data-theme="light"] .msg.user .bubble code{ background:rgba(255,255,255,.22); color:#fff; }
+body[data-theme="light"] .msg .avatar{ border-radius:4px; }
+body[data-theme="light"] .msg.user .avatar{ background:#616161; }
+body[data-theme="light"] .msg.bot .avatar{ background:linear-gradient(135deg,#005fb8,#0078d4); }
+body[data-theme="light"] .bubble strong{ color:#1f1f1f; }
+body[data-theme="light"] .bubble h3{ color:#1f1f1f; }
+body[data-theme="light"] .bubble h4{ color:#0451a5; }
+body[data-theme="light"] .bubble a{ color:#005fb8; }
+body[data-theme="light"] .bubble code{
+  background:rgba(0,0,0,.05); color:#a31515; border-radius:3px;
+  font-family:Consolas,'Cascadia Mono',monospace;
+}
+body[data-theme="light"] .bubble pre{
+  background:#ffffff; border:1px solid var(--border); border-radius:4px;
+}
+body[data-theme="light"] .bubble pre code{ background:none; color:#1f1f1f; }
+body[data-theme="light"] .op-trace-item{ color:#767676; }
+body[data-theme="light"] .op-trace-sub{ color:#8a8a8a; }
+body[data-theme="light"] .working{ color:var(--muted); }
+body[data-theme="light"] .agent-hint{ color:#767676; }
+body[data-theme="light"] .agent-status{
+  color:#005fb8; background:rgba(0,95,184,.08); border-color:rgba(0,95,184,.25); border-radius:4px;
+}
+body[data-theme="light"] .typing span{ background:#005fb8; }
+body[data-theme="light"] .continue-box{
+  background:#f3f3f3; border:1px solid var(--border); color:var(--text); border-radius:4px;
+}
+body[data-theme="light"] .continue-box button{ background:#005fb8; border-radius:2px; }
+body[data-theme="light"] .continue-box button:hover{ background:#0258a8; }
+body[data-theme="light"] .wheel{ border-color:rgba(0,95,184,.22); border-top-color:#005fb8; }
+body[data-theme="light"] #working-bar{
+  background:#f3f3f3; color:var(--text); border:1px solid var(--border); border-top:none;
+  border-radius:0 0 4px 4px; box-shadow:0 2px 8px rgba(0,0,0,.1);
+}
+body[data-theme="light"] .danger-confirm{
+  background:#fff; border:1px solid #c72e0f; border-radius:4px; box-shadow:0 4px 16px rgba(0,0,0,.14);
+}
+body[data-theme="light"] .danger-confirm .dc-txt{ color:#a1260d; }
+body[data-theme="light"] .danger-confirm button{ border-radius:2px; }
+body[data-theme="light"] .danger-confirm .dc-yes{ background:#c72e0f; }
+body[data-theme="light"] .danger-confirm .dc-no{ background:#fff; color:var(--text); border:1px solid var(--border-strong); }
+
+/* ---- Composer (Panel/Terminal input de VS Code) ---- */
+body[data-theme="light"] #composer{ background:var(--chrome); border-top:1px solid var(--border); }
+body[data-theme="light"] #input{
+  background:#fff; color:var(--text); border:1px solid var(--border-strong); border-radius:4px;
+}
+body[data-theme="light"] #input::placeholder{ color:#8a8a8a; }
+body[data-theme="light"] #input:focus{ border-color:var(--neon); box-shadow:0 0 0 1px var(--neon); }
+body[data-theme="light"] #model-sel{
+  background:#fff; color:var(--text); border:1px solid var(--border-strong); border-radius:2px;
+}
+body[data-theme="light"] #model-sel:hover{ border-color:var(--neon); }
+body[data-theme="light"] #mode-chip{
+  background:#e4e6f1; color:var(--text); border:1px solid transparent; border-radius:4px;
+}
+body[data-theme="light"] #mode-chip.on{ background:rgba(0,95,184,.12); color:#005fb8; border-color:transparent; }
+body[data-theme="light"] .mic, body[data-theme="light"] .speak{
+  background:transparent; color:#3b3b3b; border:1px solid transparent; border-radius:4px;
+}
+body[data-theme="light"] .mic:hover, body[data-theme="light"] .speak:hover{
+  background:rgba(0,0,0,.06); color:#1f1f1f; border-color:transparent; box-shadow:none;
+}
+body[data-theme="light"] .speak.on{ background:#005fb8; color:#fff; border-color:transparent; }
+body[data-theme="light"] #send{
+  background:#005fb8; border-radius:4px; box-shadow:none; width:40px; height:40px; flex:0 0 40px;
+}
+body[data-theme="light"] #send:hover{ background:#0258a8; }
+body[data-theme="light"] #send.stopping{ background:#c72e0f; }
+
+/* ---- X-CORE ---- */
+body[data-theme="light"] #xcore-player{ background:#fff; border:1px solid var(--border); border-radius:4px; box-shadow:none; }
+body[data-theme="light"] #xcore-upload-btn,
+body[data-theme="light"] .xcore-track{
+  background:#fff; color:var(--text); border:1px solid var(--border-strong); border-radius:2px;
+}
+body[data-theme="light"] #xcore-upload-btn:hover,
+body[data-theme="light"] .xcore-track:hover{ background:#f3f3f3; border-color:var(--neon); }
+body[data-theme="light"] .xcore-track.active{ border-color:var(--neon); box-shadow:0 0 0 1px var(--neon) inset; }
+body[data-theme="light"] #xcore-now{ color:var(--muted); }
+
+/* ---- Actualizador (Quick Input / Modal de VS Code) ---- */
+body[data-theme="light"] #update-overlay{ background:rgba(0,0,0,.3); }
+body[data-theme="light"] #update-panel{
+  border:1px solid var(--border-strong); border-radius:6px; box-shadow:0 8px 32px rgba(0,0,0,.2);
+}
+body[data-theme="light"] #update-panel > header,
+body[data-theme="light"] #update-panel > footer{ background:var(--chrome); }
+body[data-theme="light"] #update-body code{ background:rgba(0,0,0,.05); color:#a31515; border-radius:3px; }
+body[data-theme="light"] #update-log{
+  background:#f8f8f8; border:1px solid var(--border); color:#3b3b3b; border-radius:4px;
+}
+body[data-theme="light"] #update-body .upd-warn{ color:#bf8803; }
+body[data-theme="light"] #update-body .upd-bad{ color:#c72e0f; }
+body[data-theme="light"] #update-body .upd-good{ color:#12703f; }
+body[data-theme="light"] #update-go{ background:#005fb8; border-radius:2px; }
+body[data-theme="light"] #update-go:hover{ background:#0258a8; box-shadow:none; }
+body[data-theme="light"] #update-close:hover{ color:var(--text); }
+body[data-theme="light"] #model-watch{ background:#f3f3f3; border:1px solid var(--border); border-radius:4px; }
+body[data-theme="light"] #model-watch code{ background:rgba(0,0,0,.05); color:#a31515; }
+body[data-theme="light"] #model-watch .mw-gain{ color:#12703f; }
+body[data-theme="light"] #model-watch button{ background:#fff; border:1px solid var(--border-strong); border-radius:2px; }
+body[data-theme="light"] #model-watch button:hover{ background:#f3f3f3; border-color:var(--neon); }
+body[data-theme="light"] #model-watch button.primary{ background:#005fb8; border-color:#005fb8; color:#fff; }
+body[data-theme="light"] #btn-update .dot{ background:#12703f; box-shadow:none; }
 
 .gh-acct-list{ display:flex; flex-direction:column; gap:8px; }
 .gh-acct{
