@@ -178,6 +178,11 @@ async function checkUpdate() {
     ahead,
     dirty,
     updateAvailable: behind > 0,
+    // El repo puede estar al dia y la APP seguir vieja: pasa siempre que la
+    // instalacion falla o se interrumpe a mitad. Antes la pantalla decia "ya
+    // estas en la ultima version" mirando solo los commits, mientras el
+    // usuario seguia ejecutando el binario anterior sin enterarse.
+    repoVersion: readVersion(repo),
     offline: fetched.code !== 0,
     commits
   };

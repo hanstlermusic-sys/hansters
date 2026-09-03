@@ -304,5 +304,46 @@ t('el lock reescrito por npm se revierte tras instalar', () => {
     'npm install deja el lock modificado y bloquea la proxima actualizacion');
 });
 
+console.log('\n--- la pantalla no miente sobre la version en uso ---');
+
+// La otra PC mostraba "Ya estas en la ultima version (6f72857)" mientras
+// ejecutaba la 1.0.12 y el repo iba por la 1.0.13: updateAvailable solo miraba
+// commits de git. El codigo estaba al dia, pero la instalacion no se aplico y
+// el usuario seguia con la app vieja sin enterarse.
+function renderInfo(info) {
+  const vm2 = require('vm');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const i = src.indexOf('  function renderInfo(){');
+  const f = src.indexOf('\n  async function check(', i);
+  if (i === -1 || f === -1) throw new Error('no encuentro renderInfo en public/app.js');
+  const ctx = { esc: (s) => String(s == null ? '' : s), goBtn: {}, optsEl: {}, logEl: {},
+                body: {}, info: info, console: console };
+  vm2.runInNewContext(src.slice(i, f) + '\nrenderInfo();', ctx);
+  return { html: ctx.body.innerHTML || '', boton: ctx.goBtn };
+}
+const base = { ok: true, repoRoot: 'C:\\repo', branch: 'main', localCommit: 'abc1234',
+               remoteCommit: 'abc1234', behind: 0, ahead: 0, dirty: [],
+               updateAvailable: false, offline: false, commits: [] };
+
+t('avisa cuando la app instalada va detras del codigo', () => {
+  const r = renderInfo(Object.assign({}, base, { installedVersion: '1.0.12', repoVersion: '1.0.13' }));
+  ok(!/Ya est.s en la .ltima versi.n/.test(r.html),
+    'dice que estas en la ultima version mientras usas una app vieja');
+  ok(/1\.0\.13/.test(r.html), 'no dice cual es la version que deberia estar instalada');
+  eq(r.boton.disabled, false, 'boton');
+});
+
+t('no molesta cuando la app y el codigo coinciden', () => {
+  const r = renderInfo(Object.assign({}, base, { installedVersion: '1.0.13', repoVersion: '1.0.13' }));
+  ok(/Ya est.s en la .ltima versi.n/.test(r.html), 'deberia decir que todo esta al dia');
+  ok(!/no lleg. a aplicarse/.test(r.html), 'avisa de un desfase que no existe');
+});
+
+t('checkUpdate expone la version del repo para poder compararla', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(/repoVersion: readVersion\(repo\)/.test(src),
+    'checkUpdate no expone repoVersion: la UI no puede detectar el desfase');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

@@ -1554,6 +1554,17 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
       goBtn.hidden = false; goBtn.disabled = false;
       goBtn.textContent = 'Actualizar ahora';
       optsEl.hidden = false;
+    } else if(info.repoVersion && info.installedVersion && info.repoVersion !== info.installedVersion){
+      // El codigo esta al dia pero el binario en ejecucion no: la instalacion
+      // anterior no llego a aplicarse. Decir "ya estas en la ultima version"
+      // aqui era mentira y dejaba al usuario usando la app vieja sin saberlo.
+      h += '<div class="upd-warn" style="margin-top:10px">⚠️ El código está al día ('+esc(info.localCommit)+'), '+
+           'pero la app que estás usando es la <code>'+esc(info.installedVersion)+'</code> y el código ya va por la '+
+           '<code>'+esc(info.repoVersion)+'</code>.<br>La instalación anterior no llegó a aplicarse. '+
+           'Pulsa el botón para compilar e instalar la '+esc(info.repoVersion)+'.</div>';
+      goBtn.hidden = false; goBtn.disabled = false;
+      goBtn.textContent = 'Instalar '+info.repoVersion;
+      optsEl.hidden = false;
     } else {
       h += '<div class="upd-good" style="margin-top:10px">✅ Ya estás en la última versión ('+esc(info.localCommit)+').</div>';
       h += '<div style="margin-top:10px;color:var(--muted)">¿Reinstalaste esta PC o la app quedó desfasada del código? '+
