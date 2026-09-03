@@ -146,7 +146,10 @@ async function checkUpdate() {
   const fetched = await gitOut(repo, ['fetch', 'origin', branch, '--quiet']);
   const localRes = await gitOut(repo, ['rev-parse', 'HEAD']);
   const remoteRes = await gitOut(repo, ['rev-parse', 'origin/' + branch]);
-  const dirtyRes = await gitOut(repo, ['status', '--porcelain']);
+  // Igual que en runUpdate: solo cuentan los archivos seguidos por git. Las
+  // carpetas ajenas dentro del repo no impiden actualizar, y anunciarlas como
+  // "cambios sin guardar" mandaba al usuario a resolver algo que no existia.
+  const dirtyRes = await gitOut(repo, ['status', '--porcelain', '--untracked-files=no']);
   const dirty = dirtyRes.text.split('\n').map((s) => s.trim()).filter(Boolean);
 
   let behind = 0;
@@ -327,11 +330,18 @@ async function runUpdate(options, onFinish) {
 
       // 1. Traer cambios
       setStep('Descargando cambios');
-      const dirtyRes = await gitOut(repo, ['status', '--porcelain']);
+      // Solo importan los archivos SEGUIDOS por git: un `git pull --ff-only`
+      // no los toca, pero si los sobreescribiria si estuvieran modificados.
+      // Las carpetas sin trackear (otros proyectos dentro del repo, restos de
+      // builds) no estorban a nada, y contarlas bloqueaba la actualizacion con
+      // un "cambios sin guardar" que el usuario no podia resolver: descartarlas
+      // no era opcion y no habia nada que commitear.
+      const dirtyRes = await gitOut(repo, ['status', '--porcelain', '--untracked-files=no']);
       const dirty = dirtyRes.text.split('\n').map((s) => s.trim()).filter(Boolean);
       if (dirty.length && !opts.force) {
         throw new Error('Hay cambios locales sin guardar en el repo (' + dirty.length +
-          ' archivo(s)). Haz commit o descartalos antes de actualizar.');
+          ' archivo(s) seguidos por git): ' + dirty.slice(0, 3).join(', ') +
+          (dirty.length > 3 ? '…' : '') + '. Haz commit o descartalos antes de actualizar.');
       }
       const lockBefore = safeRead(path.join(repo, 'package-lock.json'));
       const pull = await runCmd('git', ['pull', '--ff-only', 'origin', branch], repo, log);

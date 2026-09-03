@@ -185,5 +185,35 @@ t('la app avisa cuando la version instalada no es la esperada', () => {
   ok(bloque.indexOf('lastApplyFailed') !== -1,
     '/api/update/check no reporta que la ultima actualizacion no se aplico');
 });
+console.log('\n--- el guardarrail no bloquea por carpetas ajenas ---');
+
+// Caso real: en la carpeta del repo conviven otros proyectos sin trackear
+// (Hanstler/, dj-set-studio/, xtudio-backend/). Contarlos como "cambios sin
+// guardar" bloqueaba el boton de actualizar con un error irresoluble: no habia
+// nada que commitear y descartarlos habria borrado trabajo ajeno.
+t('el chequeo de repo sucio ignora los archivos sin trackear', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  // Hay dos chequeos: el de checkUpdate (lo que muestra la pantalla) y el de
+  // runUpdate (el que aborta). Los dos deben ignorar los untracked.
+  const usos = src.match(/'status', '--porcelain'[^\]]*/g) || [];
+  ok(usos.length >= 2, 'esperaba dos chequeos de repo sucio, encontre ' + usos.length);
+  usos.forEach((u, i) => {
+    ok(u.indexOf('--untracked-files=no') !== -1,
+      'el chequeo ' + (i + 1) + ' cuenta los untracked: una carpeta ajena bloquea la actualizacion');
+  });
+});
+
+t('pero sigue bloqueando si hay cambios de verdad', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'updater.js'), 'utf8');
+  ok(/if \(dirty\.length && !opts\.force\)/.test(src),
+    'ya no aborta ante cambios locales reales: el pull los sobreescribiria');
+});
+
+t('el script reparador aplica el mismo criterio', () => {
+  const ps = fs.readFileSync(path.join(__dirname, '..', 'tools', 'repair-update.ps1'), 'utf8');
+  ok(ps.indexOf('--untracked-files=no') !== -1,
+    'repair-update.ps1 se bloquearia con las mismas carpetas ajenas');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

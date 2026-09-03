@@ -1600,31 +1600,23 @@ function toGeminiAgentContents(messages) {
     }
     filtered.push(t);
   }
-  // Gemini rechaza un historial que no empiece por un turno de 'user', pero
-  // quitar el 'model' inicial puede dejar al descubierto el functionResponse
-  // que le respondia, y entonces Gemini falla con "function response turn must
-  // come immediately after a function call turn". Hay que sanear hasta punto
-  // fijo: cada vez que se descarta un turno del inicio, el que queda expuesto
-  // se vuelve a validar.
-  // Medido contra la API real: Gemini ACEPTA que el historial empiece por un
-  // turno 'model' (200). Lo unico que rechaza es que empiece por un
-  // functionResponse, porque no tiene delante su functionCall. Por eso aqui se
-  // descarta solo eso: quitar tambien los 'model' iniciales tiraba, en un
-  // historial recortado, justo el tramo con lo que el agente acababa de leer.
+  // Medido contra la API real (gemini-3.8-flash), no supuesto: de 10 formas de
+  // historial descuadrado solo devuelve 400 en dos.
+  //   - que el historial empiece por un functionResponse: no tiene delante su
+  //     functionCall. Se descarta solo eso; Gemini SI acepta empezar por 'model',
+  //     y recortar tambien los 'model' iniciales tiraba, en un historial ya
+  //     recortado, justo el tramo con lo que el agente acababa de leer.
+  //   - que TERMINE en un functionCall sin responder -> 400 pidiendo thought_signature.
+  // Los descuadres intermedios (mas o menos respuestas que llamadas) los tolera,
+  // asi que no se tocan: recortarlos seria tirar contexto util.
   while (filtered.length && filtered[0].fromTool) filtered.shift();
-  //   - que el historial empiece por un functionResponse (lo cubre el bucle de arriba)
-  //   - que TERMINE en un functionCall sin responder -> 400 exigiendo thought_signature
-  // Por eso NO se recortan los descuadres intermedios: seria tirar contexto util.
   while (filtered.length) {
     const ultimo = filtered[filtered.length - 1];
     if (ultimo.role === 'model' && ultimo.hasFnCall) { filtered.pop(); continue; }
     break;
   }
-  while (filtered.length) {
-    const primero = filtered[0];
-    if (primero.role !== 'user' || primero.fromTool) { filtered.shift(); continue; }
-    break;
-  }
+  // Quitar el ultimo turno puede dejar expuesto un functionResponse al principio.
+  while (filtered.length && filtered[0].fromTool) filtered.shift();
   // Gemini 3.x exige la thoughtSignature de cada functionCall. Cuando NO la
   // tenemos (conversacion que venia de Copilot/Azure, o transcript guardado por
   // una version anterior) reconstruir la part desde {name,args} da un 400 en

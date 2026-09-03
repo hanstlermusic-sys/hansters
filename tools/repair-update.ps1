@@ -37,9 +37,12 @@ $antes = VersionInstalada
 Nota "version instalada ahora: $(if($antes){$antes}else{'(no instalada)'})"
 
 Paso 'Trayendo los ultimos cambios'
-$sucio = @(git status --porcelain) | Where-Object { $_.Trim() }
+# Solo los archivos SEGUIDOS por git: las carpetas sin trackear (otros proyectos
+# dentro de la carpeta, restos de builds) no estorban a un pull, y contarlas
+# bloqueaba la actualizacion con un error que no habia forma de resolver.
+$sucio = @(git status --porcelain --untracked-files=no) | Where-Object { $_.Trim() }
 if ($sucio) {
-  Nota "Hay $($sucio.Count) archivo(s) con cambios locales:"
+  Nota "Hay $($sucio.Count) archivo(s) seguidos por git con cambios locales:"
   $sucio | Select-Object -First 10 | ForEach-Object { Nota "  $_" }
   # package-lock.json lo reescribe npm install solo; descartarlo es seguro.
   $soloLock = -not ($sucio | Where-Object { $_ -notmatch 'package-lock\.json$' })
@@ -50,6 +53,8 @@ if ($sucio) {
     Mal 'Guarda o descarta esos cambios antes de continuar (git stash).'
     exit 1
   }
+} else {
+  Nota 'sin cambios locales que estorben'
 }
 $rama = (git rev-parse --abbrev-ref HEAD).Trim()
 git pull --ff-only origin $rama

@@ -156,12 +156,28 @@ t('agrupa los resultados en paralelo en UN solo turno', () => {
   eq(r.contents[2].parts.length, 2, 'functionResponse:');
 });
 
-t('el historial nunca empieza por un turno de model', () => {
+// Verificado contra la API real: Gemini ACEPTA (200) un historial que empieza
+// por 'model'. Descartar ese turno tiraba contexto util -en un historial ya
+// recortado, justo lo que el agente acababa de leer- sin ganar nada.
+t('un turno de model al principio se conserva: la API lo acepta', () => {
   const r = toGeminiAgentContents([
     { role: 'assistant', content: 'te ayudo' },
     { role: 'user', content: 'hola' }
   ]);
-  eq(r.contents, [{ role: 'user', parts: [{ text: 'hola' }] }]);
+  eq(r.contents, [
+    { role: 'model', parts: [{ text: 'te ayudo' }] },
+    { role: 'user', parts: [{ text: 'hola' }] }
+  ]);
+});
+
+t('lo que si se descarta es un functionResponse al principio', () => {
+  const r = toGeminiAgentContents([
+    { role: 'assistant', content: '', tool_calls: [{ id: 'x', function: { name: 'read_file', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'x', content: 'algo' },
+    { role: 'user', content: 'sigue' }
+  ]);
+  ok(!r.contents.length || !r.contents[0].parts.some((p) => p.functionResponse),
+    'empieza por functionResponse: HTTP 400');
 });
 
 t('tolera argumentos JSON corruptos sin reventar', () => {
@@ -255,9 +271,11 @@ t('todo functionResponse va precedido de su functionCall', () => {
   });
 });
 
-t('el historial siempre empieza por un turno user', () => {
+t('el historial nunca empieza por un functionResponse huerfano', () => {
   const out = toGeminiAgentContents(historialRecortado());
-  if (out.contents.length) eq(out.contents[0].role, 'user', 'primer turno');
+  if (!out.contents.length) return;
+  ok(!out.contents[0].parts.some((p) => p.functionResponse),
+    'empieza por una respuesta de herramienta sin su llamada: HTTP 400');
 });
 
 t('un historial que ya es valido no se toca', () => {
