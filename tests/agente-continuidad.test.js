@@ -107,5 +107,106 @@ t('el bucle usa soloAnuncia, no el regex a pelo', () => {
     'el bucle no pasa por la comparacion sin acentos');
 });
 
+console.log('\n--- no se atasca en trabajos largos ---');
+
+// El limite de contexto (AGENT_CTX_MAX_CHARS) solo se aplicaba al GUARDAR la
+// conversacion, nunca mientras el agente trabajaba. Cada paso suma la llamada a
+// la herramienta y su resultado (hasta 12000 caracteres), asi que en un trabajo
+// largo el contexto crecia sin freno: medido, al paso 40 se enviaban 478 KB en
+// cada llamada, 2.4 veces el limite que el propio HanstlerS declara. Por eso los
+// trabajos largos se iban poniendo lentos y acababan atascandose.
+(function () {
+  const vm2 = require('vm');
+  const os = require('os');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = src.indexOf('const AGENT_CTX_MAX_CHARS');
+  const f = src.indexOf('function agentFile(');
+  if (i === -1 || f === -1) throw new Error('no encuentro el recorte de contexto');
+  const ctx = { module: {}, JSON: JSON, Array: Array, Object: Object, String: String,
+                console: console, path: path, os: os, fs: fs };
+  vm2.runInNewContext(src.slice(i, f) +
+    '\nmodule.exports = { msgSize, trimAgentMessages, AGENT_CTX_MAX_CHARS };', ctx);
+  const { msgSize, trimAgentMessages, AGENT_CTX_MAX_CHARS } = ctx.module.exports;
+
+  // Reproduce un trabajo de 40 pasos igual que el bucle real.
+  function trabajoLargo(conRecorte) {
+    const preambleLen = 1;
+    const messages = [{ role: 'system', content: 'x'.repeat(3000) }];
+    const salida = 'S'.repeat(12000);
+    let maximo = 0;
+    for (let p = 1; p <= 40; p++) {
+      if (conRecorte) {
+        let n = 0;
+        for (let k = preambleLen; k < messages.length; k++) n += msgSize(messages[k]);
+        if (n > AGENT_CTX_MAX_CHARS) {
+          const body = trimAgentMessages(messages.slice(preambleLen), AGENT_CTX_MAX_CHARS);
+          if (body.length) { messages.length = preambleLen; body.forEach((m) => messages.push(m)); }
+        }
+      }
+      let n = 0;
+      for (const m of messages) n += msgSize(m);
+      if (n > maximo) maximo = n;
+      messages.push({ role: 'assistant', content: '', tool_calls: [{ id: 'c' + p, function: { name: 'run_command', arguments: '{}' } }] });
+      messages.push({ role: 'tool', tool_call_id: 'c' + p, content: salida });
+    }
+    return maximo;
+  }
+
+  t('sin recortar, un trabajo de 40 pasos se pasa del limite', () => {
+    ok(trabajoLargo(false) > AGENT_CTX_MAX_CHARS * 2,
+      'el escenario ya no reproduce el problema; revisar la prueba');
+  });
+
+  t('recortando entre pasos, el contexto se queda dentro del limite', () => {
+    const pico = trabajoLargo(true);
+    ok(pico <= AGENT_CTX_MAX_CHARS * 1.1,
+      'el contexto llega a ' + Math.round(pico / 1000) + ' KB con un limite de ' +
+      Math.round(AGENT_CTX_MAX_CHARS / 1000) + ' KB');
+  });
+
+  t('el recorte no deja un resultado de herramienta huerfano al frente', () => {
+    const m = [];
+    const salida = 'S'.repeat(12000);
+    for (let p = 1; p <= 40; p++) {
+      m.push({ role: 'assistant', content: '', tool_calls: [{ id: 'c' + p, function: { name: 'r', arguments: '{}' } }] });
+      m.push({ role: 'tool', tool_call_id: 'c' + p, content: salida });
+    }
+    const body = trimAgentMessages(m, AGENT_CTX_MAX_CHARS);
+    ok(body.length > 0, 'el recorte dejo el historial vacio');
+    ok(body[0].role !== 'tool', 'empieza por un resultado huerfano: la API responderia 400');
+  });
+
+  t('el recorte conserva los ultimos turnos, que son los que importan', () => {
+    const m = [];
+    const salida = 'S'.repeat(12000);
+    for (let p = 1; p <= 40; p++) {
+      m.push({ role: 'assistant', content: '', tool_calls: [{ id: 'c' + p, function: { name: 'r', arguments: '{}' } }] });
+      m.push({ role: 'tool', tool_call_id: 'c' + p, content: salida });
+    }
+    const body = trimAgentMessages(m, AGENT_CTX_MAX_CHARS);
+    const ultimo = body[body.length - 1];
+    ok(ultimo && ultimo.tool_call_id === 'c40',
+      'se perdio el ultimo paso: el agente no sabria por donde iba');
+  });
+})();
+
+t('el bucle recorta antes de cada llamada al modelo, no solo al guardar', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  ok(src.indexOf('function recortarSiHaceFalta') !== -1 ||
+     src.indexOf('const recortarSiHaceFalta') !== -1, 'no existe el recorte entre pasos');
+  const i = src.indexOf('brain.chatTools(messages, AGENT_TOOLS');
+  ok(i !== -1, 'no encuentro la llamada al modelo');
+  ok(src.slice(i - 300, i).indexOf('recortarSiHaceFalta()') !== -1,
+    'se llama al modelo sin recortar: el contexto crecera sin freno');
+});
+
+t('el recorte nunca vacia el historial', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const i = src.indexOf('const recortarSiHaceFalta');
+  const trozo = src.slice(i, i + 900);
+  ok(trozo.indexOf('if (!body.length) return;') !== -1,
+    'sin esa guardia el agente podria quedarse sin el turno actual');
+});
+
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);

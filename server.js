@@ -2182,6 +2182,31 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     state.convAgentMessages[convId] = body;
     saveAgentTranscript(convId, body);
   };
+  // El limite de contexto solo se aplicaba al GUARDAR la conversacion, nunca
+  // mientras el agente trabajaba. En un trabajo largo cada paso suma la llamada
+  // y su resultado (hasta 12000 caracteres), asi que el contexto crecia sin
+  // freno: medido, al paso 40 se enviaban 490 KB en cada llamada, 2.5 veces el
+  // limite que el propio HanstlerS declara. De ahi que los trabajos largos se
+  // fueran poniendo lentos y acabaran atascandose.
+  //
+  // Ahora se recorta tambien entre pasos, por el principio y respetando el
+  // preambulo. trimAgentMessages ya evita dejar un resultado de herramienta
+  // huerfano al frente, que daria error 400.
+  let recortes = 0;
+  const recortarSiHaceFalta = () => {
+    let total = 0;
+    for (let i = preambleLen; i < messages.length; i++) total += msgSize(messages[i]);
+    if (total <= AGENT_CTX_MAX_CHARS) return;
+    const body = trimAgentMessages(messages.slice(preambleLen), AGENT_CTX_MAX_CHARS);
+    // Nunca dejar el cuerpo vacio: sin el ultimo turno el modelo no sabe que hacer.
+    if (!body.length) return;
+    messages.length = preambleLen;
+    for (let i = 0; i < body.length; i++) messages.push(body[i]);
+    recortes++;
+    if (recortes === 1) {
+      send('chunk', '\n🧹 (la conversación es larga: se recorta el contexto más antiguo para no atascarse)\n');
+    }
+  };
   const OP_DELAY_MS = 4000;
   const iconOf = (n) => ({ list_dir: '📂', read_file: '📄', write_file: '✍️', apply_patch: '🩹', search_in_files: '🔎', delete_file: '🗑️', move_file: '📦', run_command: '⚙️', open_repo: '📥' }[n] || '🔧');
   // Ejecuta una herramienta, pidiendo confirmación si es peligrosa.
@@ -2277,6 +2302,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
     }
     // Indicador vivo mientras Azure "piensa" (evita sensación de colgado).
     send('status', 'Pensando… (paso ' + steps + '/' + MAX_STEPS + ')');
+    recortarSiHaceFalta();
     brain.chatTools(messages, AGENT_TOOLS, (delta) => send('chunk', delta), (err, msg) => {
       if (aborted) { send('status', ''); saveTranscript(); return onDone(1); }
       if (err) { send('status', ''); send('error', brain.label + ': ' + err.message); return onDone(1); }
