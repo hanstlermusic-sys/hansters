@@ -1322,8 +1322,13 @@ function execAgentTool(name, args, cb) {
       if (!/^https?:\/\//i.test(url)) return cb('Error: URL inválida (debe empezar con http:// o https://)', 'error');
       // Usar el shell de Windows para abrir el navegador predeterminado.
       const child = spawn('cmd.exe', ['/d', '/s', '/c', 'start', '', url], { windowsHide: true });
-      child.on('close', () => cb('Abierto en el navegador: ' + url, 'abierto'));
-      child.on('error', e => cb('Error: ' + e.message, 'error'));
+      // Un spawn fallido emite 'error' Y DESPUES 'close': sin esta guardia cb() se
+      // llamaria dos veces y el bucle del agente perderia el resultado de otra
+      // herramienta de la misma tanda (ver comentario en loop()).
+      let finished = false;
+      const done = (txt, s) => { if (finished) return; finished = true; cb(txt, s); };
+      child.on('close', () => done('Abierto en el navegador: ' + url, 'abierto'));
+      child.on('error', e => done('Error: ' + e.message, 'error'));
       return;
     }
     if (name === 'git_commit') {
@@ -1354,8 +1359,10 @@ function execAgentTool(name, args, cb) {
       const msg = String(args.message || '').replace(/'/g, '').slice(0, 200);
       const ps = `Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(4000, '${title}', '${msg}', [System.Windows.Forms.ToolTipIcon]::None); Start-Sleep 5; $n.Visible = $false`;
       const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true });
-      child.on('close', () => cb('Notificación enviada: ' + title, 'notificado'));
-      child.on('error', e => cb('Error: ' + e.message, 'error'));
+      let finished = false;
+      const done = (txt, s) => { if (finished) return; finished = true; cb(txt, s); };
+      child.on('close', () => done('Notificación enviada: ' + title, 'notificado'));
+      child.on('error', e => done('Error: ' + e.message, 'error'));
       return;
     }
     if (name === 'open_repo') {
@@ -1599,6 +1606,22 @@ function toGeminiAgentContents(messages) {
   // come immediately after a function call turn". Hay que sanear hasta punto
   // fijo: cada vez que se descarta un turno del inicio, el que queda expuesto
   // se vuelve a validar.
+  while (filtered.length) {
+    const primero = filtered[0];
+    if (primero.role !== 'user' || primero.fromTool) { filtered.shift(); continue; }
+    break;
+  }
+  // Medido contra la API real (gemini-3.8-flash): Gemini TOLERA que el numero de
+  // functionResponse no cuadre con el de functionCall, y tolera respuestas
+  // separadas de su llamada. Solo rechaza dos formas, y las dos se corrigen aqui:
+  //   - que el historial empiece por un functionResponse (lo cubre el bucle de arriba)
+  //   - que TERMINE en un functionCall sin responder -> 400 exigiendo thought_signature
+  // Por eso NO se recortan los descuadres intermedios: seria tirar contexto util.
+  while (filtered.length) {
+    const ultimo = filtered[filtered.length - 1];
+    if (ultimo.role === 'model' && ultimo.hasFnCall) { filtered.pop(); continue; }
+    break;
+  }
   while (filtered.length) {
     const primero = filtered[0];
     if (primero.role !== 'user' || primero.fromTool) { filtered.shift(); continue; }
@@ -2129,17 +2152,29 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
         let pending = msg.tool_calls.length;
         send('status', 'Ejecutando ' + pending + (pending === 1 ? ' acción…' : ' acciones…'));
         const orderedToolResults = new Array(msg.tool_calls.length);
+        const yaRespondio = new Array(msg.tool_calls.length).fill(false);
         msg.tool_calls.forEach((tc, idx) => {
           let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
           const label = (args.path || args.command || '').toString();
           const shortLabel = label.length > 60 ? '…' + label.slice(-58) : label;
           send('chunk', '\n' + iconOf(tc.function.name) + ' ' + tc.function.name + '(' + shortLabel + ') …');
           runToolGated(tc, args, (result, summary) => {
+            // Si una herramienta contesta dos veces (p.ej. un spawn que emite
+            // 'error' y luego 'close'), "pending" bajaria de mas y la tanda se
+            // cerraria dejando huecos: Gemini recibiria menos functionResponse
+            // que functionCall y responderia 400, envenenando la conversacion.
+            if (yaRespondio[idx]) return;
+            yaRespondio[idx] = true;
             send('chunk', ' ✓' + (summary ? ' ' + summary : ''));
             orderedToolResults[idx] = { role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 12000) };
             if (--pending === 0) {
               for (let i = 0; i < orderedToolResults.length; i++) {
-                if (orderedToolResults[i]) messages.push(orderedToolResults[i]);
+                // Toda llamada necesita SU respuesta, aunque la herramienta no
+                // haya devuelto nada: el numero de ambas debe cuadrar siempre.
+                messages.push(orderedToolResults[i] || {
+                  role: 'tool', tool_call_id: msg.tool_calls[i].id,
+                  content: 'Error: la herramienta no devolvió ningún resultado.'
+                });
               }
               send('chunk', '\n');
               loop();

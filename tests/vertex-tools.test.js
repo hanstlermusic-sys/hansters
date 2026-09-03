@@ -93,7 +93,8 @@ t('los system van a systemInstruction, no a contents', () => {
 t('assistant con tool_calls -> turno model con functionCall', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'suma' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'run_command', arguments: '{"command":"ls"}' } }] }
+    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'run_command', arguments: '{"command":"ls"}' } }] },
+    { role: 'tool', tool_call_id: 'a1', content: 'ok' }
   ]);
   eq(r.contents[1], { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { command: 'ls' } } }] });
 });
@@ -104,7 +105,8 @@ t('reenvia las parts crudas del modelo, conservando thoughtSignature', () => {
   const crudas = [{ functionCall: { name: 'run_command', args: { command: 'ls' }, id: 'call_1' }, thoughtSignature: 'FIRMA' }];
   const r = toGeminiAgentContents([
     { role: 'user', content: 'x' },
-    { role: 'assistant', content: null, _geminiParts: crudas, tool_calls: [{ id: 'call_1', _geminiId: 'call_1', type: 'function', function: { name: 'run_command', arguments: '{}' } }] }
+    { role: 'assistant', content: null, _geminiParts: crudas, tool_calls: [{ id: 'call_1', _geminiId: 'call_1', type: 'function', function: { name: 'run_command', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: 'ok' }
   ]);
   eq(r.contents[1], { role: 'model', parts: crudas });
   ok(JSON.stringify(r.contents).indexOf('FIRMA') !== -1, 'se perdio el thoughtSignature');
@@ -156,7 +158,8 @@ t('el historial nunca empieza por un turno de model', () => {
 t('tolera argumentos JSON corruptos sin reventar', () => {
   const r = toGeminiAgentContents([
     { role: 'user', content: 'x' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'f', arguments: '{no es json' } }] }
+    { role: 'assistant', content: null, tool_calls: [{ id: 'a1', type: 'function', function: { name: 'f', arguments: '{no es json' } }] },
+    { role: 'tool', tool_call_id: 'a1', content: 'ok' }
   ]);
   eq(r.contents[1].parts[0].functionCall.args, {});
 });
@@ -271,6 +274,82 @@ t('un historial que ya es valido no se toca', () => {
 t('el recorte no deja el historial vacio si hay turnos utiles', () => {
   const out = toGeminiAgentContents(historialRecortado());
   ok(out.contents.length > 0, 'se descarto todo el historial');
+});
+// ===== lo que Gemini rechaza de verdad (regresion 1.0.8) =====
+// Verificado contra la API real (gemini-3.8-flash), no supuesto: de 10 formas de
+// historial descuadrado, Gemini solo devuelve 400 en dos. Las demas las ACEPTA,
+// asi que recortarlas seria tirar contexto util del agente.
+const CALL_N = (n) => ({
+  role: 'assistant', content: '',
+  tool_calls: Array.from({ length: n }, (_, i) => ({ id: 'c' + i, function: { name: 'read_file', arguments: '{}' } })),
+  _geminiParts: Array.from({ length: n }, (_, i) => ({ functionCall: { name: 'read_file', args: {} }, thoughtSignature: 'S' + i }))
+});
+const RESP_N = (i) => ({ role: 'tool', tool_call_id: 'c' + i, content: 'ok' });
+const hayCall = (t) => t.parts.some((p) => p.functionCall);
+const hayResp = (t) => t.parts.some((p) => p.functionResponse);
+
+t('RECHAZADO por la API: el historial no puede terminar en functionCall sin responder', () => {
+  const c = toGeminiAgentContents([{ role: 'user', content: 'haz algo' }, CALL_N(1)]).contents;
+  ok(!c.length || !hayCall(c[c.length - 1]), 'quedo un functionCall colgando al final: HTTP 400');
+});
+
+t('RECHAZADO por la API: el historial no puede empezar por functionResponse', () => {
+  const c = toGeminiAgentContents([CALL_N(1), RESP_N(0), { role: 'user', content: 'sigue' }]).contents;
+  ok(!c.length || !hayResp(c[0]), 'empieza por functionResponse: HTTP 400');
+});
+
+t('ACEPTADO por la API: faltan respuestas, pero el contexto NO se tira', () => {
+  const c = toGeminiAgentContents([
+    { role: 'user', content: 'x' }, CALL_N(3), RESP_N(0), { role: 'user', content: 'y?' }
+  ]).contents;
+  ok(c.some(hayCall), 'se perdieron las llamadas: Gemini acepta este historial');
+  ok(c.some(hayResp), 'se perdieron las respuestas ya obtenidas');
+});
+
+t('ACEPTADO por la API: sobran respuestas, pero el contexto NO se tira', () => {
+  const c = toGeminiAgentContents([
+    { role: 'user', content: 'x' }, CALL_N(1), RESP_N(0), RESP_N(1), { role: 'user', content: 'y?' }
+  ]).contents;
+  ok(c.some(hayCall) && c.some(hayResp), 'se tiro contexto que la API acepta');
+});
+
+t('un descuadre no se lleva por delante el resto del historial', () => {
+  const c = toGeminiAgentContents([
+    { role: 'user', content: 'primero' }, CALL_N(2), RESP_N(0), RESP_N(1),
+    { role: 'assistant', content: 'listo' },
+    { role: 'user', content: 'segundo' }, CALL_N(3), RESP_N(0),
+    { role: 'user', content: 'tercero' }
+  ]).contents;
+  ok(c.length && c[0].role === 'user', 'el historial ya no empieza por user');
+  ok(c.filter(hayResp).length >= 2, 'se perdieron tandas validas');
+});
+
+// El origen real del descuadre: herramientas cuyo callback se dispara dos veces.
+// Un spawn fallido emite 'error' Y DESPUES 'close'; sin guardia, el bucle del
+// agente baja "pending" de mas y cierra la tanda perdiendo resultados de otras
+// herramientas que aun no habian terminado.
+const srvSrc = require('fs').readFileSync(require('path').join(__dirname, '..', 'server.js'), 'utf8');
+
+t('toda herramienta con spawn protege su callback contra la doble llamada', () => {
+  const inicio = srvSrc.indexOf('function execAgentTool(');
+  const cuerpo = srvSrc.slice(inicio, srvSrc.indexOf('\nfunction ', inicio + 10));
+  const sinGuardia = [];
+  const re = /if \(name === '([a-z_]+)'\) \{([\s\S]*?)\n    \}/g;
+  let m;
+  while ((m = re.exec(cuerpo))) {
+    if (m[2].indexOf('spawn(') === -1) continue;
+    if (m[2].indexOf("child.on('error'") === -1) continue;
+    if (m[2].indexOf('finished') === -1) sinGuardia.push(m[1]);
+  }
+  ok(!sinGuardia.length, 'sin guardia contra doble callback: ' + sinGuardia.join(', '));
+});
+
+t('el bucle del agente ignora la segunda respuesta y rellena los huecos', () => {
+  const i = srvSrc.indexOf('const orderedToolResults = new Array(');
+  const bloque = srvSrc.slice(i, i + 2000);
+  ok(bloque.indexOf('yaRespondio') !== -1, 'no hay guardia de doble respuesta por herramienta');
+  ok(bloque.indexOf('if (orderedToolResults[i]) messages.push') === -1,
+    'sigue saltandose los huecos en vez de rellenarlos');
 });
 console.log('\n=== ' + pass + ' pasaron, ' + fail + ' fallaron ===\n');
 process.exit(fail ? 1 : 0);
