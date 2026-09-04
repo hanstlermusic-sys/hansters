@@ -1,6 +1,6 @@
 {
   "name": "hanstlers",
-  "version": "1.0.20",
+  "version": "1.0.21",
   "description": "HanstlerS - tu asistente personal",
   "main": "electron-main.js",
   "author": "Cesar Zumbado",
@@ -13,7 +13,9 @@
   "build": {
     "appId": "com.hanstler.hanstlers",
     "productName": "HanstlerS",
-    "directories": { "output": "dist-electron" },
+    "directories": {
+      "output": "dist-electron"
+    },
     "files": [
       "electron-main.js",
       "server.js",
