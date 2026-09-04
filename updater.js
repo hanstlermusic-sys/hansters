@@ -395,6 +395,8 @@ async function runUpdate(options, onFinish) {
   job.error = '';
   job.restarting = false;
   job.stashed = null;
+  job.stashRestored = false;
+  job.stashConflict = false;
   job.step = '';
   job.steps = [];
   job.log = [];
@@ -456,6 +458,28 @@ async function runUpdate(options, onFinish) {
             'Esto hay que resolverlo a mano: git log origin/' + branch + '..HEAD');
         }
         throw new Error('git pull fallo. Revisa el log.');
+      }
+
+      // El pull entro. Ahora hay que DEVOLVER lo que se aparto: si no, el
+      // trabajo local se queda en el stash para siempre y desde fuera parece
+      // que se perdio. Paso justo eso con un tema claro a medio hacer: el
+      // boton lo aparto, el pull entro, y el cambio dejo de verse sin que nadie
+      // dijera nada.
+      if (stashed) {
+        setStep('Devolviendo tus cambios locales');
+        const pop = await runCmd('git', ['stash', 'pop'], repo, log);
+        if (pop.code === 0) {
+          stashed = false;
+          job.stashed = null;
+          job.stashRestored = true;
+          pushLog('Tus cambios locales estan de vuelta en su sitio.');
+        } else {
+          // Choca con lo que acaba de llegar. No se toca nada mas: se deja en
+          // el stash y se dice claramente, en vez de perderlo en silencio.
+          job.stashConflict = true;
+          pushLog('Tus cambios locales chocan con lo que acaba de llegar, ' +
+            'asi que siguen guardados. Para recuperarlos: git stash pop');
+        }
       }
 
       // 2. Dependencias, solo si cambiaron
@@ -581,6 +605,8 @@ function status(since) {
     error: job.error,
     restarting: job.restarting,
     stashed: job.stashed || null,
+    stashRestored: !!job.stashRestored,
+    stashConflict: !!job.stashConflict,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     nextCursor: job.log.length,

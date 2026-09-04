@@ -1627,10 +1627,16 @@ document.getElementById('btn-theme')?.addEventListener('click', ()=>{
       const ico = (!last || st.done) ? (st.ok||!last ? '✅' : '❌') : '⏳';
       h += '<div class="upd-step"><span class="ico">'+ico+'</span><span>'+esc(s.name)+'</span></div>';
     });
+    if(st.stashRestored){
+      h += '<div class="upd-good" style="margin-top:12px">📦 Tus cambios locales volvieron a su sitio.</div>';
+    }
     if(st.stashed && st.stashed.length){
       h += '<div class="upd-warn" style="margin-top:12px">📦 Aparté '+st.stashed.length+
            ' archivo(s) con cambios locales: <code>'+esc(st.stashed.slice(0,4).join(', '))+'</code>'+
-           (st.stashed.length>4?' …':'')+'<br>Recupéralos con <code>git stash pop</code> en el repo.</div>';
+           (st.stashed.length>4?' …':'')+'<br>'+
+           (st.stashConflict
+             ? 'Chocan con lo que acaba de llegar, así que siguen guardados. Recupéralos con <code>git stash pop</code> en el repo.'
+             : 'Recupéralos con <code>git stash pop</code> en el repo.')+'</div>';
     }
     if(st.done && st.error){
       h += '<div class="upd-bad" style="margin-top:12px">❌ '+esc(st.error)+'</div>';

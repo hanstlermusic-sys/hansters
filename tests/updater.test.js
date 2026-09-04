@@ -274,8 +274,23 @@ t('si el pull falla, los cambios apartados vuelven a su sitio', () => {
     'el pull falla y el trabajo del usuario se queda en el stash sin avisar');
 });
 
+t('si el pull SI entra, los cambios apartados tambien vuelven', () => {
+  // El bug que borro el tema claro: solo se hacia stash pop en la rama de
+  // error. Con el pull limpio el trabajo se quedaba en el stash y desde la
+  // app parecia que el cambio nunca existio.
+  const i = upSrc.indexOf('throw new Error(\'git pull fallo. Revisa el log.\');');
+  ok(i !== -1, 'no encuentro el final del manejo del pull fallido');
+  const despues = upSrc.slice(i, i + 1200);
+  ok(/stash', 'pop'/.test(despues),
+    'tras un pull correcto no se devuelve el stash: el trabajo local se pierde de vista');
+  ok(/stashConflict/.test(despues),
+    'si el pop choca hay que decirlo, no dejarlo en silencio');
+});
+
 t('el stash se anuncia en pantalla, no solo en el log', () => {
   ok(/stashed: job\.stashed/.test(upSrc), 'status() no expone stashed');
+  ok(/stashRestored/.test(upSrc), 'status() no dice si el trabajo volvio a su sitio');
+  ok(/stashConflict/.test(upSrc), 'status() no dice si el trabajo sigue atrapado');
   ok(/st\.stashed/.test(uiSrc), 'la UI no muestra que se aparto trabajo');
   ok(/stash pop/.test(uiSrc), 'la UI no dice como recuperarlo');
 });
