@@ -1,0 +1,36 @@
+name: Mirror to enterprise
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      MIRROR_TARGET_REPO: ms-copilot/hansters
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate mirror secret
+        run: |
+          if [ -z "${{ secrets.MIRROR_PUSH_TOKEN }}" ]; then
+            echo "::error::Missing secret MIRROR_PUSH_TOKEN"
+            exit 1
+          fi
+
+      - name: Configure mirror remote
+        run: |
+          git remote remove mirroring || true
+          git remote add mirroring "https://x-access-token:${{ secrets.MIRROR_PUSH_TOKEN }}@github.com/${{ env.MIRROR_TARGET_REPO }}.git"
+
+      - name: Push branches and tags to mirror
+        run: |
+          git push mirroring --prune "+refs/heads/*:refs/heads/*"
+          git push mirroring --prune "+refs/tags/*:refs/tags/*"

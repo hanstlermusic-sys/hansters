@@ -31,6 +31,29 @@ Ahora HanstlerS acepta configuracion por **API key** (sin depender de `gcloud au
 Con eso, los modelos `vertex-auto`, `vertex-gemini-pro` y `vertex-gemini-flash` quedan operativos.
 `vertex-claude-opus-5` sigue requiriendo GCP + ADC (`gcloud auth application-default login`).
 
+## Mirroring a Enterprise (EMU compatible)
+
+Para trabajar con una cuenta EMU (`cezumbad_microsoft`) sin perder el repo fuente
+personal, este repo incluye el workflow:
+
+- `.github/workflows/mirror-enterprise.yml`
+
+Este flujo empuja `branches` y `tags` al remoto enterprise usando una conexion
+llamada `mirroring`.
+
+1. Crea el repo destino en la organizacion enterprise (ejemplo:
+   `ms-copilot/hansters`).
+2. Agrega el secret `MIRROR_PUSH_TOKEN` en este repo fuente (PAT con permiso de
+   push al repo enterprise).
+3. Verifica la conexion local:
+
+```powershell
+git remote add mirroring https://github.com/ms-copilot/hansters.git
+git remote -v
+```
+
+Cuando hagas push a `main`, el workflow sincroniza automaticamente al mirror.
+
 ### Vertex con herramientas (modo agente)
 
 Gemini ya no solo conversa: **ejecuta**. Cuando la peticion es una tarea de
