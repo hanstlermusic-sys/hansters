@@ -17,9 +17,9 @@ jobs:
       - name: Check mirror configuration
         id: mirror_config
         env:
-          MIRROR_PUSH_TOKEN: ${{ secrets.MIRROR_PUSH_TOKEN }}
+          MIRROR_SSH_PRIVATE_KEY: ${{ secrets.MIRROR_SSH_PRIVATE_KEY }}
         run: |
-          if [ -n "$MIRROR_PUSH_TOKEN" ]; then
+          if [ -n "$MIRROR_SSH_PRIVATE_KEY" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -30,11 +30,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Start SSH agent
+        if: ${{ steps.mirror_config.outputs.enabled == 'true' }}
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.MIRROR_SSH_PRIVATE_KEY }}
+
       - name: Configure mirror remote
         if: ${{ steps.mirror_config.outputs.enabled == 'true' }}
         run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
           git remote remove mirroring || true
-          git remote add mirroring "https://x-access-token:${{ secrets.MIRROR_PUSH_TOKEN }}@github.com/${{ env.MIRROR_TARGET_REPO }}.git"
+          git remote add mirroring "git@github.com:${{ env.MIRROR_TARGET_REPO }}.git"
 
       - name: Push branches and tags to mirror
         if: ${{ steps.mirror_config.outputs.enabled == 'true' }}
@@ -45,4 +53,4 @@ jobs:
       - name: Mirror not configured
         if: ${{ steps.mirror_config.outputs.enabled != 'true' }}
         run: |
-          echo "Mirror skipped: configure MIRROR_PUSH_TOKEN to enable enterprise mirroring."
+          echo "Mirror skipped: configure MIRROR_SSH_PRIVATE_KEY to enable enterprise mirroring."

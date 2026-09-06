@@ -43,8 +43,8 @@ llamada `mirroring`.
 
 1. Crea el repo destino en un namespace compatible con tu usuario EMU
    (ejemplo activo: `cezumbad_microsoft/hansters`).
-2. Agrega el secret `MIRROR_PUSH_TOKEN` en este repo fuente (PAT con permiso de
-   push al repo enterprise).
+2. Agrega el secret `MIRROR_SSH_PRIVATE_KEY` en este repo fuente (llave privada
+   SSH con permiso de escritura en el repo mirror).
 3. Verifica la conexion local:
 
 ```powershell
