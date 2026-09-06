@@ -2644,6 +2644,62 @@ function ghSwitchAccount(login, cb) {
     cb(null, { user, output: out });
   });
 }
+function copilotEnvForActiveGh(cb) {
+  const ghBin = resolveGhBinary();
+  execFile(ghBin, ['auth', 'token', '--hostname', 'github.com'], { windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    const token = String(stdout || '').trim();
+    if (err || !token) return cb(process.env);
+    cb(Object.assign({}, process.env, { COPILOT_GITHUB_TOKEN: token }));
+  });
+}
+// El CLI de Copilot IGNORA COPILOT_GITHUB_TOKEN si ya hay credencial guardada,
+// asi que la unica forma real de cambiar de suscripcion es reescribirla con
+// `copilot login --with-token` usando el token de la cuenta elegida.
+const COPILOT_ACCOUNT_FILE = path.join(os.homedir(), '.hanstlers', 'copilot-account.json');
+function readCopilotAccount() {
+  try { return String(JSON.parse(fs.readFileSync(COPILOT_ACCOUNT_FILE, 'utf8')).user || ''); } catch (e) { return ''; }
+}
+function writeCopilotAccount(user) {
+  try {
+    fs.mkdirSync(path.dirname(COPILOT_ACCOUNT_FILE), { recursive: true });
+    fs.writeFileSync(COPILOT_ACCOUNT_FILE, JSON.stringify({ user: String(user || ''), at: Date.now() }));
+  } catch (e) {}
+}
+function copilotLoginAs(login, cb) {
+  const user = String(login || '').trim();
+  if (!user) return cb(new Error('cuenta requerida'));
+  const ghBin = resolveGhBinary();
+  execFile(ghBin, ['auth', 'token', '--hostname', 'github.com', '--user', user], { windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    const token = String(stdout || '').trim();
+    if (err || !token) return cb(new Error('no se pudo leer el token de ' + user));
+    const bin = resolveCopilotBinary();
+    const loader = resolveLoader();
+    const args = ['login', '--with-token'];
+    let child;
+    try {
+      if (bin) child = spawn(bin, args, { env: process.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      else if (loader) child = spawn(process.execPath, [loader].concat(args), { env: nodeEnv(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      else child = spawn(COPILOT_CMD, args, { env: process.env, windowsHide: true, shell: process.platform === 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) { return cb(e); }
+    let out = '';
+    let done = false;
+    const finish = (e) => {
+      if (done) return; done = true;
+      try { clearTimeout(timer); } catch (_) {}
+      if (e) return cb(e);
+      const m = /Signed in successfully as\s+([^\s.]+)/i.exec(stripAnsi(out));
+      if (!m) return cb(new Error(stripAnsi(out).trim().slice(0, 200) || 'Copilot no confirmó el inicio de sesión'));
+      writeCopilotAccount(m[1]);
+      cb(null, { user: m[1] });
+    };
+    const timer = setTimeout(() => { try { child.kill(); } catch (_) {} finish(new Error('tiempo agotado al iniciar sesión en Copilot')); }, 60000);
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.stderr.on('data', (d) => { out += d.toString(); });
+    child.on('error', (e) => finish(e));
+    child.on('close', () => finish(null));
+    try { child.stdin.write(token + '\n'); child.stdin.end(); } catch (e) { finish(e); }
+  });
+}
 function startGhAuth(cb) {
   const ghBin = resolveGhBinary();
   try {
@@ -3729,7 +3785,9 @@ function handleChat(req, res, body) {
     if (feats.proResponseMode && !isXCoreReq && !isAzureFamily && !looksLikeExecutionTask(message)) {
       finalMessage = wrapProResponsePrompt(finalMessage);
     }
-    detectFlags(() => handleChatInner(req, res, finalMessage, sessionId, convId, reqModel, memNote, convHistoryArr, convHistorySummary, visionImages, routePick, reqCwd, statelessMode));
+    detectFlags(() => copilotEnvForActiveGh((copilotEnv) => {
+      handleChatInner(req, res, finalMessage, sessionId, convId, reqModel, memNote, convHistoryArr, convHistorySummary, visionImages, routePick, reqCwd, statelessMode, copilotEnv);
+    }));
   };
   // Inyectar contexto del proyecto solo en el primer turno de cada conversación.
   if (firstTurn && !isXCoreReq) {
@@ -3743,7 +3801,7 @@ function handleChat(req, res, body) {
   }
 }
 
-function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory, convHistorySummary, visionImages, routePick, runCwd, statelessMode) {
+function handleChatInner(req, res, message, sessionId, convId, model, memNote, convHistory, convHistorySummary, visionImages, routePick, runCwd, statelessMode, copilotEnv) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -3889,20 +3947,21 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
 
   function launchRaw(withModel, opts) {
     const a = buildArgs(message, opts, withModel);
+    const authEnv = copilotEnv || process.env;
     // PREFERIDO: ejecutar el binario nativo copilot.exe DIRECTO y OCULTO (sin ventana negra).
     const bin = resolveCopilotBinary();
     if (bin) {
-      return spawn(bin, a, { cwd: useCwd, env: process.env, windowsHide: true });
+      return spawn(bin, a, { cwd: useCwd, env: authEnv, windowsHide: true });
     }
     const loader = resolveLoader();
     if (loader) {
       // Respaldo: Electron ejecuta el loader como Node (ELECTRON_RUN_AS_NODE) — oculto.
-      return spawn(process.execPath, [loader].concat(a), { cwd: useCwd, env: nodeEnv(), windowsHide: true });
+      return spawn(process.execPath, [loader].concat(a), { cwd: useCwd, env: Object.assign({}, authEnv, { ELECTRON_RUN_AS_NODE: '1' }), windowsHide: true });
     }
     if (process.platform === 'win32') {
-      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: useCwd, env: process.env, windowsHide: true });
+      return spawn('cmd.exe', ['/d', '/s', '/c', COPILOT_CMD].concat(a), { cwd: useCwd, env: authEnv, windowsHide: true });
     }
-    return spawn(COPILOT_CMD, a, { cwd: useCwd, env: process.env, windowsHide: true });
+    return spawn(COPILOT_CMD, a, { cwd: useCwd, env: authEnv, windowsHide: true });
   }
 
   function attempt(withModel, opts, isRetry) {
@@ -4280,9 +4339,23 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && reqPath === '/api/gh/auth/switch') {
     const body = await readBody(req);
     return ghSwitchAccount(body && body.user, (err, r) => {
-      res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(err ? { ok: false, error: err.message } : { ok: true, user: r.user }));
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+      // Reautenticar el CLI de Copilot: sin esto seguiria facturando a la cuenta anterior.
+      return copilotLoginAs(r.user, (cErr, cRes) => {
+        state.convSessions = {};
+        res.writeHead(cErr ? 500 : 200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(cErr
+          ? { ok: false, error: 'Cuenta de GitHub cambiada, pero Copilot no: ' + cErr.message }
+          : { ok: true, user: r.user, copilotUser: cRes.user }));
+      });
     });
+  }
+  if (req.method === 'GET' && reqPath === '/api/gh/auth/copilot') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, user: readCopilotAccount() }));
   }
   if (req.method === 'POST' && reqPath === '/api/gh/auth/start') {
     return startGhAuth((err) => {

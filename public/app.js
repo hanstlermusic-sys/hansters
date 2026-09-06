@@ -250,7 +250,7 @@ function updateRollingSummary(c, userMsg, assistantMsg){
 }
 
 function getConv(id){
-  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, model:null, queue:[], busy:false, aborts:new Set(), live:null, xcore:{ tracks:[], activeTrackId:null, lastPos:0 }, rollupSummary:'', rollupTurns:0 };
+  if(!convData[id]) convData[id] = { title:'Nueva conversación', messages:[], session:null, githubAccount:'', model:null, queue:[], busy:false, aborts:new Set(), live:null, xcore:{ tracks:[], activeTrackId:null, lastPos:0 }, rollupSummary:'', rollupTurns:0 };
   ensureConvMeta(convData[id]);
   ensureXcoreState(convData[id]);
   return convData[id];
@@ -266,7 +266,7 @@ function persistConv(id){
   ensureXcoreState(c);
   ensureConvMeta(c);
   fetch('/api/conv/save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session, model:c.model, xcore:c.xcore, rollupSummary:c.rollupSummary, rollupTurns:c.rollupTurns })})
+    body: JSON.stringify({ id, title:c.title, messages:c.messages, session:c.session, githubAccount:c.githubAccount||'', model:c.model, xcore:c.xcore, rollupSummary:c.rollupSummary, rollupTurns:c.rollupTurns })})
     .then(()=>loadConvList()).catch(()=>{});
 }
 
@@ -288,12 +288,14 @@ function renderActive(){
 async function loadConvList(){
   if(sidebarMode !== 'conv') return;
   try{
+    if(!Array.isArray(repoAuth.ghAccounts)) await refreshRepoAuth();
     const r = await fetch('/api/conv/list'); const j = await r.json();
     const box = document.getElementById('conv-list'); box.innerHTML='';
     const q = (document.getElementById('conv-search')?.value||'').trim().toLowerCase();
     const allItems = (j.items||[]);
     const shownItems = allItems.filter(it=> !q || (it.title||'').toLowerCase().includes(q));
     renderConvPanelCard(box, allItems.length, shownItems.length);
+    renderRepoAuthCard(box, true);
     shownItems.forEach(it=>{
       const busy = convData[it.id] && convData[it.id].busy;
       const model = (convData[it.id] && convData[it.id].model) ? String(convData[it.id].model) : 'auto';
@@ -340,7 +342,7 @@ async function openConv(id){
     if(!convData[id]){
       const r = await fetch('/api/conv/get?id='+encodeURIComponent(id)); const c = await r.json();
       if(!c || c.error) return;
-      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, model:c.model||null, queue:[], busy:false, aborts:new Set(), xcore:c.xcore||{ tracks:[], activeTrackId:null, lastPos:0 }, rollupSummary: typeof c.rollupSummary==='string' ? c.rollupSummary : '', rollupTurns: Number(c.rollupTurns||0) };
+      convData[id] = { title:c.title||'Conversación', messages:c.messages||[], session:c.session||null, githubAccount:String(c.githubAccount||''), model:c.model||null, queue:[], busy:false, aborts:new Set(), xcore:c.xcore||{ tracks:[], activeTrackId:null, lastPos:0 }, rollupSummary: typeof c.rollupSummary==='string' ? c.rollupSummary : '', rollupTurns: Number(c.rollupTurns||0) };
       ensureConvMeta(convData[id]);
     }
     activeId = id;
@@ -460,20 +462,31 @@ async function refreshRepoAuth(){
     const aj = await ar.json();
     repoAuth.ghAccounts = Array.isArray(aj && aj.accounts) ? aj.accounts : [];
   }catch(e){ repoAuth.ghAccounts = []; }
+  try{
+    const cr = await fetch('/api/gh/auth/copilot');
+    const cj = await cr.json();
+    repoAuth.copilotUser = String((cj && cj.user) || '');
+  }catch(e){ repoAuth.copilotUser = ''; }
   return repoAuth;
 }
-function renderRepoAuthCard(box){
+function renderRepoAuthCard(box, forConversations){
   const card = document.createElement('div');
   card.className = 'repo-auth';
   const name = repoAuth.user ? (repoAuth.user.name || repoAuth.user.login || '') : '';
   const ghName = repoAuth.ghUser ? repoAuth.ghUser : 'gh local';
-  const shownName = name || ghName;
+  const shownName = forConversations ? (ghName || name) : (name || ghName);
   const login = repoAuth.ok
     ? ('Conectado: <b>' + esc(shownName) + '</b>')
     : (repoAuth.ghLogged ? ('Conectado por CLI: <b>' + esc(ghName) + '</b>') : 'Sin sesión de GitHub');
   const note = repoAuth.enabled
     ? 'Puedes usar OAuth o GitHub CLI para cargar repos remotos.'
     : 'OAuth no está configurado. Usa GitHub CLI (botón abajo).';
+  const copilotUser = String(repoAuth.copilotUser || '');
+  const copilotNote = forConversations
+    ? '<div class="repo-auth-note">' + (copilotUser
+        ? ('Copilot factura a <b>' + esc(copilotUser) + '</b>.' + (copilotUser !== ghName && repoAuth.ghLogged ? ' Pulsa la cuenta que quieras para cambiarlo.' : ''))
+        : 'Elige una cuenta abajo para fijar la suscripción de Copilot del chat.') + '</div>'
+    : '';
   const btnLogin = repoAuth.enabled && !repoAuth.ok ? '<button type="button" data-repo-login>Iniciar sesión web</button>' : '';
   const btnGhLogin = (!repoAuth.ok && !repoAuth.ghLogged) ? '<button type="button" data-gh-login>Login con GitHub CLI</button>' : '';
   const btnLogout = repoAuth.enabled && repoAuth.ok ? '<button type="button" data-repo-logout>Cerrar sesión</button>' : '';
@@ -496,6 +509,7 @@ function renderRepoAuthCard(box){
     '<div class="repo-auth-title">GitHub</div>' +
     '<div class="repo-auth-status">' + login + '</div>' +
     '<div class="repo-auth-note">' + note + '</div>' +
+    copilotNote +
     switchRow +
     '<div class="repo-auth-sep"></div>' +
     '<div class="repo-auth-actions">' +
@@ -603,7 +617,7 @@ async function loadRepoList(){
     box.appendChild(el);
   });
 }
-document.getElementById('repo-list')?.addEventListener('click', async (e)=>{
+document.getElementById('sidebar')?.addEventListener('click', async (e)=>{
   const t = e.target;
   if(!(t instanceof Element)) return;
   if(t.closest('[data-repo-login]')){
@@ -623,19 +637,27 @@ document.getElementById('repo-list')?.addEventListener('click', async (e)=>{
   if(swBtn){
     const user = swBtn.getAttribute('data-gh-switch') || '';
     swBtn.disabled = true;
+    showMemoryChip('Cambiando la suscripción de Copilot a ' + user + '…');
     try{
       const r = await fetch('/api/gh/auth/switch', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ user })
       });
       const j = await r.json();
-      if(j && j.ok) showMemoryChip('Cuenta de GitHub activa: ' + user);
+      if(j && j.ok){
+        const acct = String(j.copilotUser || user);
+        Object.values(convData).forEach((c)=>{
+          if(c && String(c.githubAccount||'') !== acct) c.session = null;
+          if(c) c.githubAccount = acct;
+        });
+        showMemoryChip('Copilot ahora factura a ' + acct + '.');
+      }
       else showMemoryChip('No se pudo cambiar: ' + ((j && j.error) || 'error'));
     }catch(_){ showMemoryChip('No se pudo cambiar de cuenta.'); }
     reposLoadError = '';
     await refreshRepoAuth();
-    await refreshReposData();
-    loadRepoList();
+    if(sidebarMode === 'repo') await refreshReposData();
+    renderSidebarList();
     return;
   }
   if(t.closest('[data-repo-logout]')){
@@ -855,6 +877,11 @@ async function runOne(id, msg, images, files){
   const compactCtx = stateless ? { history: [], historySummary: '' } : buildCompactHistory(c, botIdx);
   const history = compactCtx.history;
   const historySummary = compactCtx.historySummary;
+  const githubAccount = String(repoAuth.ghUser || '');
+  if(githubAccount && String(c.githubAccount || '') !== githubAccount){
+    c.session = null;
+    c.githubAccount = githubAccount;
+  }
   try{
     const xcore = xcoreContextForChat(c);
     const resp = await fetch('/api/chat', {
@@ -865,6 +892,7 @@ async function runOne(id, msg, images, files){
         images: images||[],
         files: files||[],
         sessionId: stateless ? '' : (c.session || ''),
+        githubAccount: githubAccount,
         convId: stateless ? '' : id,
         model: c.model || '',
         history: history,

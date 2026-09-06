@@ -1,14 +1,15 @@
 {
   "name": "hanstlers",
-  "version": "1.0.22",
+  "version": "1.0.23",
   "description": "HanstlerS - tu asistente personal",
   "main": "electron-main.js",
   "author": "Cesar Zumbado",
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win nsis",
-    "test": "node tests/context.test.js && node tests/vertex-tools.test.js && node tests/repo-open.test.js && node tests/updater.test.js && node tests/vertex-models.test.js && node tests/model-watch.test.js && node tests/ask-cli.test.js && node tests/gemini-backoff.test.js && node tests/agente-continuidad.test.js",
-    "test:e2e": "node tests/e2e-context.js"
+    "test": "node tests/context.test.js && node tests/vertex-tools.test.js && node tests/repo-open.test.js && node tests/updater.test.js && node tests/vertex-models.test.js && node tests/model-watch.test.js && node tests/ask-cli.test.js && node tests/gemini-backoff.test.js && node tests/agente-continuidad.test.js && node tests/copilot-account.test.js && node tests/conv-auth-card.test.js",
+    "test:e2e": "node tests/e2e-context.js",
+    "test:cuenta": "node tests/e2e-cuenta-copilot.js"
   },
   "build": {
     "appId": "com.hanstler.hanstlers",
