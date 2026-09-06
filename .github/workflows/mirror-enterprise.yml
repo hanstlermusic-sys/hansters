@@ -9,30 +9,40 @@ permissions:
   contents: read
 
 jobs:
-  mirror-disabled:
-    if: ${{ secrets.MIRROR_PUSH_TOKEN == '' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Mirror not configured
-        run: |
-          echo "Mirror skipped: configure MIRROR_PUSH_TOKEN to enable enterprise mirroring."
-
   mirror:
-    if: ${{ secrets.MIRROR_PUSH_TOKEN != '' }}
     runs-on: ubuntu-latest
     env:
       MIRROR_TARGET_REPO: cezumbad_microsoft/hansters
     steps:
+      - name: Check mirror configuration
+        id: mirror_config
+        env:
+          MIRROR_PUSH_TOKEN: ${{ secrets.MIRROR_PUSH_TOKEN }}
+        run: |
+          if [ -n "$MIRROR_PUSH_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: ${{ steps.mirror_config.outputs.enabled == 'true' }}
         with:
           fetch-depth: 0
 
       - name: Configure mirror remote
+        if: ${{ steps.mirror_config.outputs.enabled == 'true' }}
         run: |
           git remote remove mirroring || true
           git remote add mirroring "https://x-access-token:${{ secrets.MIRROR_PUSH_TOKEN }}@github.com/${{ env.MIRROR_TARGET_REPO }}.git"
 
       - name: Push branches and tags to mirror
+        if: ${{ steps.mirror_config.outputs.enabled == 'true' }}
         run: |
           git push mirroring --prune "+refs/heads/*:refs/heads/*"
           git push mirroring --prune "+refs/tags/*:refs/tags/*"
+
+      - name: Mirror not configured
+        if: ${{ steps.mirror_config.outputs.enabled != 'true' }}
+        run: |
+          echo "Mirror skipped: configure MIRROR_PUSH_TOKEN to enable enterprise mirroring."
