@@ -21,7 +21,7 @@ jobs:
     if: ${{ secrets.MIRROR_PUSH_TOKEN != '' }}
     runs-on: ubuntu-latest
     env:
-      MIRROR_TARGET_REPO: ms-copilot/hansters
+      MIRROR_TARGET_REPO: cezumbad_microsoft/hansters
     steps:
       - uses: actions/checkout@v4
         with:

@@ -41,14 +41,14 @@ personal, este repo incluye el workflow:
 Este flujo empuja `branches` y `tags` al remoto enterprise usando una conexion
 llamada `mirroring`.
 
-1. Crea el repo destino en la organizacion enterprise (ejemplo:
-   `ms-copilot/hansters`).
+1. Crea el repo destino en un namespace compatible con tu usuario EMU
+   (ejemplo activo: `cezumbad_microsoft/hansters`).
 2. Agrega el secret `MIRROR_PUSH_TOKEN` en este repo fuente (PAT con permiso de
    push al repo enterprise).
 3. Verifica la conexion local:
 
 ```powershell
-git remote add mirroring https://github.com/ms-copilot/hansters.git
+git remote add mirroring https://github.com/cezumbad_microsoft/hansters.git
 git remote -v
 ```
 
