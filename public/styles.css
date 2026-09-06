@@ -1,4 +1,4 @@
-* { box-sizing: border-box; margin: 0; padding: 0; }
+﻿* { box-sizing: border-box; margin: 0; padding: 0; }
 :root{
   --bg:#131417; --panel:#1c1e24; --neon:#1a73e8; --neon2:#8ab4f8;
   --text:#e8eaed; --muted:#9aa0a6; --border:#2e323c; --user:#1a73e8; --bot:#1c1e2400;
@@ -87,12 +87,14 @@ body{
   background:rgba(74,42,158,.25); border:1px solid #7c4dff; padding:4px 10px; border-radius:9px;
   pointer-events:none; letter-spacing:.2px; font-weight:500; white-space:nowrap;
   box-shadow:0 0 8px rgba(124,77,255,.25);
+  min-width:0; max-width:240px; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;
 }
 #usage-meter-google{
   font-size:12.5px; color:#3a2f00;
   background:rgba(255,193,7,.85); border:1px solid #ffb300; padding:4px 10px; border-radius:9px;
   pointer-events:none; letter-spacing:.2px; font-weight:600; white-space:nowrap;
   box-shadow:0 0 8px rgba(255,179,0,.35);
+  min-width:0; max-width:220px; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;
 }
 #mainpane{ flex:1; display:flex; flex-direction:column; min-width:0; height:100vh; position:relative; z-index:20; }
 #btn-toggle{ background:#1a1a2a; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:7px 10px; font-size:14px; cursor:pointer; }
@@ -101,8 +103,10 @@ body{
   display:flex; align-items:center; gap:14px; padding:10px 16px;
   background:linear-gradient(90deg,#14141f,#0e0e18); border-bottom:1px solid var(--border);
   position:relative; z-index:40;
+  flex-wrap:nowrap; min-width:0; overflow:hidden;
 }
-.brand{display:flex; align-items:center; gap:10px;}
+#btn-toggle{ flex-shrink:0; }
+.brand{display:flex; align-items:center; gap:10px; flex-shrink:0; min-width:0;}
 .logo{
   width:36px;height:36px;display:grid;place-items:center;font-weight:800;font-size:19px;color:#fff;
   border-radius:10px;background:linear-gradient(135deg,#4285f4,var(--neon2));
@@ -112,13 +116,14 @@ body{
 .brand-text strong{font-size:15px;letter-spacing:.3px;}
 .brand-text small{color:var(--muted);font-size:11px;}
 .cwd{
-  flex:1;min-width:0;max-width:280px;font-size:12px;color:var(--muted);background:#0c0c16;border:1px solid var(--border);
+  flex:1 1 90px;min-width:0;max-width:280px;font-size:12px;color:var(--muted);background:#0c0c16;border:1px solid var(--border);
   border-radius:8px;padding:7px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-.actions{display:flex;gap:6px;align-items:center;flex-shrink:0;}
+.actions{display:flex;gap:6px;align-items:center;flex:0 1 auto;min-width:0;margin-left:auto;}
 #topbar button{
   background:#1a1a2a;color:var(--text);border:1px solid var(--border);border-radius:8px;
   padding:7px 12px;font-size:13px;cursor:pointer;transition:all .15s;
+  flex-shrink:0;
 }
 #topbar button:hover{border-color:var(--neon2);box-shadow:0 0 10px rgba(138,180,248,.35);}
 .icon-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;color:#c8c8dc;padding:7px 9px !important;}
@@ -611,4 +616,32 @@ body[data-theme="light"] #btn-update .dot{ background:#12703f; box-shadow:none; 
 #model-watch button[disabled]{ opacity:.5; cursor:default; }
 #model-watch label.mw-auto{
   margin-left:auto; display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; cursor:pointer;
+}
+
+/* --- Topbar responsivo: evita desbordes y botones cortados --- */
+@media (max-width: 1500px){
+  #topbar{ gap:10px; }
+  #usage-meter{ max-width:190px; }
+  #usage-meter-google{ max-width:170px; }
+}
+@media (max-width: 1320px){
+  .brand-text{ display:none; }
+  .cwd{ max-width:180px; }
+  #usage-meter{ max-width:210px; font-size:11.5px; padding:4px 8px; }
+  #usage-meter-google{ max-width:180px; font-size:11.5px; padding:4px 8px; }
+}
+@media (max-width: 1150px){
+  #topbar{ gap:8px; padding:10px 12px; }
+  .icon-btn.wide span{ display:none; }
+  .icon-btn.wide{ padding:7px 9px !important; }
+  #topbar button{ padding:7px 9px; }
+  #usage-meter{ max-width:185px; font-size:11px; }
+  #usage-meter-google{ max-width:150px; font-size:11px; }
+}
+@media (max-width: 980px){
+  .cwd{ display:none; }
+  #usage-meter-google{ display:none; }
+}
+@media (max-width: 820px){
+  #usage-meter{ display:none; }
 }
