@@ -9,7 +9,16 @@ permissions:
   contents: read
 
 jobs:
+  mirror-disabled:
+    if: ${{ secrets.MIRROR_PUSH_TOKEN == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror not configured
+        run: |
+          echo "Mirror skipped: configure MIRROR_PUSH_TOKEN to enable enterprise mirroring."
+
   mirror:
+    if: ${{ secrets.MIRROR_PUSH_TOKEN != '' }}
     runs-on: ubuntu-latest
     env:
       MIRROR_TARGET_REPO: ms-copilot/hansters
@@ -17,13 +26,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Validate mirror secret
-        run: |
-          if [ -z "${{ secrets.MIRROR_PUSH_TOKEN }}" ]; then
-            echo "::error::Missing secret MIRROR_PUSH_TOKEN"
-            exit 1
-          fi
 
       - name: Configure mirror remote
         run: |
