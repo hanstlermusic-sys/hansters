@@ -2870,23 +2870,74 @@ function looksLikeExecutionTask(text) {
 function isXtudioMentioned(text) {
   return /\b(xtudio(?:-?1)?|xstudio(?:-?1)?|dj[-\s]?set[-\s]?studio|main_qt\.py)\b/i.test(String(text || ''));
 }
+// Solo una orden corta y directa ("abre Xtudio-1") debe activar el lanzador.
+// Un prompt largo que menciona Xtudio de pasada es una conversacion normal y
+// tiene que llegar al modelo, no quedarse en "Xtudio-1 lanzado correctamente".
+const XTUDIO_LAUNCH_VERB = /(?:^|\s)(?:me\s+|nos\s+)?(?:puedes\s+|podr[ií]as\s+|porfa\s+|por\s+favor\s+)?(?:abre|abrir|abr[ií]|lanza|l[aá]nzal[oa]|lanzal[oa]|lanzar|inicia|iniciar|arranca|arrancar|ejecuta|ejecutar|corre|correr|open|launch|start|run)(?:\s|$)/i;
+// Menciona Xtudio pero para otra cosa (arreglarlo, compilarlo, subirlo...).
+const XTUDIO_OTHER_TASK = /\b(commit\w*|push|mirror|repo\w*|rama|branch|build|compil\w*|instal\w*|test\w*|prueb\w*|arregl\w*|corrig\w*|error\w*|bug\w*|falla\w*|deploy|despleg\w*|actualiz\w*|revis\w*|version\w*|versi[oó]n\w*|c[oó]digo|archivo\w*)\b/i;
 function isXtudioLaunchIntent(message, history, historySummary) {
   const msg = String(message || '').trim();
   if (!msg) return false;
-  const launchVerb = /\b(abr\w*|lanz\w*|inici\w*|arranc\w*|ejecut\w*)\b/i;
-  return launchVerb.test(msg) && isXtudioMentioned(msg);
+  if (!isXtudioMentioned(msg)) return false;
+  if (/[\r\n]/.test(msg)) return false;          // varias lineas => no es una orden suelta
+  if (/@[\w./\\-]/.test(msg)) return false;      // adjuntos o rutas => tarea real
+  if (msg.includes('?') || msg.includes('¿')) return false; // pregunta, no orden
+  if (msg.length > 80 || msg.split(/\s+/).length > 8) return false;
+  if (XTUDIO_OTHER_TASK.test(msg)) return false;
+  return XTUDIO_LAUNCH_VERB.test(msg);
+}
+// Las rutas dependen de la maquina: se resuelven en caliente en vez de fijarlas.
+function resolveXtudio1Paths() {
+  const home = os.homedir();
+  const roots = [
+    path.join(home, 'Documents', 'HanstlerS', 'xtudio-1'),
+    path.join(home, 'Documents', 'HansterS', 'xtudio-1'),
+    path.join(home, 'xtudio-1'),
+    path.join(home, 'Documents', 'HanstlerS', 'dj-set-studio'),
+    path.join(home, 'Documents', 'HansterS', 'dj-set-studio')
+  ];
+  const envRoot = String(process.env.HANSTLERS_XTUDIO_DIR || '').trim();
+  if (envRoot) roots.unshift(envRoot);
+  for (const wd of roots) {
+    const main = path.join(wd, 'main_qt.py');
+    let ok = false;
+    try { ok = fs.existsSync(main); } catch (_) { ok = false; }
+    if (!ok) continue;
+    const candidates = [
+      path.join(wd, '.venv', 'Scripts', 'pythonw.exe'),
+      path.join(wd, '.venv', 'Scripts', 'python.exe'),
+      path.join(wd, 'venv', 'Scripts', 'pythonw.exe'),
+      path.join(wd, 'venv', 'Scripts', 'python.exe')
+    ];
+    let py = 'python';
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) { py = c; break; } } catch (_) {}
+    }
+    return { py, main, wd };
+  }
+  return null;
 }
 function launchXtudio1(cb) {
-  const py = 'C:\\Users\\czumb\\AppData\\Local\\Programs\\Python\\Python311\\python.exe';
-  const main = 'C:\\Users\\czumb\\Documents\\HanstlerS\\dj-set-studio\\main_qt.py';
-  const wd = 'C:\\Users\\czumb\\Documents\\HanstlerS\\dj-set-studio';
+  const found = resolveXtudio1Paths();
+  if (!found) return cb(new Error('no encuentro main_qt.py de Xtudio-1 (revisa la copia local o define HANSTLERS_XTUDIO_DIR)'));
+  let child;
   try {
-    const child = spawn(py, [main], { cwd: wd, windowsHide: true, detached: true, stdio: 'ignore' });
-    try { child.unref(); } catch (_) {}
-    return cb(null, child && child.pid ? child.pid : 0);
+    child = spawn(found.py, [found.main], { cwd: found.wd, windowsHide: true, detached: true, stdio: 'ignore' });
   } catch (e) {
     return cb(e);
   }
+  let settled = false;
+  const finish = (err, pid) => {
+    if (settled) return;
+    settled = true;
+    try { child.unref(); } catch (_) {}
+    cb(err, pid);
+  };
+  // spawn avisa del fallo de forma asincrona: sin esta espera se reportaba
+  // "lanzado correctamente" aunque el ejecutable no existiera.
+  child.on('error', (e) => finish(e));
+  setTimeout(() => finish(null, child.pid || 0), 900);
 }
 function looksLikeStrategyTask(text) {
   return /\b(estrategia|roadmap|assessment|analiza|compar[aá]|trade[- ]?off|arquitectura|plan|prioriza|benchmark|decisi[oó]n|enfoque)\b/i.test(text || '');
