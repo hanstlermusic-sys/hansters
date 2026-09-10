@@ -29,6 +29,14 @@ sesiones, perfiles de proyecto, etc.
 - Errores de red contra HanstlerS con mensaje accionable (distingue HTTP N de
   conexion cortada a media respuesta).
 
+### Router automatico actualizado
+
+Cuando el modelo esta en `auto`, la decision se toma en HanstlerS (`server.js`):
+
+- General: `gemini-3.5-flash` con respaldo `gpt-5.4-mini`.
+- Codigo: `gpt-5.3-codex` con respaldo `claude-opus-5`.
+- Bloqueos o desarrollo nuevo desde cero: `claude-opus-5`.
+
 ## Instalar / actualizar en una PC
 
 Desde la raiz del repo (`hansters`), tras `git pull`:

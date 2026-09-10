@@ -2867,25 +2867,36 @@ function looksLikeExecutionTask(text) {
   return /\b(abr\w*|open\w*|lanz\w*|inici\w*|arranc\w*|cre\w*|edit\w*|modific\w*|arregl\w*|corrig\w*|ejecut\w*|corr\w*|instal\w*|despleg\w*|refactor\w*|agreg\w*|a[ñn]ad\w*|archivo\w*|carpeta\w*|comando\w*|script\w*|c[oó]digo\w*|bug\w*|error\w*|compil\w*|build\w*|test\w*|prueb\w*|git\w*|deploy\w*|terminal\w*)\b/i.test(text || '')
     || /@[\w./\\-]+/.test(text || '');
 }
+function looksLikeCodeDevelopmentTask(text) {
+  return /\b(c[oó]digo|code|program\w*|desarroll\w*|feature|funci[oó]n|endpoint|api|frontend|backend|fix|arregl\w*|corrig\w*|bug|error|refactor\w*|optimiz\w*|test\w*|prueb\w*|commit\w*|pull request|pr\b|archivo\w*|clase\w*|m[oó]dulo\w*|script\w*)\b/i.test(text || '')
+    || /@[\w./\\-]+/.test(text || '');
+}
+function looksLikeUnresolvedTask(text) {
+  return /\b(no\s+pude|no\s+se\s+puede|no\s+se\s+pudo|atascad\w*|bloquead\w*|stuck|cannot|can['’]t|unable|imposible|no\s+funciona|sigue\s+fallando|no\s+logr[eo])\b/i.test(text || '');
+}
+function looksLikeNewDevelopmentTask(text) {
+  return /\b(nuevo\s+desarrollo|desde\s+cero|from\s+scratch|nueva\s+app|new\s+app|nuevo\s+proyecto|new\s+project|arquitectura\s+completa|scaffold|boilerplate|mvp)\b/i.test(text || '');
+}
 function isXtudioMentioned(text) {
   return /\b(xtudio(?:-?1)?|xstudio(?:-?1)?|dj[-\s]?set[-\s]?studio|main_qt\.py)\b/i.test(String(text || ''));
 }
-// Solo una orden corta y directa ("abre Xtudio-1") debe activar el lanzador.
-// Un prompt largo que menciona Xtudio de pasada es una conversacion normal y
-// tiene que llegar al modelo, no quedarse en "Xtudio-1 lanzado correctamente".
-const XTUDIO_LAUNCH_VERB = /(?:^|\s)(?:me\s+|nos\s+)?(?:puedes\s+|podr[ií]as\s+|porfa\s+|por\s+favor\s+)?(?:abre|abrir|abr[ií]|lanza|l[aá]nzal[oa]|lanzal[oa]|lanzar|inicia|iniciar|arranca|arrancar|ejecuta|ejecutar|corre|correr|open|launch|start|run)(?:\s|$)/i;
-// Menciona Xtudio pero para otra cosa (arreglarlo, compilarlo, subirlo...).
-const XTUDIO_OTHER_TASK = /\b(commit\w*|push|mirror|repo\w*|rama|branch|build|compil\w*|instal\w*|test\w*|prueb\w*|arregl\w*|corrig\w*|error\w*|bug\w*|falla\w*|deploy|despleg\w*|actualiz\w*|revis\w*|version\w*|versi[oó]n\w*|c[oó]digo|archivo\w*)\b/i;
+// El lanzador solo acepta una orden completa; las menciones dentro de una
+// consulta o tarea mas amplia deben llegar al modelo.
+const XTUDIO_DIRECT_LAUNCH = /^(?:(?:por favor|porfa)\s+)?(?:(?:puedes|podrias)\s+)?(?:abre(?:me)?|abrir|abri|lanza(?:la|lo)?|lanzar|inicia|iniciar|arranca|arrancar|ejecuta|ejecutar|corre|correr|open|launch|start|run)\s+(?:(?:el|la|mi)\s+)?(?:xtudio(?:-?1)?|xstudio(?:-?1)?|dj[-\s]?set[-\s]?studio|main_qt\.py)(?:\s+(?:por favor|porfa|ahora|ya))?$/;
 function isXtudioLaunchIntent(message, history, historySummary) {
   const msg = String(message || '').trim();
   if (!msg) return false;
   if (!isXtudioMentioned(msg)) return false;
-  if (/[\r\n]/.test(msg)) return false;          // varias lineas => no es una orden suelta
-  if (/@[\w./\\-]/.test(msg)) return false;      // adjuntos o rutas => tarea real
-  if (msg.includes('?') || msg.includes('¿')) return false; // pregunta, no orden
-  if (msg.length > 80 || msg.split(/\s+/).length > 8) return false;
-  if (XTUDIO_OTHER_TASK.test(msg)) return false;
-  return XTUDIO_LAUNCH_VERB.test(msg);
+  if (/[\r\n]/.test(msg) || /@[\w./\\-]/.test(msg)) return false;
+  if (msg.includes('?') || msg.includes('¿')) return false;
+  const normalized = msg
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[.,!;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return XTUDIO_DIRECT_LAUNCH.test(normalized);
 }
 // Las rutas dependen de la maquina: se resuelven en caliente en vez de fijarlas.
 function resolveXtudio1Paths() {
@@ -2983,6 +2994,16 @@ function pickVertexTarget(model, message, hasAttachments) {
   if (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments) return { model: cfg.models.flash, publisher: 'google', reason: 'vertex-auto-execution-or-vision' };
   return { model: cfg.models.flash, publisher: 'google', reason: 'vertex-auto-default' };
 }
+function chooseAutoModelRoute(feats, message, hasAttachments, fromLocalAgent) {
+  if (feats.preferXCoreForAudio && looksLikeAudioTask(message)) return { model: 'x-core', reason: 'audio-task' };
+  if (looksLikeUnresolvedTask(message)) return { model: 'claude-opus-5', reason: 'auto-unresolved-opus' };
+  if (looksLikeNewDevelopmentTask(message)) return { model: 'claude-opus-5', reason: 'auto-new-development-opus' };
+  if (looksLikeCodeDevelopmentTask(message)) return { model: 'gpt-5.3-codex', reason: 'auto-code-primary', fallbackModel: 'claude-opus-5' };
+  if (feats.routeExecutionToAzureAgent && loadAzure() && (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments)) {
+    return { model: 'azure-agent', reason: fromLocalAgent ? 'local-agent-execution-or-web' : 'execution-or-web-task' };
+  }
+  return { model: 'gemini-3.5-flash', reason: 'auto-general-primary', fallbackModel: 'gpt-5.4-mini' };
+}
 function chooseModelForRequest(requestedModel, message, hasAttachments, fromLocalAgent) {
   const feats = currentFeatures();
   const base = (requestedModel || state.model || 'auto').trim();
@@ -2997,13 +3018,9 @@ function chooseModelForRequest(requestedModel, message, hasAttachments, fromLoca
     return { model: base || 'auto', reason: 'explicit-model' };
   }
   if (fromLocalAgent && feats.agentBridgeMode && feats.autoRouteForLocalAgent) {
-    if (feats.routeExecutionToAzureAgent && loadAzure() && (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments)) return { model: 'azure-agent', reason: 'local-agent-execution-or-web' };
-    return { model: 'claude-sonnet-5', reason: 'local-agent-default' };
+    return chooseAutoModelRoute(feats, message, hasAttachments, true);
   }
-  if (feats.preferXCoreForAudio && looksLikeAudioTask(message)) return { model: 'x-core', reason: 'audio-task' };
-  if (feats.routeExecutionToAzureAgent && loadAzure() && (looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments)) return { model: 'azure-agent', reason: 'execution-or-web-task' };
-  if (feats.preferClaudeForStrategy && looksLikeStrategyTask(message)) return { model: 'claude-sonnet-5', reason: 'strategy-task' };
-  return { model: 'auto', reason: 'auto-default' };
+  return chooseAutoModelRoute(feats, message, hasAttachments, false);
 }
 function wrapProResponsePrompt(message) {
   const guard = '[Instrucción interna: respuesta profesional, clara, accionable, sin relleno, con recomendación principal cuando aplique y máxima exactitud técnica.]';
@@ -3867,6 +3884,9 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
   if (routePick && routePick.reason && routePick.model) send('route', routePick);
 
   const effModel = model || state.model;
+  const autoFallbackModel = (routePick && routePick.model === effModel && routePick.fallbackModel)
+    ? String(routePick.fallbackModel).trim()
+    : '';
   const useCwd = (runCwd && String(runCwd).trim()) ? String(runCwd).trim() : state.cwd;
   state.convSessions = state.convSessions || {};
   let effSession = statelessMode ? '' : (sessionId || (convId ? state.convSessions[convId] : '') || '');
@@ -4051,6 +4071,17 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
       if (code !== 0 && opts.sessionId && !gotOutput && !isRetry) {
         return attempt(withModel, { model: opts.model }, true);
       }
+      // Auto: cadena de respaldo por tipo de tarea (general -> mini, codigo -> opus).
+      if (code !== 0 && withModel && opts.fallbackModel && !isRetry && opts.fallbackModel !== opts.model) {
+        const fallback = String(opts.fallbackModel).trim();
+        if (fallback) {
+          send('status', 'Reintentando con modelo de respaldo…');
+          send('chunk', '\n⚠️ El modelo ' + String(opts.model || effModel) + ' no pudo completar esta tarea.' +
+            '\nReintento con ' + fallback + '.\n\n');
+          send('route', { model: fallback, reason: 'auto-fallback' });
+          return attempt(withModel, { sessionId: opts.sessionId || '', model: fallback }, true);
+        }
+      }
       filter.flush();
       emitSession(raw);
       // Respaldo: si no se detectó en la salida, buscar la sesión más reciente en disco.
@@ -4081,7 +4112,7 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
     req.on('close', () => { try { child.kill(); } catch (e) {} });
   }
 
-  attempt(!state.autoOnly, { sessionId: effSession, model: effModel }, false);
+  attempt(!state.autoOnly, { sessionId: effSession, model: effModel, fallbackModel: autoFallbackModel }, false);
 }
 
 // ===== Historial de conversaciones (persistente en disco) =====
@@ -4765,7 +4796,7 @@ const server = http.createServer(async (req, res) => {
     const vFlash = vtx && vtx.models && vtx.models.flash ? String(vtx.models.flash) : '';
     const vOpus = vtx && vtx.models && vtx.models.opus ? String(vtx.models.opus) : '';
     const models = [
-      { id: 'auto', name: 'Automatico (recomendado)' },
+      { id: 'auto', name: 'Automatico (Gemini 3.5 Flash/GPT-5.4 mini, codigo con GPT-5.3 Codex, dificil con Claude Opus 5)' },
       { id: 'x-core', name: 'X-Core local (HanstlerS)' },
       { id: 'vertex-auto', name: 'Vertex Auto (Google: ' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
       { id: 'vertex-gemini-pro', name: 'Vertex Gemini Pro (' + (vPro || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },

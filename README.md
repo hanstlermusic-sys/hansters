@@ -31,6 +31,17 @@ Ahora HanstlerS acepta configuracion por **API key** (sin depender de `gcloud au
 Con eso, los modelos `vertex-auto`, `vertex-gemini-pro` y `vertex-gemini-flash` quedan operativos.
 `vertex-claude-opus-5` sigue requiriendo GCP + ADC (`gcloud auth application-default login`).
 
+## Router automatico de modelos
+
+En `Automatico`, HanstlerS enruta por tipo de tarea:
+
+- Preguntas generales: `gemini-3.5-flash` (respaldo `gpt-5.4-mini`).
+- Desarrollo de codigo: `gpt-5.3-codex` (respaldo `claude-opus-5`).
+- Tareas bloqueadas o nuevo desarrollo desde cero: `claude-opus-5`.
+
+Si detecta tarea operativa web/portal y hay Azure BYOK configurado, mantiene
+la ruta `azure-agent` para ejecutar acciones en servidor local.
+
 ## Mirroring a Enterprise (EMU compatible)
 
 Para trabajar con una cuenta EMU (`cezumbad_microsoft`) sin perder el repo fuente
