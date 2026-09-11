@@ -64,6 +64,8 @@ t('otras tareas sobre Xtudio no lanzan la app', () => {
   noLanza('compila xtudio-1');
   noLanza('arregla el error de xtudio');
   noLanza('actualiza el mirror de xtudio-1');
+  noLanza('abre xtudio y despues revisa el registro de errores');
+  noLanza('no abras xtudio');
 });
 
 t('mensajes con adjuntos o varias lineas no lanzan la app', () => {
