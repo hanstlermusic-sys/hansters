@@ -4,14 +4,6 @@ Tu asistente personal basado en GitHub Copilot CLI: chat con voz, selector de ca
 
 Descarga el instalador todo-en-uno en Releases (instala Node + Copilot CLI + la app).
 
-## Asistente guiado por la documentación
-
-Al iniciar una conversación, HanstlerS carga `AGENTS.md`, `README.md`, la
-documentación Markdown de `docs/` y los README de componentes de la carpeta de
-trabajo. El agente usa esas reglas como fuente de verdad y abre cualquier
-documento truncado antes de modificar su área. La implementación y sus límites
-se describen en [`docs/ASISTENTE.md`](docs/ASISTENTE.md).
-
 ## Vertex / Gemini rapido (con auth key)
 
 Ahora HanstlerS acepta configuracion por **API key** (sin depender de `gcloud auth`).

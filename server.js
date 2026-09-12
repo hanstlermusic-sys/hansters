@@ -8,7 +8,6 @@ const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const updater = require('./updater');
 const modelWatch = require('./model-watch');
-const { buildDocumentationContext } = require('./assistant-context');
 
 // Version instalada, para comparar contra la del repo en el actualizador.
 const APP_VERSION = (function () {
@@ -2174,7 +2173,7 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
   let aborted = false;
   if (onAbort) onAbort(() => { aborted = true; });
   const preamble = [
-    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. Estás en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nLa documentación incluida en el contexto es la fuente de verdad del proyecto. Cumple AGENTS.md y consulta con read_file cualquier documento truncado o relacionado con la tarea antes de modificar código. Usa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tú mismo (no solo expliques). SÉ DECIDIDO Y AUTÓNOMO: si la intención está clara, ACTÚA de inmediato sin pedir permiso ni confirmación. NO preguntes "¿quieres que...?", "¿procedo?", "¿te gustaría?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acción es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leíste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parámetros. Responde en español, conciso. Cuando termines, resume lo que hiciste.' },
+    { role: 'system', content: 'Eres HanstlerS, asistente de Cesar en modo AGENTE. Estás en Windows (PowerShell), carpeta de trabajo: ' + state.cwd + '.' + (state.projectCtx && state.projectCtx.cwd === state.cwd && state.projectCtx.text ? '\n\nCONTEXTO DEL PROYECTO:\n' + state.projectCtx.text : '') + '\n\nUsa las herramientas para leer/crear archivos y ejecutar comandos y COMPLETAR la tarea tú mismo (no solo expliques). SÉ DECIDIDO Y AUTÓNOMO: si la intención está clara, ACTÚA de inmediato sin pedir permiso ni confirmación. NO preguntes "¿quieres que...?", "¿procedo?", "¿te gustaría?": simplemente hazlo y muestra el resultado. Toma decisiones razonables por tu cuenta (nombres de archivo, estructura, enfoque) en lugar de consultar. Solo detente a preguntar si de verdad falta un dato imprescindible que no puedes deducir del contexto ni de los archivos (por ejemplo una credencial secreta), o si la acción es claramente destructiva e irreversible (borrar muchos archivos, formatear). En cualquier otro caso, procede hasta terminar. EFICIENCIA: cuando necesites leer o crear varios archivos, pide TODAS las herramientas a la vez en el mismo turno (varias tool_calls en paralelo) en lugar de una por una. No releas un archivo que ya leíste. Prioriza hacer los cambios (write_file) cuanto antes. Al usar run_command, NUNCA uses comandos interactivos ni que dejen una ventana/consola abierta (nada de -NoExit, Read-Host, pause, o abrir la app en primer plano); usa siempre modo no interactivo con parámetros. Responde en español, conciso. Cuando termines, resume lo que hiciste.' },
     { role: 'system', content: 'Si el usuario pide ir a una web (por ejemplo Cloudflare, Azure o GitHub), abre la página tú con la herramienta de navegador y ejecuta el flujo tú mismo. No le pidas al usuario que navegue manualmente.' },
     { role: 'system', content: 'REPOS: si el usuario menciona un repositorio de GitHub (por nombre, owner/repo o URL) y no es ya la carpeta de trabajo, llama PRIMERO a open_repo. Esa herramienta clona el repo automáticamente si no está en disco, hace git pull si ya estaba, y deja la carpeta de trabajo dentro del repo; después trabaja con rutas relativas. Nunca le pidas al usuario que clone a mano ni que te dé la ruta local: dedúcela con open_repo. Interpreta la intención en lenguaje natural ("abre X", "trabaja en X", "revisa X", "arregla Y en X") y ejecuta la tarea completa sobre ese repo.' }
   ];
@@ -3028,7 +3027,7 @@ function wrapProResponsePrompt(message) {
   return guard + '\n\n' + message;
 }
 
-// Construye un bloque de contexto del proyecto: árbol, git, documentación y package.json.
+// Construye un bloque de contexto del proyecto: árbol, git status, README y package.json.
 // Llama cb(text) al terminar; usa caché si el cwd no cambió.
 function buildProjectContext(cwd, cb) {
   if (state.projectCtx && state.projectCtx.cwd === cwd) {
@@ -3077,10 +3076,10 @@ function buildProjectContext(cwd, cb) {
     } else { tryDone(); } // 2 sin git
   } catch (e) { if (!gitDone) { gitDone = true; tryDone(); } } // 2 error
 
-  // 3. Documentación Markdown del proyecto.
+  // 3. README.md (primeros 600 chars)
   try {
-    const docs = buildDocumentationContext(cwd);
-    if (docs) parts.push('### Documentación del proyecto\n' + docs);
+    const rp = ['README.md', 'readme.md', 'Readme.md'].map(n => path.join(cwd, n)).find(p => { try { return fs.existsSync(p); } catch (e) { return false; } });
+    if (rp) parts.push('### README.md\n' + fs.readFileSync(rp, 'utf8').trim().slice(0, 600));
   } catch (e) {}
   tryDone(); // 3
 
