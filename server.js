@@ -628,6 +628,19 @@ function toAnthropicMessages(history, message) {
   return out;
 }
 
+function toOpenAiMessages(history, message) {
+  const raw = [];
+  (Array.isArray(history) ? history : []).forEach((m) => {
+    const role = String(m && m.role || '').toLowerCase() === 'user' ? 'user' : 'assistant';
+    const txt = String(m && (m.content || m.html) || '').trim();
+    if (!txt) return;
+    raw.push({ role, content: txt.slice(0, 2000) });
+  });
+  while (raw.length && raw[0].role !== 'user') raw.shift();
+  raw.push({ role: 'user', content: String(message || '') });
+  return raw;
+}
+
 function runVertex(message, history, historySummary, selectedVertexModel, send, onDone, onAbort, images) {
   const cfg = loadVertex();
   if (!cfg) return onDone(1, 'Vertex no configurado (GCP_PROJECT_ID/GCP_REGION o GOOGLE_API_KEY).');
@@ -635,6 +648,9 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
   if (!pick.model) return onDone(1, 'No se pudo resolver modelo Vertex.');
   if (pick.publisher === 'anthropic' && cfg.authMode !== 'adc') {
     return onDone(1, 'Claude Opus en Vertex requiere GCP_PROJECT_ID/GCP_REGION y auth de gcloud (ADC).');
+  }
+  if (pick.publisher === 'xai' && cfg.authMode !== 'adc') {
+    return onDone(1, 'Grok en Vertex requiere GCP_PROJECT_ID/GCP_REGION y auth de gcloud (ADC).');
   }
   const finalMsg = historySummary ? (`Resumen acumulado:\n${historySummary}\n\nMensaje actual:\n${message}`) : message;
   const payload = pick.publisher === 'anthropic'
@@ -644,6 +660,12 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       temperature: 0.2,
       max_tokens: 2048
     })
+    : pick.publisher === 'xai'
+      ? JSON.stringify({
+        messages: toOpenAiMessages(history, finalMsg),
+        temperature: 0.2,
+        max_tokens: 2048
+      })
     : JSON.stringify({
       contents: toGeminiContents(history, finalMsg, images),
       generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
@@ -670,6 +692,12 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
       const usage = j.usage || {};
       promptTok = Number(usage.input_tokens);
       outTok = Number(usage.output_tokens);
+    } else if (publisher === 'xai') {
+      const c0 = (((j || {}).choices || [])[0] || {});
+      txt = String((((c0 || {}).message || {}).content) || '').trim();
+      const usage = j.usage || {};
+      promptTok = Number(usage.prompt_tokens);
+      outTok = Number(usage.completion_tokens);
     } else {
       const cand = (((j || {}).candidates || [])[0] || {});
       const parts = cand.content || {};
@@ -736,6 +764,9 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
     req.end();
   };
   if (cfg.authMode === 'api-key') {
+    if ((pick.publisher || 'google') !== 'google') {
+      return onDone(1, 'Ese modelo en Vertex requiere ADC (gcloud), no API key.');
+    }
     return sendVertexRequest({}, buildGoogleEndpoint(pick.model), pick.model, pick.reason);
   }
 
@@ -743,7 +774,7 @@ function runVertex(message, history, historySummary, selectedVertexModel, send, 
     getGcpAccessToken((tokErr, token) => {
       if (tokErr) return onDone(1, 'Vertex auth: ' + tokErr.message);
       const publisher = pick.publisher || 'google';
-      const method = publisher === 'anthropic' ? 'rawPredict' : 'generateContent';
+      const method = (publisher === 'anthropic' || publisher === 'xai') ? 'rawPredict' : 'generateContent';
       const endpoint = `https://${cfg.region}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/locations/${encodeURIComponent(cfg.region)}/publishers/${encodeURIComponent(publisher)}/models/${encodeURIComponent(pick.model)}:${method}`;
       return sendVertexRequest({ 'Authorization': 'Bearer ' + token }, endpoint, pick.model, pick.reason);
     });
@@ -2961,7 +2992,7 @@ function looksLikeWebPortalTask(text) {
 }
 function isVertexModel(model) {
   const m = String(model || '').trim().toLowerCase();
-  return m === 'vertex-auto' || m === 'vertex-gemini-pro' || m === 'vertex-gemini-flash' || m === 'vertex-claude-opus-5';
+  return m === 'vertex-auto' || m === 'vertex-gemini-pro' || m === 'vertex-gemini-flash' || m === 'vertex-claude-opus-5' || m === 'vertex-grok-4.6' || m === 'vertex-grok-4.5';
 }
 function isModelIdentityQuestion(text) {
   const t = String(text || '').toLowerCase();
@@ -2978,7 +3009,9 @@ function describeEffectiveModel(reqModel, routeReason) {
   if (isVertexModel(m)) {
     const pick = pickVertexTarget(m, '', false);
     const real = pick && pick.model ? pick.model : m;
-    const pub = pick && pick.publisher === 'anthropic' ? 'Anthropic en Vertex' : 'Google Gemini en Vertex';
+    const pub = pick && pick.publisher === 'anthropic'
+      ? 'Anthropic en Vertex'
+      : (pick && pick.publisher === 'xai' ? 'xAI en Vertex' : 'Google Gemini en Vertex');
     return 'Modelo activo: ' + m + ' → ' + real + ' (' + pub + ').';
   }
   return 'Modelo activo: ' + m + (routeReason ? (' (' + routeReason + ').') : '.');
@@ -2988,6 +3021,8 @@ function pickVertexTarget(model, message, hasAttachments) {
   const m = String(model || '').trim().toLowerCase();
   if (!cfg) return { model: '', reason: 'vertex-not-configured' };
   if (m === 'vertex-claude-opus-5') return { model: cfg.models.opus, publisher: 'anthropic', reason: 'vertex-manual-opus' };
+  if (m === 'vertex-grok-4.6') return { model: 'grok-4.6', publisher: 'xai', reason: 'vertex-manual-grok-46' };
+  if (m === 'vertex-grok-4.5') return { model: 'grok-4.5', publisher: 'xai', reason: 'vertex-manual-grok-45' };
   if (m === 'vertex-gemini-pro') return { model: cfg.models.pro, publisher: 'google', reason: 'vertex-manual-pro' };
   if (m === 'vertex-gemini-flash') return { model: cfg.models.flash, publisher: 'google', reason: 'vertex-manual-flash' };
   if (looksLikeStrategyTask(message)) return { model: cfg.models.pro, publisher: 'google', reason: 'vertex-auto-strategy' };
@@ -3011,7 +3046,7 @@ function chooseModelForRequest(requestedModel, message, hasAttachments, fromLoca
   if (base !== 'auto') {
     const explicit = base.toLowerCase();
     const wantsExecution = looksLikeExecutionTask(message) || looksLikeWebPortalTask(message) || hasAttachments;
-    const explicitVertex = explicit === 'vertex-auto' || explicit === 'vertex-gemini-pro' || explicit === 'vertex-gemini-flash' || explicit === 'vertex-claude-opus-5';
+    const explicitVertex = explicit === 'vertex-auto' || explicit === 'vertex-gemini-pro' || explicit === 'vertex-gemini-flash' || explicit === 'vertex-claude-opus-5' || explicit === 'vertex-grok-4.6' || explicit === 'vertex-grok-4.5';
     if (explicitVertex && wantsExecution) {
       return { model: base, reason: 'explicit-vertex-locked' };
     }
@@ -3912,7 +3947,7 @@ function handleChatInner(req, res, message, sessionId, convId, model, memNote, c
     // pedidos como "abre el repo X" caian en chat plano y solo describian el plan.
     const vxCfg = loadVertex();
     const vxPick = vxCfg ? pickVertexTarget(effModel, message, !!(visionImages && visionImages.length)) : null;
-    const vxUsaAgente = !!(vxCfg && vxPick && vxPick.model && vxPick.publisher !== 'anthropic' &&
+    const vxUsaAgente = !!(vxCfg && vxPick && vxPick.model && vxPick.publisher === 'google' &&
       currentFeatures().vertexAgentTools);
     if (vxUsaAgente) {
       let vxDone = false;
@@ -4801,7 +4836,9 @@ const server = http.createServer(async (req, res) => {
       { id: 'vertex-auto', name: 'Vertex Auto (Google: ' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
       { id: 'vertex-gemini-pro', name: 'Vertex Gemini Pro (' + (vPro || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
       { id: 'vertex-gemini-flash', name: 'Vertex Gemini Flash (' + (vFlash || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
-      { id: 'vertex-claude-opus-5', name: 'Vertex Claude Opus 5 (Anthropic: ' + (vOpus || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') }
+      { id: 'vertex-claude-opus-5', name: 'Vertex Claude Opus 5 (Anthropic: ' + (vOpus || 'sin modelo') + ')' + (vtx ? '' : ' [configurar GCP/API key]') },
+      { id: 'vertex-grok-4.6', name: 'Vertex Grok 4.6 (xAI) [requiere ADC]' + (vtx ? '' : ' [configurar GCP/API key]') },
+      { id: 'vertex-grok-4.5', name: 'Vertex Grok 4.5 (xAI) [requiere ADC]' + (vtx ? '' : ' [configurar GCP/API key]') }
     ];
     if (loadAzure()) models.push({ id: 'azure', name: 'Azure gpt-5-mini (tu cuota, barato)' });
     if (loadAzure()) models.push({ id: 'azure-agent', name: 'Azure Agente (ejecuta archivos/comandos)' });
@@ -4811,6 +4848,8 @@ const server = http.createServer(async (req, res) => {
       { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6' },
       { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
       { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5 (rapido)' },
+      { id: 'grok-4.6', name: 'Grok 4.6 (xAI)' },
+      { id: 'grok-4.5', name: 'Grok 4.5 (xAI)' },
       { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' },
       { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
       { id: 'gpt-5.4', name: 'GPT-5.4' },
