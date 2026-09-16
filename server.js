@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const updater = require('./updater');
 const modelWatch = require('./model-watch');
+const mockApi = require('./mock-api');
 
 // Version instalada, para comparar contra la del repo en el actualizador.
 const APP_VERSION = (function () {
@@ -2499,7 +2500,11 @@ function defaultFeatures() {
     preferClaudeForStrategy: true,
     preferXCoreForAudio: true,
     autoRouteForLocalAgent: true,
-    operatorMode: false
+    operatorMode: false,
+    // Servidor local aparte que inventa respuestas JSON para probar
+    // frontend/backend sin APIs externas. Apagado por defecto: abre un
+    // puerto extra, asi que solo se levanta si el usuario lo pide.
+    mockApi: false
   };
 }
 function loadFeatures() {
@@ -2519,6 +2524,41 @@ function saveFeatures(cfg) {
 let FEATURES = loadFeatures();
 function currentFeatures() { return FEATURES || loadFeatures(); }
 function reloadFeatures() { FEATURES = loadFeatures(); return FEATURES; }
+// Genera el JSON del mock con Vertex (Gemini Flash: barato y rapido).
+// Si Vertex no esta configurado o falla, mock-api.js cae solo a su
+// respuesta de respaldo, asi que el mock nunca deja de responder.
+function mockGenerate(prompt, cb) {
+  let done = false;
+  const finish = (err, txt) => { if (!done) { done = true; cb(err, txt); } };
+  let texto = '';
+  try {
+    runVertex(
+      prompt,
+      [],
+      '',
+      'vertex-gemini-flash',
+      (ev, data) => { if (ev === 'chunk') texto += String(data == null ? '' : data); },
+      (code, err) => {
+        if (code !== 0 || !texto.trim()) return finish(new Error(err || 'sin respuesta'));
+        finish(null, texto);
+      },
+      null,
+      null
+    );
+  } catch (e) { finish(e); }
+}
+// Arranca o detiene el Mock API segun la bandera. Se llama al iniciar y
+// cada vez que cambian las banderas.
+function syncMockApi() {
+  try {
+    const on = !!currentFeatures().mockApi;
+    if (!on) { if (mockApi.isRunning()) mockApi.stop(); return; }
+    mockApi.start({ generate: mockGenerate }, (err, info) => {
+      if (err) return console.error('Mock API no pudo arrancar:', err && err.message);
+      if (info && !info.yaActivo) console.log('Mock API en http://127.0.0.1:' + info.puerto);
+    });
+  } catch (e) {}
+}
 function authEnabled() { return !!(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && SESSION_SECRET && BASE_URL); }
 const authSessions = new Map(); // sid -> { login, name, avatarUrl, isAdmin, at, githubToken }
 const oauthStates = new Map();  // state -> createdAt
@@ -4680,8 +4720,34 @@ const server = http.createServer(async (req, res) => {
     });
     saveFeatures(f);
     reloadFeatures();
+    syncMockApi();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, features: currentFeatures() }));
+  }
+  if (req.method === 'GET' && req.url === '/api/mock/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(mockApi.status()));
+  }
+  if (req.method === 'POST' && req.url === '/api/mock/start') {
+    if (!requireAdminOrDeny(req, res)) return;
+    return mockApi.start({ generate: mockGenerate }, (err) => {
+      res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
+      if (err) return res.end(JSON.stringify({ ok: false, error: err.message }));
+      return res.end(JSON.stringify({ ok: true, mock: mockApi.status() }));
+    });
+  }
+  if (req.method === 'POST' && req.url === '/api/mock/stop') {
+    if (!requireAdminOrDeny(req, res)) return;
+    return mockApi.stop(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, mock: mockApi.status() }));
+    });
+  }
+  if (req.method === 'POST' && req.url === '/api/mock/clear') {
+    if (!requireAdminOrDeny(req, res)) return;
+    const n = mockApi.clearCache();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, borrados: n }));
   }
   if (req.method === 'GET' && req.url === '/api/quota') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -5024,6 +5090,8 @@ function startListen() {
     scheduleGithubQuotaSync();
     // Vigilancia de modelos nuevos de Gemini (si está habilitada).
     try { modelWatch.schedule(onModelFinding); } catch (e) {}
+    // Mock API local (si está habilitado en features.json).
+    try { syncMockApi(); } catch (e) {}
   });
 }
 

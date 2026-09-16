@@ -42,6 +42,49 @@ En `Automatico`, HanstlerS enruta por tipo de tarea:
 Si detecta tarea operativa web/portal y hay Azure BYOK configurado, mantiene
 la ruta `azure-agent` para ejecutar acciones en servidor local.
 
+## Mock API local
+
+Servidor aparte que inventa respuestas JSON para desarrollar frontend o
+backend sin depender de APIs externas (PayPal, R2, licencias...). Vive en su
+propio puerto: si falla, el chat no se entera.
+
+Se activa con la bandera `mockApi` (apagada por defecto):
+
+```powershell
+curl.exe -s -X POST http://127.0.0.1:8717/api/mock/start
+curl.exe -s http://127.0.0.1:8717/api/mock/status
+```
+
+Luego cualquier ruta contra `http://127.0.0.1:8718` devuelve un JSON creíble,
+generado con Gemini Flash y **cacheado en disco** (`~\.hanstlers\mocks`), de
+modo que la segunda llamada es instantánea y no gasta cuota:
+
+```powershell
+curl.exe -s http://127.0.0.1:8718/api/paypal/order
+```
+
+Parámetros de control para forzar los casos difíciles de reproducir de verdad:
+
+- `?__scenario=rechazado` — cambia la respuesta y usa su propia caché.
+- `?__status=500` — fuerza el código HTTP y devuelve una forma de error.
+
+La paginación normal (`?page=2`) **no** parte la caché: la forma es la misma.
+
+Rutas de control del propio mock:
+
+- `GET /__mock/health` — estado y número de respuestas cacheadas.
+- `GET /__mock/list` — qué hay cacheado.
+- `POST /__mock/clear` — vacía la caché.
+- `POST /__mock/seed` — fija una respuesta a mano con
+  `{ path, data, method?, scenario?, status? }`.
+
+Si Vertex no está configurado o se cae, el mock **sigue respondiendo** con un
+respaldo local deducido del nombre del recurso (plural → lista, singular →
+objeto). Ese respaldo no se cachea cuando hay IA disponible, para que la
+siguiente llamada vuelva a intentarlo.
+
+El puerto se cambia con `HANSTLERS_MOCK_PORT`.
+
 ## Mirroring a Enterprise (EMU compatible)
 
 Para trabajar con una cuenta EMU (`cezumbad_microsoft`) sin perder el repo fuente
