@@ -175,6 +175,37 @@ que siempre. `tests/read-patch.test.js` cubre las dos herramientas, incluida la
 compatibilidad hacia atras y una prueba que confirma que `apply_patch` se niega
 a editar el `server.js` real con un `find` repetido.
 
+## Revision automatica al escribir
+
+El vigilante de arriba mira lo que guardas tu. Esta parte mira lo que escribe
+**el agente**, que antes creaba un archivo y seguia adelante sin volver a
+mirarlo: si dejaba una clave pegada o un parentesis sin cerrar, el fallo
+aparecia mucho despues, ya enterrado bajo otros cambios.
+
+Ahora, tras un `write_file` o `apply_patch` correcto, se revisa **solo ese
+archivo** y el hallazgo se le devuelve al modelo dentro del resultado de la
+herramienta, que es lo unico que vuelve a leer:
+
+```
+Parche aplicado en puro.js (linea ~2)
+⚠️ Revision del archivo que acabas de escribir: 1 error de sintaxis.
+  - puro.js:2 — SyntaxError: Unexpected token ';'
+Corrigelo AHORA antes de seguir: el archivo no es valido tal como quedo.
+```
+
+Asi el propio agente lo arregla en el mismo turno, en vez de que lo descubras
+tu al ejecutar la app.
+
+Es la misma revision local del vigilante (expresiones regulares y `node
+--check`), sin IA: **si el archivo esta limpio no se anade ni un caracter** al
+resultado, o sea que no gasta tokens salvo cuando de verdad hay algo que decir.
+Los secretos se muestran enmascarados, los ejemplos (`${GITHUB_TOKEN}`) no
+disparan aviso, y si la revision falla o tarda se ignora: es una red de
+seguridad y nunca debe tumbar una accion que ya salio bien.
+
+Se activa con la misma bandera `codeGuardian`. `tests/revision-escritura.test.js`
+cubre el formato del aviso y el comportamiento sobre archivos reales.
+
 ## Mirroring a Enterprise (EMU compatible)
 
 Para trabajar con una cuenta EMU (`cezumbad_microsoft`) sin perder el repo fuente

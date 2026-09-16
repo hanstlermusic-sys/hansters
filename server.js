@@ -1415,6 +1415,68 @@ function verifyPostCheck(tool, args, result, summary) {
   return { ok: true, detail: '' };
 }
 
+// ===== Revision al escribir (guardian en el bucle del agente) =====
+// El agente escribia un archivo y seguia adelante sin mirarlo. Si metia una
+// clave o dejaba un parentesis sin cerrar, el fallo aparecia mucho despues, ya
+// enterrado bajo otros cambios. Aqui se reutiliza el guardian (el mismo que
+// vigila los guardados a mano): tras un write_file/apply_patch correcto se
+// revisa SOLO ese archivo y, si hay algo, se le devuelve al modelo dentro del
+// resultado de la herramienta, que es lo unico que el vuelve a leer.
+//
+// Es revision local (regex + `node --check`), sin IA: no gasta tokens salvo
+// cuando de verdad hay un hallazgo que reportar.
+const GUARDIAN_MAX_AVISOS = 5;
+
+function formatearAvisoGuardian(hallazgos) {
+  const lista = Array.isArray(hallazgos) ? hallazgos.filter(Boolean) : [];
+  if (!lista.length) return null;
+  const secretos = lista.filter((h) => h.tipo === 'secreto').length;
+  const sintaxis = lista.filter((h) => h.tipo === 'sintaxis').length;
+  const lineas = lista.slice(0, GUARDIAN_MAX_AVISOS).map((h) => {
+    const donde = path.basename(String(h.archivo || '')) + (h.linea ? ':' + h.linea : '');
+    return '  - ' + donde + ' — ' + h.detalle;
+  });
+  if (lista.length > GUARDIAN_MAX_AVISOS) lineas.push('  - ... y ' + (lista.length - GUARDIAN_MAX_AVISOS) + ' mas');
+  const partes = [];
+  if (sintaxis) partes.push(sintaxis === 1 ? '1 error de sintaxis' : sintaxis + ' errores de sintaxis');
+  if (secretos) partes.push(secretos === 1 ? '1 posible secreto' : secretos + ' posibles secretos');
+  const cabecera = '\u26a0\ufe0f Revision del archivo que acabas de escribir: ' + partes.join(' y ') + '.';
+  const pie = sintaxis
+    ? 'Corrigelo AHORA antes de seguir: el archivo no es valido tal como quedo.'
+    : 'Si es una credencial de verdad, sacala del codigo y leela de una variable de entorno. Si es un ejemplo, ignora este aviso.';
+  return [cabecera, lineas.join('\n'), pie].join('\n');
+}
+
+function etiquetaAvisoGuardian(hallazgos) {
+  const lista = Array.isArray(hallazgos) ? hallazgos.filter(Boolean) : [];
+  if (!lista.length) return '';
+  return lista.some((h) => h.tipo === 'sintaxis') ? 'revision: sintaxis rota' : 'revision: posible secreto';
+}
+
+// Devuelve cb(avisoTexto|null, etiqueta). Nunca lanza ni bloquea: si algo falla
+// se comporta como si no hubiera hallazgos, porque esto es una red de
+// seguridad y jamas debe tumbar la accion que ya salio bien.
+function revisarTrasEscritura(toolName, args, cb) {
+  try {
+    if (toolName !== 'write_file' && toolName !== 'apply_patch') return cb(null, '');
+    if (!currentFeatures().codeGuardian) return cb(null, '');
+    const f = resolveInCwd(args.path);
+    if (!guardian.esRevisable(f)) return cb(null, '');
+    let listo = false;
+    const fin = (hs) => {
+      if (listo) return;
+      listo = true;
+      const lista = hs || [];
+      cb(formatearAvisoGuardian(lista), etiquetaAvisoGuardian(lista));
+    };
+    setTimeout(() => fin([]), 12000);
+    guardian.scanFile(f, { env: nodeEnv() }, fin);
+  } catch (e) {
+    return cb(null, '');
+  }
+}
+// ===== fin revision al escribir =====
+
 function execAgentTool(name, args, cb) {
   try {
     if (name === 'list_dir') {
@@ -2419,7 +2481,13 @@ function runAzureAgent(message, history, historySummary, send, onDone, onAbort, 
           if (chk.ok) return whenDone(result, ((summary || '') + ' · post-check ok').trim());
           return whenDone((String(result || '') + '\n⚠️ ' + chk.detail).trim(), ((summary || '') + ' · post-check falló').trim());
         }
-        if (chk.ok) return whenDone(result, ((summary || '') + ' · post-check ok').trim());
+        if (chk.ok) {
+          return revisarTrasEscritura(toolName, args, (aviso, etiqueta) => {
+            const txt = aviso ? (String(result || '') + '\n' + aviso).trim() : result;
+            const s = ((summary || '') + ' · post-check ok' + (etiqueta ? ' · ' + etiqueta : '')).trim();
+            whenDone(txt, s);
+          });
+        }
         if (toolName === 'move_file') {
           try {
             const from = resolveInCwd(args.from);
