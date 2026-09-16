@@ -98,6 +98,43 @@ function fallbackMock(info) {
       path: info.pathname
     };
   }
+  // Caso frecuente en HanstlerS: simular una orden de PayPal para pruebas
+  // del checkout sin pegarle a la API real.
+  if (String(info.pathname || '').toLowerCase() === '/api/paypal/order') {
+    return {
+      id: '5O190127TN364715T',
+      status: 'CREATED',
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          reference_id: 'default',
+          amount: { currency_code: 'USD', value: '49.99' },
+          description: 'HanstlerS Pro'
+        }
+      ],
+      payer: {
+        name: { given_name: 'Cesar', surname: 'Zumbado' },
+        email_address: 'comprador@ejemplo.com'
+      },
+      links: [
+        {
+          href: 'https://api-m.sandbox.paypal.com/v2/checkout/orders/5O190127TN364715T',
+          rel: 'self',
+          method: 'GET'
+        },
+        {
+          href: 'https://www.sandbox.paypal.com/checkoutnow?token=5O190127TN364715T',
+          rel: 'approve',
+          method: 'GET'
+        },
+        {
+          href: 'https://api-m.sandbox.paypal.com/v2/checkout/orders/5O190127TN364715T/capture',
+          rel: 'capture',
+          method: 'POST'
+        }
+      ]
+    };
+  }
   const plural = /s$|list|items|productos|licenses|orders/.test(last);
   const item = (i) => ({
     id: 'mock-' + last + '-' + (i + 1),

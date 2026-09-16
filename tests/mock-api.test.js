@@ -97,6 +97,14 @@ t('un recurso en singular devuelve objeto', () => {
   assert.ok(String(r.id).includes('license'));
 });
 
+t('la ruta de PayPal devuelve forma de orden compatible con checkout', () => {
+  const r = mock.fallbackMock({ pathname: '/api/paypal/order', status: 200, scenario: '' });
+  assert.strictEqual(r.status, 'CREATED');
+  assert.strictEqual(r.intent, 'CAPTURE');
+  assert.ok(Array.isArray(r.purchase_units) && r.purchase_units.length === 1);
+  assert.ok(Array.isArray(r.links) && r.links.some((l) => l.rel === 'approve'));
+});
+
 t('status de error o escenario de fallo devuelve error', () => {
   assert.strictEqual(mock.fallbackMock({ pathname: '/api/pago', status: 500, scenario: '' }).ok, false);
   assert.strictEqual(mock.fallbackMock({ pathname: '/api/pago', status: 200, scenario: 'rechazado' }).ok, false);
