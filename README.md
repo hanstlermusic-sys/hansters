@@ -95,6 +95,42 @@ siguiente llamada vuelva a intentarlo.
 
 El puerto se cambia con `HANSTLERS_MOCK_PORT`.
 
+## Vigilante de codigo
+
+Revisa cada archivo que se guarda en la carpeta de trabajo y avisa con una
+notificacion de Windows si encuentra un **secreto expuesto** (token de GitHub,
+llave de OpenAI/Google/AWS, llave privada, cadena de conexion con contrasena,
+JWT) o un **error de sintaxis** de JavaScript, antes de ejecutar la app o de
+hacer commit.
+
+El analisis es **local**: no llama a ninguna IA, no gasta cuota y no manda
+codigo a ningun lado. Revisar con IA en cada Ctrl+S costaria cuota en cada
+guardado y tardaria lo que tarde la red, justo lo contrario de lo que sirve
+mientras se escribe codigo.
+
+Se activa con la bandera `codeGuardian` (apagada por defecto):
+
+```powershell
+curl.exe -s -X POST http://127.0.0.1:8717/api/features -H "Content-Type: application/json" -d "{\"codeGuardian\":true}"
+curl.exe -s http://127.0.0.1:8717/api/guardian/status
+```
+
+- `GET /api/guardian/status` — si esta activo, que carpeta vigila y los ultimos
+  hallazgos.
+- `POST /api/guardian/scan` — barrido completo de la carpeta, bajo demanda. Al
+  arrancar no se hace solo: llenaria de avisos cosas que ya estaban ahi.
+- `POST /api/guardian/clear` — olvida los hallazgos y vuelve a avisar de ellos.
+
+El aviso llega **enmascarado** (`ghp_A1***7r8`): identifica el secreto sin
+copiarlo entero a la barra de notificaciones. Cada hallazgo avisa una sola vez,
+asi que guardar diez veces el mismo archivo no produce diez globos.
+
+Las reglas son de alta confianza (formatos propios de cada proveedor) y los
+marcadores de ejemplo (`ghp_XXXX...`, `${GITHUB_TOKEN}`, `<tu-token>`) no
+disparan: un aviso falso en cada guardado ensena a ignorar los avisos, y
+entonces el de verdad tambien pasa de largo. `tests/guardian.test.js` fija ese
+equilibrio en las dos direcciones.
+
 ## Mirroring a Enterprise (EMU compatible)
 
 Para trabajar con una cuenta EMU (`cezumbad_microsoft`) sin perder el repo fuente

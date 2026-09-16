@@ -9,6 +9,7 @@ const { spawn, execFile } = require('child_process');
 const updater = require('./updater');
 const modelWatch = require('./model-watch');
 const mockApi = require('./mock-api');
+const guardian = require('./guardian');
 
 // Version instalada, para comparar contra la del repo en el actualizador.
 const APP_VERSION = (function () {
@@ -2508,7 +2509,11 @@ function defaultFeatures() {
     // Servidor local aparte que inventa respuestas JSON para probar
     // frontend/backend sin APIs externas. Apagado por defecto: abre un
     // puerto extra, asi que solo se levanta si el usuario lo pide.
-    mockApi: false
+    mockApi: false,
+    // Vigila la carpeta de trabajo y avisa de secretos expuestos o errores de
+    // sintaxis al guardar. El analisis es local: no llama a ninguna IA ni gasta
+    // cuota. Apagado por defecto.
+    codeGuardian: false
   };
 }
 function loadFeatures() {
@@ -2662,6 +2667,17 @@ function runMockTool(args, cb) {
 
   // start (y cualquier otra cosa): encender y explicar como usarla.
   return encender(() => cb(ayuda(), 'API falsa encendida'));
+}
+// Arranca o detiene el vigilante de codigo segun la bandera y la carpeta de
+// trabajo. Se llama al iniciar, al cambiar de carpeta y al cambiar banderas.
+function syncGuardian() {
+  try {
+    const on = !!currentFeatures().codeGuardian;
+    const st = guardian.status();
+    if (!on) { if (st.activo) guardian.stop(); return; }
+    if (st.activo && st.cwd === state.cwd) return;
+    guardian.start({ cwd: state.cwd, nodeBin: process.execPath, env: nodeEnv() });
+  } catch (e) {}
 }
 function authEnabled() { return !!(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && SESSION_SECRET && BASE_URL); }
 const authSessions = new Map(); // sid -> { login, name, avatarUrl, isAdmin, at, githubToken }
@@ -4396,7 +4412,7 @@ function pickFolder(res) {
   execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', ps], { windowsHide: true }, (err, stdout) => {
     const p = (stdout || '').trim();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    if (p) { state.cwd = p; state.started = false; state.projectCtx = null; }
+    if (p) { state.cwd = p; state.started = false; state.projectCtx = null; syncGuardian(); }
     res.end(JSON.stringify({ path: p || null, cwd: state.cwd }));
   });
 }
@@ -4659,6 +4675,7 @@ const server = http.createServer(async (req, res) => {
     return openRepoWorkspace(spec, (err, info) => {
       res.writeHead(err ? 500 : 200, { 'Content-Type': 'application/json' });
       if (err) return res.end(JSON.stringify({ ok: false, error: err.message, cwd: state.cwd }));
+      syncGuardian();
       return res.end(JSON.stringify({ ok: true, cwd: info.path, repoRef: info.repoRef, action: info.action }));
     });
   }
@@ -4677,6 +4694,7 @@ const server = http.createServer(async (req, res) => {
     state.cwd = p;
     state.started = false;
     state.projectCtx = null;
+    syncGuardian();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, cwd: state.cwd }));
   }
@@ -4825,8 +4843,25 @@ const server = http.createServer(async (req, res) => {
     saveFeatures(f);
     reloadFeatures();
     syncMockApi();
+    syncGuardian();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, features: currentFeatures() }));
+  }
+  if (req.method === 'GET' && req.url === '/api/guardian/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(Object.assign({ habilitado: !!currentFeatures().codeGuardian }, guardian.status())));
+  }
+  if (req.method === 'POST' && req.url === '/api/guardian/scan') {
+    if (!requireAdminOrDeny(req, res)) return;
+    return guardian.scanTree(state.cwd, { nodeBin: process.execPath, env: nodeEnv() }, (hallazgos, revisados) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, cwd: state.cwd, revisados, hallazgos }));
+    });
+  }
+  if (req.method === 'POST' && req.url === '/api/guardian/clear') {
+    if (!requireAdminOrDeny(req, res)) return;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, estado: guardian.clear() }));
   }
   if (req.method === 'GET' && req.url === '/api/mock/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -5196,6 +5231,8 @@ function startListen() {
     try { modelWatch.schedule(onModelFinding); } catch (e) {}
     // Mock API local (si está habilitado en features.json).
     try { syncMockApi(); } catch (e) {}
+    // Vigilante de código local (si está habilitado en features.json).
+    try { syncGuardian(); } catch (e) {}
   });
 }
 
