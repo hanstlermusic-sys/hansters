@@ -48,7 +48,17 @@ Servidor aparte que inventa respuestas JSON para desarrollar frontend o
 backend sin depender de APIs externas (PayPal, R2, licencias...). Vive en su
 propio puerto: si falla, el chat no se entera.
 
-Se activa con la bandera `mockApi` (apagada por defecto):
+Se activa con la bandera `mockApi` (apagada por defecto). Lo más cómodo es
+**pedírselo al asistente en lenguaje natural**, sin acordarse de puertos ni de
+`curl`:
+
+> dame un mock de la API de pagos de PayPal en la ruta `/api/paypal/order`
+
+El agente enciende el servidor, deja la bandera activada para la próxima vez y
+responde con la URL lista para pegar en el código. También entiende «apaga el
+mock», «qué mocks tengo» o «que `/api/license/check` devuelva expirado».
+
+A mano, si se prefiere:
 
 ```powershell
 curl.exe -s -X POST http://127.0.0.1:8717/api/mock/start

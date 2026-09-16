@@ -1056,7 +1056,8 @@ const AGENT_TOOLS = [
   { type: 'function', function: { name: 'git_commit', description: 'Hace git add -A y git commit con el mensaje dado en la carpeta de trabajo', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Mensaje del commit' } }, required: ['message'] } } },
   { type: 'function', function: { name: 'npm_run', description: 'Ejecuta un script de npm (package.json) en la carpeta de trabajo. Útil para build, test, lint, start, etc.', parameters: { type: 'object', properties: { script: { type: 'string', description: 'Nombre del script (ej: build, test, lint)' }, args: { type: 'string', description: 'Argumentos opcionales adicionales' } }, required: ['script'] } } },
   { type: 'function', function: { name: 'notify', description: 'Muestra una notificación toast en Windows con un título y mensaje', parameters: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } } },
-  { type: 'function', function: { name: 'open_repo', description: 'Abre un repositorio de GitHub para trabajar en él: lo clona automáticamente si no está en disco (o hace git pull si ya estaba) y cambia la carpeta de trabajo a ese repo. Úsala SIEMPRE que el usuario diga "abre el repo X", "trabaja en X", "clona X" o mencione un repositorio de GitHub que aún no es la carpeta actual.', parameters: { type: 'object', properties: { repo: { type: 'string', description: 'owner/repo, URL de GitHub, o solo el nombre del repo si es de la cuenta del usuario' } }, required: ['repo'] } } }
+  { type: 'function', function: { name: 'open_repo', description: 'Abre un repositorio de GitHub para trabajar en él: lo clona automáticamente si no está en disco (o hace git pull si ya estaba) y cambia la carpeta de trabajo a ese repo. Úsala SIEMPRE que el usuario diga "abre el repo X", "trabaja en X", "clona X" o mencione un repositorio de GitHub que aún no es la carpeta actual.', parameters: { type: 'object', properties: { repo: { type: 'string', description: 'owner/repo, URL de GitHub, o solo el nombre del repo si es de la cuenta del usuario' } }, required: ['repo'] } } },
+  { type: 'function', function: { name: 'mock_api', description: 'Monta al instante una API falsa local que devuelve JSON inventado, para probar frontend o backend sin depender de APIs reales (PayPal, R2, licencias...). Úsala cuando el usuario diga "dame un mock de X", "necesito una API falsa", "simula la respuesta de X", "quiero probar sin PayPal" o similar. Con action=start la levanta y devuelve la URL lista para usar. Con action=seed fija una respuesta EXACTA para una ruta (úsalo cuando el usuario diga qué debe devolver). Con action=stop la apaga.', parameters: { type: 'object', properties: { action: { type: 'string', enum: ['start', 'stop', 'status', 'seed', 'clear'], description: 'start la levanta, seed fija una respuesta exacta, stop la apaga, clear borra lo cacheado' }, path: { type: 'string', description: 'Ruta a simular, por ejemplo /api/paypal/order (solo para seed)' }, data: { type: 'string', description: 'JSON exacto que debe devolver esa ruta (solo para seed)' }, scenario: { type: 'string', description: 'Variante a simular, por ejemplo "rechazado" o "vencida" (opcional)' }, status: { type: 'number', description: 'Código HTTP a devolver, por ejemplo 402 o 500 (opcional)' } }, required: ['action'] } } }
 ];
 
 function resolveInCwd(p) {
@@ -1420,6 +1421,9 @@ function execAgentTool(name, args, cb) {
         cb('Repo ' + info.action + ': ' + info.repoRef + '\nCarpeta de trabajo ahora: ' + info.path +
           '\nYa puedes leer/editar sus archivos con rutas relativas.', info.action + ' ' + info.repoRef);
       });
+    }
+    if (name === 'mock_api') {
+      return runMockTool(args, cb);
     }
     cb('Herramienta desconocida: ' + name);
   } catch (e) { cb('Error: ' + e.message); }
@@ -2558,6 +2562,106 @@ function syncMockApi() {
       if (info && !info.yaActivo) console.log('Mock API en http://127.0.0.1:' + info.puerto);
     });
   } catch (e) {}
+}
+// Herramienta del agente: montar una API falsa sin que el usuario tenga que
+// saber de puertos ni de curl. Basta con pedirla en lenguaje natural.
+// Al encender deja la bandera guardada, para que siga ahi tras reiniciar.
+function runMockTool(args, cb) {
+  const accion = String((args && args.action) || 'start').toLowerCase();
+  const feats = Object.assign({}, currentFeatures());
+
+  const guardarBandera = (on) => {
+    if (feats.mockApi === on) return;
+    feats.mockApi = on;
+    saveFeatures(feats);
+    reloadFeatures();
+  };
+
+  const url = () => 'http://127.0.0.1:' + mockApi.status().puerto;
+
+  const ayuda = () => {
+    const u = url();
+    return [
+      'API falsa lista en ' + u,
+      '',
+      'Apunta tu codigo ahi y cualquier ruta devuelve JSON creible:',
+      '  ' + u + '/api/paypal/order',
+      '',
+      'Para forzar los casos dificiles de reproducir:',
+      '  ' + u + '/api/paypal/order?__scenario=rechazado&__status=402',
+      '  ' + u + '/api/r2?__status=500',
+      '',
+      'La primera llamada la inventa la IA; las siguientes salen de cache y son instantaneas.'
+    ].join('\n');
+  };
+
+  if (accion === 'status') {
+    const s = mockApi.status();
+    return cb(s.activo
+      ? ('API falsa encendida en ' + s.url + ' (' + s.cacheados + ' respuestas cacheadas).')
+      : 'La API falsa esta apagada. Dime "dame un mock" y la enciendo.', s.activo ? 'encendida' : 'apagada');
+  }
+
+  if (accion === 'stop') {
+    guardarBandera(false);
+    return mockApi.stop(() => cb('API falsa apagada. El puerto queda libre.', 'apagada'));
+  }
+
+  if (accion === 'clear') {
+    const n = mockApi.clearCache();
+    return cb('Borradas ' + n + ' respuestas cacheadas: las siguientes llamadas se vuelven a inventar.', 'cache limpia');
+  }
+
+  const encender = (luego) => {
+    mockApi.start({ generate: mockGenerate }, (err) => {
+      if (err) return cb('No se pudo levantar la API falsa: ' + err.message, 'error');
+      guardarBandera(true);
+      luego();
+    });
+  };
+
+  if (accion === 'seed') {
+    const ruta = String((args && args.path) || '').trim();
+    if (!ruta) return cb('Para fijar una respuesta necesito la ruta, por ejemplo /api/licencia.', 'falta ruta');
+    let datos = args && args.data;
+    if (typeof datos === 'string') {
+      const parsed = mockApi.extractJson(datos);
+      if (parsed === null) return cb('El JSON de la respuesta no se entiende. Pasalo como JSON valido.', 'json invalido');
+      datos = parsed;
+    }
+    if (typeof datos === 'undefined' || datos === null) {
+      return cb('Para fijar una respuesta necesito el JSON que debe devolver.', 'falta data');
+    }
+    return encender(() => {
+      const cuerpo = JSON.stringify({
+        path: ruta,
+        data: datos,
+        method: 'GET',
+        scenario: (args && args.scenario) || '',
+        status: (args && Number(args.status)) || 200
+      });
+      const req = http.request({
+        host: '127.0.0.1',
+        port: mockApi.status().puerto,
+        method: 'POST',
+        path: '/__mock/seed',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(cuerpo) }
+      }, (resp) => {
+        let raw = '';
+        resp.on('data', (d) => (raw += d));
+        resp.on('end', () => {
+          if (resp.statusCode >= 400) return cb('No se pudo fijar la respuesta: ' + raw.slice(0, 200), 'error');
+          cb('Listo: ' + url() + ruta + ' ya devuelve exactamente ese JSON.', 'mock fijado');
+        });
+      });
+      req.on('error', (e) => cb('No se pudo fijar la respuesta: ' + e.message, 'error'));
+      req.write(cuerpo);
+      req.end();
+    });
+  }
+
+  // start (y cualquier otra cosa): encender y explicar como usarla.
+  return encender(() => cb(ayuda(), 'API falsa encendida'));
 }
 function authEnabled() { return !!(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && SESSION_SECRET && BASE_URL); }
 const authSessions = new Map(); // sid -> { login, name, avatarUrl, isAdmin, at, githubToken }
