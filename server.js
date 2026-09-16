@@ -1044,11 +1044,147 @@ function runXCore(message, history, send, onDone, onAbort) {
 // Modo confianza total: sin confirmaciones para acciones del agente.
 let trustMode = true;
 
+// ===== Lectura por trozos y parcheo seguro =====
+// Funciones puras (no tocan disco) para poder probarlas de verdad: los tests
+// las extraen de aqui y las corren en un sandbox, igual que AGENT_TOOLS.
+//
+// Tope de caracteres que devuelve read_file de una sola vez. Un archivo grande
+// no cabe: por eso read_file avisa EXPLICITAMENTE cuando recorta y ofrece
+// offset/limit. Antes recortaba en silencio y el modelo creia haber leido todo
+// (server.js son 258 KB: veia el 7.7% y editaba a ciegas, de ahi los parches
+// que no encajaban y el codigo duplicado).
+const READ_MAX_CHARS = 20000;
+const READ_DEFAULT_LIMIT = 400;
+
+function leerTrozo(data, args) {
+  const a = args || {};
+  const lineas = String(data).split('\n');
+  const total = lineas.length;
+  const pidioRango = a.offset != null || a.limit != null;
+
+  if (!pidioRango) {
+    // Sin rango: se comporta como siempre, pero si recorta lo dice.
+    if (data.length <= READ_MAX_CHARS) return { texto: data, resumen: total + ' lineas' };
+    const parcial = data.slice(0, READ_MAX_CHARS);
+    const vistas = parcial.split('\n').length;
+    const pct = Math.max(1, Math.round((READ_MAX_CHARS / data.length) * 100));
+    return {
+      texto: parcial + '\n\n[RECORTADO: solo viste ' + vistas + ' de ' + total + ' lineas (~' + pct +
+        '% del archivo). NO supongas que es el archivo completo. Para seguir leyendo llama otra vez con offset=' +
+        (vistas + 1) + ' (y limit si quieres mas o menos lineas).]',
+      resumen: 'RECORTADO ' + vistas + '/' + total + ' lineas'
+    };
+  }
+
+  let desde = parseInt(a.offset, 10);
+  if (!isFinite(desde) || desde < 1) desde = 1;
+  let cuantas = parseInt(a.limit, 10);
+  if (!isFinite(cuantas) || cuantas < 1) cuantas = READ_DEFAULT_LIMIT;
+  if (desde > total) {
+    return { texto: 'Error: offset ' + desde + ' supera el total de lineas del archivo (' + total + ').', resumen: 'fuera de rango' };
+  }
+  const hasta = Math.min(total, desde + cuantas - 1);
+  let trozo = lineas.slice(desde - 1, hasta).join('\n');
+  let nota = '';
+  if (trozo.length > READ_MAX_CHARS) {
+    trozo = trozo.slice(0, READ_MAX_CHARS);
+    nota = '\n\n[el trozo pedido no cabe entero: pide menos lineas con "limit"]';
+  }
+  const pie = hasta < total
+    ? '\n\n[quedan ' + (total - hasta) + ' lineas. Continua con offset=' + (hasta + 1) + '.]'
+    : '\n\n[fin del archivo]';
+  return {
+    texto: '[lineas ' + desde + '-' + hasta + ' de ' + total + ']\n' + trozo + nota + pie,
+    resumen: 'lineas ' + desde + '-' + hasta + '/' + total
+  };
+}
+
+function ubicarOcurrencias(orig, find) {
+  const pos = [];
+  if (!find) return pos;
+  let d = 0;
+  for (;;) {
+    const i = String(orig).indexOf(find, d);
+    if (i === -1) break;
+    pos.push(i);
+    d = i + find.length;
+  }
+  return pos;
+}
+
+function lineaDePosicion(orig, i) {
+  return String(orig).slice(0, i).split('\n').length;
+}
+
+// Antes esto usaba indexOf a secas: reemplazaba la PRIMERA aparicion y decia
+// "listo" aunque hubiera 51 iguales (medido en server.js: el 8.3% de las
+// lineas se repiten). Es decir, podia corromper la funcion equivocada y
+// reportar exito. Ahora, si el texto no es unico, se niega y dice donde esta,
+// salvo que le indiquen cual con "ocurrencia" o "todas".
+function aplicarParche(orig, args) {
+  const a = args || {};
+  const find = String(a.find || '');
+  const replace = String(a.replace == null ? '' : a.replace);
+  if (!find) return { ok: false, texto: 'Error: "find" vacio', resumen: 'error' };
+
+  const pos = ubicarOcurrencias(orig, find);
+  if (!pos.length) {
+    return {
+      ok: false,
+      texto: 'Error: no se encontro el texto a reemplazar. Lee el archivo de nuevo (usa offset/limit si es grande) y copia el fragmento exacto.',
+      resumen: 'no encontrado'
+    };
+  }
+
+  const todas = a.todas === true || a.todas === 'true';
+  if (todas) {
+    let out = '';
+    let prev = 0;
+    for (let i = 0; i < pos.length; i++) {
+      out += String(orig).slice(prev, pos[i]) + replace;
+      prev = pos[i] + find.length;
+    }
+    out += String(orig).slice(prev);
+    return { ok: true, contenido: out, texto: 'Parche aplicado a ' + pos.length + ' apariciones.', resumen: pos.length + ' reemplazos' };
+  }
+
+  const pedida = parseInt(a.ocurrencia, 10);
+  const eligio = isFinite(pedida) && pedida >= 1;
+  if (pos.length > 1 && !eligio) {
+    const donde = pos.slice(0, 10).map((p, i) => '  #' + (i + 1) + ' linea ' + lineaDePosicion(orig, p)).join('\n');
+    return {
+      ok: false,
+      texto: 'Error: el texto de "find" aparece ' + pos.length + ' veces, no se sabe cual editar:\n' + donde +
+        (pos.length > 10 ? '\n  ... y ' + (pos.length - 10) + ' mas' : '') +
+        '\n\nNo se toco el archivo. Elige una opcion:\n' +
+        '  1) Amplia "find" con las lineas de alrededor hasta que sea unico (recomendado).\n' +
+        '  2) Repite la llamada con ocurrencia=N para editar solo esa.\n' +
+        '  3) Repite la llamada con todas=true si de verdad quieres cambiarlas todas.',
+      resumen: 'ambiguo (' + pos.length + ' coincidencias)'
+    };
+  }
+
+  const idx = eligio ? pedida - 1 : 0;
+  if (idx >= pos.length) {
+    return { ok: false, texto: 'Error: pediste la ocurrencia ' + pedida + ' pero solo hay ' + pos.length + '.', resumen: 'fuera de rango' };
+  }
+  const p = pos[idx];
+  const contenido = String(orig).slice(0, p) + replace + String(orig).slice(p + find.length);
+  const linea = lineaDePosicion(orig, p);
+  return {
+    ok: true,
+    contenido,
+    texto: 'Parche aplicado (linea ~' + linea + ')' + (pos.length > 1 ? ', ocurrencia ' + (idx + 1) + ' de ' + pos.length : '') + '.',
+    resumen: 'editado linea ~' + linea
+  };
+}
+// ===== fin lectura/parcheo =====
+
 const AGENT_TOOLS = [
   { type: 'function', function: { name: 'list_dir', description: 'Lista archivos y carpetas de un directorio', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Ruta (por defecto la carpeta de trabajo)' } } } } },
-  { type: 'function', function: { name: 'read_file', description: 'Lee el contenido de un archivo de texto', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  { type: 'function', function: { name: 'read_file', description: 'Lee el contenido de un archivo de texto. Si el archivo es grande la respuesta viene recortada y se te avisa: en ese caso vuelve a llamar con "offset" y "limit" para leer el resto por trozos, en vez de suponer que ya lo viste todo.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', description: 'Línea inicial (1 = primera). Opcional.' }, limit: { type: 'integer', description: 'Cuántas líneas leer desde offset (por defecto 400). Opcional.' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'write_file', description: 'Crea o sobrescribe un archivo con contenido', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
-  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza la primera aparición de un texto por otro (más rápido y barato que reescribir todo). Usa esto para cambios pequeños.', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea único)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' } }, required: ['path', 'find', 'replace'] } } },
+  { type: 'function', function: { name: 'apply_patch', description: 'Edita un trozo de un archivo existente: reemplaza un texto por otro (más rápido y barato que reescribir todo). Usa esto para cambios pequeños. El texto de "find" DEBE ser único en el archivo: si aparece varias veces la edición se rechaza y se te dicen las líneas, para que añadas contexto alrededor o elijas con "ocurrencia".', parameters: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string', description: 'Texto exacto a buscar (incluye contexto suficiente para que sea único)' }, replace: { type: 'string', description: 'Texto nuevo que lo reemplaza' }, ocurrencia: { type: 'integer', description: 'Si el texto se repite, cuál reemplazar (1 = la primera). Opcional.' }, todas: { type: 'boolean', description: 'true para reemplazar todas las apariciones. Opcional.' } }, required: ['path', 'find', 'replace'] } } },
   { type: 'function', function: { name: 'search_in_files', description: 'Busca un texto o patrón en todos los archivos del proyecto y devuelve las coincidencias con archivo y número de línea', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Carpeta donde buscar (por defecto la de trabajo)' } }, required: ['query'] } } },
   { type: 'function', function: { name: 'delete_file', description: 'Borra un archivo o carpeta', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'move_file', description: 'Mueve o renombra un archivo o carpeta', parameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, required: ['from', 'to'] } } },
@@ -1289,7 +1425,8 @@ function execAgentTool(name, args, cb) {
     if (name === 'read_file') {
       const f = resolveInCwd(args.path);
       const data = fs.readFileSync(f, 'utf8');
-      return cb(data.slice(0, 20000), data.split('\n').length + ' líneas');
+      const r = leerTrozo(data, args);
+      return cb(r.texto, r.resumen);
     }
     if (name === 'write_file') {
       const f = resolveInCwd(args.path);
@@ -1301,14 +1438,10 @@ function execAgentTool(name, args, cb) {
       const f = resolveInCwd(args.path);
       if (!fs.existsSync(f)) return cb('Error: el archivo no existe: ' + f, 'no existe');
       const orig = fs.readFileSync(f, 'utf8');
-      const find = String(args.find || '');
-      if (!find) return cb('Error: "find" vacío', 'error');
-      const idx = orig.indexOf(find);
-      if (idx === -1) return cb('Error: no se encontró el texto a reemplazar. Lee el archivo de nuevo y copia el fragmento exacto.', 'no encontrado');
-      const updated = orig.slice(0, idx) + String(args.replace || '') + orig.slice(idx + find.length);
-      fs.writeFileSync(f, updated);
-      const before = orig.slice(0, idx).split('\n').length;
-      return cb('Parche aplicado en ' + f + ' (línea ~' + before + ')', 'editado línea ~' + before);
+      const r = aplicarParche(orig, args);
+      if (!r.ok) return cb(r.texto, r.resumen);
+      fs.writeFileSync(f, r.contenido);
+      return cb(r.texto.replace('Parche aplicado', 'Parche aplicado en ' + f), r.resumen);
     }
     if (name === 'search_in_files') {
       const root = resolveInCwd(args.path);

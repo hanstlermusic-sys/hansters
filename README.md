@@ -131,6 +131,50 @@ disparan: un aviso falso en cada guardado ensena a ignorar los avisos, y
 entonces el de verdad tambien pasa de largo. `tests/guardian.test.js` fija ese
 equilibrio en las dos direcciones.
 
+## Lectura por trozos y parcheo seguro
+
+Dos herramientas del agente (`read_file` y `apply_patch`) fallaban en silencio
+con archivos grandes, que es justo donde mas duele.
+
+`read_file` devuelve como mucho 20000 caracteres. Antes recortaba **sin
+decirlo**: con `server.js` (258 KB) el modelo veia 442 de 5254 lineas, el 7.7%,
+y creia tener el archivo completo. De ahi salian los parches que no encajaban y
+el codigo duplicado. Ahora, cuando recorta, lo dice y ademas indica por donde
+seguir:
+
+```
+[RECORTADO: solo viste 442 de 5254 lineas (~8% del archivo).
+ NO supongas que es el archivo completo. Para seguir leyendo llama otra vez
+ con offset=443 (y limit si quieres mas o menos lineas).]
+```
+
+Y acepta `offset` (linea inicial) y `limit` (cuantas lineas), para pedir solo el
+trozo que interesa en lugar de arrastrar el archivo entero en cada paso. Sin
+esos parametros se comporta exactamente igual que antes.
+
+`apply_patch` usaba `indexOf`, o sea reemplazaba la **primera** aparicion del
+texto y reportaba exito aunque hubiera decenas iguales. En `server.js` el 8.3%
+de las lineas estan repetidas y `res.writeHead(200, ...)` aparece 51 veces: el
+agente podia corromper la funcion equivocada y decir que todo salio bien. Ahora,
+si el texto no es unico, **no toca el archivo** y explica que pasa:
+
+```
+Error: el texto de "find" aparece 2 veces, no se sabe cual editar:
+  #1 linea 2
+  #2 linea 5
+
+No se toco el archivo. Elige una opcion:
+  1) Amplia "find" con las lineas de alrededor hasta que sea unico (recomendado).
+  2) Repite la llamada con ocurrencia=N para editar solo esa.
+  3) Repite la llamada con todas=true si de verdad quieres cambiarlas todas.
+```
+
+Nada se pierde: lo que antes "funcionaba" por accidente ahora se pide a
+proposito con `ocurrencia` o `todas`. Un `find` que ya era unico se aplica igual
+que siempre. `tests/read-patch.test.js` cubre las dos herramientas, incluida la
+compatibilidad hacia atras y una prueba que confirma que `apply_patch` se niega
+a editar el `server.js` real con un `find` repetido.
+
 ## Mirroring a Enterprise (EMU compatible)
 
 Para trabajar con una cuenta EMU (`cezumbad_microsoft`) sin perder el repo fuente
