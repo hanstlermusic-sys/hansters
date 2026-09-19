@@ -482,10 +482,21 @@ function renderRepoAuthCard(box, forConversations){
     ? 'Puedes usar OAuth o GitHub CLI para cargar repos remotos.'
     : 'OAuth no está configurado. Usa GitHub CLI (botón abajo).';
   const copilotUser = String(repoAuth.copilotUser || '');
+  // La lista de abajo sirve para dos cosas distintas segun donde se dibuje:
+  // en Repos manda la cuenta activa de `gh` (la que usa git), y en
+  // Conversaciones manda la cuenta que factura Copilot. Marcarlas siempre por
+  // `gh` era el bug: `gh auth switch` es estado global de la maquina, asi que
+  // cualquier push o script de fuera movia la marca y la eleccion del usuario
+  // parecia deshacerse sola.
+  const billByCopilot = forConversations && !!copilotUser;
+  const ghDiffers = !!copilotUser && !!repoAuth.ghUser && copilotUser !== repoAuth.ghUser;
   const copilotNote = forConversations
     ? '<div class="repo-auth-note">' + (copilotUser
         ? ('Copilot factura a <b>' + esc(copilotUser) + '</b>.' + (copilotUser !== ghName && repoAuth.ghLogged ? ' Pulsa la cuenta que quieras para cambiarlo.' : ''))
         : 'Elige una cuenta abajo para fijar la suscripción de Copilot del chat.') + '</div>'
+      + (ghDiffers
+        ? '<div class="repo-auth-warn">git usa <b>' + esc(repoAuth.ghUser) + '</b> y Copilot factura a <b>' + esc(copilotUser) + '</b>. Cambia de cuenta aquí para igualarlas.</div>'
+        : '')
     : '';
   const btnLogin = repoAuth.enabled && !repoAuth.ok ? '<button type="button" data-repo-login>Iniciar sesión web</button>' : '';
   const btnGhLogin = (!repoAuth.ok && !repoAuth.ghLogged) ? '<button type="button" data-gh-login>Login con GitHub CLI</button>' : '';
@@ -493,7 +504,7 @@ function renderRepoAuthCard(box, forConversations){
   const accounts = Array.isArray(repoAuth.ghAccounts) ? repoAuth.ghAccounts : [];
   const switchBtns = accounts.map((a)=>{
     const login2 = String(a.login||'');
-    const isAct = !!a.active;
+    const isAct = billByCopilot ? (login2 === copilotUser) : !!a.active;
     return '<button type="button" class="gh-acct' + (isAct?' active':'') + '" data-gh-switch="' + esc(login2) + '"' + (isAct?' disabled':'') + '>'
       + '<span class="gh-acct-dot">' + (isAct?'✅':'🔄') + '</span>'
       + '<span class="gh-acct-name">' + esc(login2) + '</span>'

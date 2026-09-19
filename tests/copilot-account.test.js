@@ -38,4 +38,20 @@ assert.ok(
   'cambiar de cuenta debe descartar la sesión de Copilot anterior'
 );
 
+// `gh auth switch` es estado global de la maquina: un push o un script de
+// fuera lo mueve. Si la lista marcara la cuenta activa por `gh`, la eleccion
+// de suscripcion del usuario pareceria deshacerse sola.
+assert.ok(
+  /billByCopilot\s*=\s*forConversations\s*&&\s*!!copilotUser/.test(app),
+  'en Conversaciones la cuenta marcada debe ser la que factura Copilot'
+);
+assert.ok(
+  /const isAct\s*=\s*billByCopilot\s*\?\s*\(login2 === copilotUser\)\s*:\s*!!a\.active/.test(app),
+  'la marca de activa no puede depender solo de la cuenta activa de gh'
+);
+assert.ok(
+  /ghDiffers/.test(app) && /repo-auth-warn/.test(app),
+  'si git y Copilot apuntan a cuentas distintas, hay que avisarlo'
+);
+
 console.log('  PASS  selector de cuenta de Copilot conectado al chat');
